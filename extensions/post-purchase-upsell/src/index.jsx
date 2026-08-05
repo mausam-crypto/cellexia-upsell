@@ -37,15 +37,7 @@ import {
 } from "@shopify/post-purchase-ui-extensions-react";
 
 // ════════════════════════════════════════════════════════════════════════════
-// ▸▸▸ TODO — REQUIRED BEFORE DEPLOY ◂◂◂
-//
-// Replace APP_URL with the public HTTPS URL of YOUR deployed app backend
-// (the Remix app that serves /api/offer, /api/sign-changeset, /api/events).
-// During `shopify app dev` this is the tunnel URL printed by the CLI; in
-// production it is your hosting URL, e.g. "https://cellexia-upsell.fly.dev".
-// NO trailing slash. See docs/IMPLEMENTATION_GUIDE.md.
-// ════════════════════════════════════════════════════════════════════════════
-const APP_URL = "https://REPLACE-WITH-YOUR-APP-URL.example.com";
+const APP_URL = "https://cellexia-upsell.onrender.com";
 
 /** Inline English fallbacks — used only when the server strings are missing. */
 const FALLBACK_STRINGS = {

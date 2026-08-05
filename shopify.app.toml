@@ -3,10 +3,10 @@
 #   shopify app config link
 # The CLI will fill in client_id and keep application_url in sync during dev.
 
-client_id = "REPLACE_WITH_CLIENT_ID"
+client_id = "501bb278be617245331c30293fe921dc"
 name = "Cellexia Post-Purchase Upsell"
 handle = "cellexia-post-purchase-upsell"
-application_url = "https://replace-with-your-app-url.example.com"
+application_url = "https://cellexia-upsell.onrender.com"
 embedded = true
 
 [build]
@@ -18,9 +18,9 @@ scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,wri
 
 [auth]
 redirect_urls = [
-  "https://replace-with-your-app-url.example.com/auth/callback",
-  "https://replace-with-your-app-url.example.com/auth/shopify/callback",
-  "https://replace-with-your-app-url.example.com/api/auth/callback"
+  "https://cellexia-upsell.onrender.com/auth/callback",
+  "https://cellexia-upsell.onrender.com/auth/shopify/callback",
+  "https://cellexia-upsell.onrender.com/api/auth/callback"
 ]
 
 [webhooks]
