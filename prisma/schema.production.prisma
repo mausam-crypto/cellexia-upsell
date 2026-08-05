@@ -30,6 +30,8 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+  refreshToken  String?
+  refreshTokenExpires DateTime?
 }
 
 // One row per installed shop. settingsJson holds AppSettings (see app/types.ts).
