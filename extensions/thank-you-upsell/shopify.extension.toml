@@ -16,6 +16,7 @@ api_version = "2025-07"
 [[extensions]]
 name = "Cellexia Thank You Upsell"
 handle = "thank-you-upsell"
+uid = "668606a9-da05-e73e-6c99-cf8e980b59ed8c1dcfb8"
 type = "ui_extension"
 description = "Discount-code upsell offer on the thank-you page — fallback for wallet and PayPal payments."
 

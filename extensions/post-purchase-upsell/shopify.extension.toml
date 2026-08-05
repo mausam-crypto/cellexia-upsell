@@ -1,3 +1,4 @@
 name = "Cellexia Post-Purchase Upsell"
 type = "checkout_post_purchase"
 metafields = []
+uid = "27243ea7-34ea-1c33-5ca7-a3e121c209a50e9290d3"
