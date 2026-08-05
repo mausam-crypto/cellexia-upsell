@@ -1,0 +1,10 @@
+{
+  "name": "Cellexia Thank You Upsell",
+  "title": "A little something extra",
+  "cta": "Claim this offer",
+  "decline": "No thanks",
+  "was": "Was",
+  "now": "Now",
+  "save_pct": "Save {{pct}}%",
+  "code_note": "Code {{code}} — applied automatically at checkout"
+}

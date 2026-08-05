@@ -1,0 +1,42 @@
+# Shopify app configuration.
+# After creating the app in the Partner Dashboard, run:
+#   shopify app config link
+# The CLI will fill in client_id and keep application_url in sync during dev.
+
+client_id = "REPLACE_WITH_CLIENT_ID"
+name = "Cellexia Post-Purchase Upsell"
+handle = "cellexia-post-purchase-upsell"
+application_url = "https://replace-with-your-app-url.example.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
+
+[access_scopes]
+scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,write_discounts"
+
+[auth]
+redirect_urls = [
+  "https://replace-with-your-app-url.example.com/auth/callback",
+  "https://replace-with-your-app-url.example.com/auth/shopify/callback",
+  "https://replace-with-your-app-url.example.com/api/auth/callback"
+]
+
+[webhooks]
+api_version = "2026-01"
+
+[[webhooks.subscriptions]]
+topics = ["app/uninstalled", "app/scopes_update"]
+uri = "/webhooks"
+
+[[webhooks.subscriptions]]
+topics = ["orders/create", "products/create", "products/update", "products/delete"]
+uri = "/webhooks"
+
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "/webhooks"
+
+[pos]
+embedded = false

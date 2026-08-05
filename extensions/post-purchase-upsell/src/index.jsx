@@ -1,0 +1,723 @@
+/**
+ * Cellexia Post-Purchase Upsell — buyer-facing checkout extension.
+ *
+ * Flow:
+ *   1. ShouldRender asks the app backend for offers and stashes the response
+ *      in extension storage.
+ *   2. Render reads storage.initialData (re-fetching when empty — Shop Pay
+ *      may not persist ShouldRender storage) and walks the buyer through the
+ *      offer pages one at a time (or a single bundle page).
+ *   3. Accepting an offer signs the changeset server-side, applies it with
+ *      one click (charged to the card just used), then advances.
+ *
+ * Analytics events (impression / accepted / declined / error) are strictly
+ * fire-and-forget: they can never break or block the buyer's order.
+ */
+
+import { useEffect, useRef, useState } from "react";
+import {
+  extend,
+  render,
+  useExtensionInput,
+  BlockStack,
+  InlineStack,
+  Button,
+  CalloutBanner,
+  Heading,
+  Image,
+  Layout,
+  TextBlock,
+  TextContainer,
+  Text,
+  Separator,
+  Tiles,
+  View,
+  Banner,
+  Spinner,
+} from "@shopify/post-purchase-ui-extensions-react";
+
+// ════════════════════════════════════════════════════════════════════════════
+// ▸▸▸ TODO — REQUIRED BEFORE DEPLOY ◂◂◂
+//
+// Replace APP_URL with the public HTTPS URL of YOUR deployed app backend
+// (the Remix app that serves /api/offer, /api/sign-changeset, /api/events).
+// During `shopify app dev` this is the tunnel URL printed by the CLI; in
+// production it is your hosting URL, e.g. "https://cellexia-upsell.fly.dev".
+// NO trailing slash. See docs/IMPLEMENTATION_GUIDE.md.
+// ════════════════════════════════════════════════════════════════════════════
+const APP_URL = "https://REPLACE-WITH-YOUR-APP-URL.example.com";
+
+/** Inline English fallbacks — used only when the server strings are missing. */
+const FALLBACK_STRINGS = {
+  offer_badge: "Exclusive one-time offer",
+  offer_x_of_y: "Offer {x} of {y}",
+  time_left: "Offer reserved for",
+  add_to_order: "Add to my order",
+  add_all_to_order: "Add all to my order",
+  decline: "No thanks, complete my order",
+  was: "Was",
+  now: "Now",
+  save_pct: "Save {pct}%",
+  ships_free: "Ships with your order — no extra shipping",
+  one_click_note: "One click — charged to the payment method you just used",
+  processing: "Adding to your order…",
+  error_try_again: "Something went wrong. Your original order is not affected.",
+  discount_applied: "{pct}% off — post-purchase exclusive",
+};
+
+// ── Small helpers ────────────────────────────────────────────────────────────
+
+/** Localized string lookup with English fallback and {var} interpolation. */
+function t(strings, key, vars) {
+  let template =
+    (strings && typeof strings[key] === "string" && strings[key]) ||
+    FALLBACK_STRINGS[key] ||
+    key;
+  if (vars) {
+    for (const [name, value] of Object.entries(vars)) {
+      template = template.split(`{${name}}`).join(String(value));
+    }
+  }
+  return template;
+}
+
+function toAmount(value) {
+  const n = typeof value === "number" ? value : parseFloat(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+/** Currency formatting with a plain-text fallback when Intl rejects inputs. */
+function formatMoney(amount, currency, locale) {
+  const n = toAmount(amount);
+  try {
+    return new Intl.NumberFormat(locale || "en", {
+      style: "currency",
+      currency: currency || "EUR",
+    }).format(n);
+  } catch (error) {
+    return `${n.toFixed(2)} ${currency || ""}`.trim();
+  }
+}
+
+/** Seconds → "mm:ss". */
+function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mm = String(Math.floor(s / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
+
+/** POST /api/offer — returns the OfferResponse JSON (throws on failure). */
+async function fetchOfferResponse(token, referenceId) {
+  const response = await fetch(`${APP_URL}/api/offer`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ referenceId }),
+  });
+  if (!response.ok) {
+    throw new Error(`Offer request failed with status ${response.status}`);
+  }
+  return response.json();
+}
+
+/** Validate/clean an OfferResponse. Returns null when there is nothing to show. */
+function normalizeOfferResponse(data) {
+  if (!data || typeof data !== "object" || !Array.isArray(data.offers)) {
+    return null;
+  }
+  const offers = data.offers.filter(
+    (offer) =>
+      offer &&
+      typeof offer.offerId === "string" &&
+      Array.isArray(offer.products) &&
+      offer.products.length > 0 &&
+      Array.isArray(offer.changes) &&
+      offer.changes.length > 0,
+  );
+  if (offers.length === 0) return null;
+  return { ...data, offers };
+}
+
+/**
+ * Pull an accurate presentment total out of a calculateChangeset result.
+ * Shape differs across API versions — parse defensively; null means
+ * "fall back to the server-provided prices".
+ */
+function extractCalculatedTotal(result) {
+  try {
+    const purchase =
+      result && typeof result === "object"
+        ? result.calculatedPurchase || result
+        : null;
+    if (!purchase || typeof purchase !== "object") return null;
+    const candidates = [
+      purchase.totalOutstandingSet && purchase.totalOutstandingSet.presentmentMoney,
+      purchase.totalOutstandingSet && purchase.totalOutstandingSet.shopMoney,
+    ];
+    for (const money of candidates) {
+      if (!money) continue;
+      const amount =
+        typeof money.amount === "number" ? money.amount : parseFloat(money.amount);
+      if (Number.isFinite(amount) && amount > 0) return round2(amount);
+    }
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+/** Fire-and-forget analytics event — must NEVER throw or block the UX. */
+function sendEvent(token, payload) {
+  try {
+    fetch(`${APP_URL}/api/events`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ surface: "post_purchase", ...payload }),
+      keepalive: true,
+    }).catch(() => {
+      /* analytics are best-effort */
+    });
+  } catch (error) {
+    /* analytics are best-effort */
+  }
+}
+
+// ── ShouldRender ─────────────────────────────────────────────────────────────
+
+extend(
+  "Checkout::PostPurchase::ShouldRender",
+  async ({ inputData, storage }) => {
+    try {
+      const referenceId =
+        inputData && inputData.initialPurchase
+          ? inputData.initialPurchase.referenceId
+          : null;
+      const offerResponse = await fetchOfferResponse(
+        inputData && inputData.token,
+        referenceId,
+      );
+      try {
+        await storage.update(offerResponse);
+      } catch (error) {
+        // Storage failure is fine — Render re-fetches when initialData is empty.
+      }
+      const hasOffers = Boolean(
+        offerResponse &&
+          Array.isArray(offerResponse.offers) &&
+          offerResponse.offers.length > 0,
+      );
+      return { render: hasOffers };
+    } catch (error) {
+      // Any failure → skip the page entirely; never delay the buyer.
+      return { render: false };
+    }
+  },
+);
+
+// ── Render ───────────────────────────────────────────────────────────────────
+
+render("Checkout::PostPurchase::Render", () => <App />);
+
+export function App() {
+  const input = useExtensionInput() || {};
+  const { storage, inputData, calculateChangeset, applyChangeset, done } = input;
+
+  const token = inputData ? inputData.token : null;
+  const referenceId =
+    inputData && inputData.initialPurchase
+      ? inputData.initialPurchase.referenceId
+      : null;
+  const locale = (inputData && inputData.locale) || "en";
+
+  const [offerData, setOfferData] = useState(() =>
+    normalizeOfferResponse(storage ? storage.initialData : null),
+  );
+  const [loading, setLoading] = useState(() => offerData === null);
+  const [pageIndex, setPageIndex] = useState(0);
+  const [processing, setProcessing] = useState(false);
+  const [justAccepted, setJustAccepted] = useState(false);
+  const [errorText, setErrorText] = useState(null);
+  const [calculatedTotal, setCalculatedTotal] = useState(null);
+  const [secondsLeft, setSecondsLeft] = useState(null);
+
+  const doneRef = useRef(false);
+  const expiredRef = useRef(false);
+  const processingRef = useRef(false);
+  processingRef.current = processing || justAccepted;
+  const impressionsSentRef = useRef({});
+  const advanceTimerRef = useRef(null);
+
+  /** done() exactly once, and never let it throw into the render tree. */
+  function safeDone() {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    try {
+      Promise.resolve(done()).catch(() => {});
+    } catch (error) {
+      /* completing the order is Shopify's job from here */
+    }
+  }
+
+  const hasOffers = Boolean(
+    offerData && Array.isArray(offerData.offers) && offerData.offers.length > 0,
+  );
+  const offers = hasOffers ? offerData.offers : [];
+  const safeIndex = Math.min(pageIndex, Math.max(0, offers.length - 1));
+  const offer = hasOffers ? offers[safeIndex] : null;
+  const currentOfferId = offer ? offer.offerId : null;
+  const strings = (offerData && offerData.strings) || {};
+  const ui = (offerData && offerData.ui) || {};
+  const currency = (offerData && offerData.currency) || "EUR";
+  const showCountdown = Boolean(hasOffers && ui.showCountdown);
+
+  // Shop Pay caveat: Render may not see what ShouldRender stored — re-fetch.
+  useEffect(() => {
+    if (offerData) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const refreshed = await fetchOfferResponse(token, referenceId);
+        if (cancelled) return;
+        const normalized = normalizeOfferResponse(refreshed);
+        if (normalized) {
+          setOfferData(normalized);
+        } else {
+          safeDone();
+        }
+      } catch (error) {
+        if (!cancelled) safeDone(); // never trap the buyer on an empty page
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Countdown: starts once offers are visible; single timer for the whole flow.
+  useEffect(() => {
+    if (!showCountdown) return undefined;
+    const minutes = Number(ui.countdownMinutes);
+    const totalSeconds =
+      Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes * 60) : 600;
+    setSecondsLeft(totalSeconds);
+    const startedAt = Date.now();
+    const interval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      const remaining = Math.max(0, totalSeconds - elapsed);
+      setSecondsLeft(remaining);
+      if (remaining <= 0) clearInterval(interval);
+    }, 1000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showCountdown]);
+
+  // Countdown expiry → close the offer flow (unless an accept is in flight —
+  // in that case advance() (success) or handleAccept's catch (failure)
+  // notices the expiry flag once it completes).
+  useEffect(() => {
+    if (!showCountdown || secondsLeft !== 0) return;
+    expiredRef.current = true;
+    if (!processingRef.current) safeDone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [secondsLeft, showCountdown]);
+
+  // Impression event on each page mount (deduplicated per offerId).
+  useEffect(() => {
+    if (!currentOfferId || impressionsSentRef.current[currentOfferId]) return;
+    impressionsSentRef.current[currentOfferId] = true;
+    sendEvent(token, {
+      referenceId,
+      offerId: currentOfferId,
+      eventType: "impression",
+      currency,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentOfferId]);
+
+  // calculateChangeset per page → accurate presentment totals for the money row.
+  useEffect(() => {
+    setCalculatedTotal(null);
+    if (!currentOfferId || !offer || typeof calculateChangeset !== "function") {
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await calculateChangeset({ changes: offer.changes });
+        if (cancelled) return;
+        const total = extractCalculatedTotal(result);
+        if (total !== null) setCalculatedTotal(total);
+      } catch (error) {
+        // Fall back to the server-provided prices — never surface this.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentOfferId]);
+
+  // Clear the brief-success timer if the extension unmounts mid-transition.
+  useEffect(
+    () => () => {
+      if (advanceTimerRef.current) clearTimeout(advanceTimerRef.current);
+    },
+    [],
+  );
+
+  /** Move to the next offer page, or finish the flow. */
+  function advance() {
+    if (advanceTimerRef.current) {
+      clearTimeout(advanceTimerRef.current);
+      advanceTimerRef.current = null;
+    }
+    setProcessing(false);
+    setJustAccepted(false);
+    setErrorText(null);
+    if (expiredRef.current || safeIndex + 1 >= offers.length) {
+      safeDone();
+      return;
+    }
+    setPageIndex(safeIndex + 1);
+  }
+
+  /** One-click accept: sign server-side → applyChangeset → event → advance. */
+  async function handleAccept() {
+    if (processing || justAccepted || !offer) return;
+    setProcessing(true);
+    setErrorText(null);
+    try {
+      const response = await fetch(`${APP_URL}/api/sign-changeset`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ referenceId, offerId: offer.offerId }),
+      });
+      const signed = await response.json();
+      if (
+        !response.ok ||
+        !signed ||
+        typeof signed.token !== "string" ||
+        signed.token.length === 0
+      ) {
+        throw new Error(
+          (signed && signed.error) || "Unable to sign the changeset",
+        );
+      }
+      const result = await applyChangeset(signed.token);
+      const status = result && result.status ? String(result.status) : "";
+      if (status.toLowerCase() === "unprocessed") {
+        const detail =
+          result && Array.isArray(result.errors) && result.errors.length > 0
+            ? result.errors
+                .map((e) => (e && e.message) || (e && e.code) || "")
+                .filter(Boolean)
+                .join("; ")
+            : "Changeset was not processed";
+        throw new Error(detail || "Changeset was not processed");
+      }
+      const revenue = round2(
+        offer.products.reduce((sum, p) => sum + toAmount(p.discountedPrice), 0),
+      );
+      sendEvent(token, {
+        referenceId,
+        offerId: offer.offerId,
+        eventType: "accepted",
+        revenue,
+        currency,
+      });
+      setJustAccepted(true);
+      // Brief success beat so the buyer sees the confirmation, then move on.
+      advanceTimerRef.current = setTimeout(() => {
+        advance();
+      }, 1200);
+    } catch (error) {
+      sendEvent(token, {
+        referenceId,
+        offerId: offer.offerId,
+        eventType: "error",
+        message:
+          error && error.message
+            ? String(error.message).slice(0, 500)
+            : "accept_failed",
+      });
+      setErrorText(t(strings, "error_try_again"));
+      setProcessing(false);
+      // If the countdown expired while this accept was in flight, the expiry
+      // effect already fired (secondsLeft stays 0, so it never re-runs) and
+      // deferred to us — terminate the flow now so the buyer is never left on
+      // a dead-end page. The error Banner stays visible until Shopify closes
+      // the page once done() resolves.
+      if (expiredRef.current) safeDone();
+    }
+  }
+
+  /** Decline: event, then next page / finish. Always available. */
+  function handleDecline() {
+    if (processing || justAccepted) return;
+    if (offer) {
+      sendEvent(token, {
+        referenceId,
+        offerId: offer.offerId,
+        eventType: "declined",
+        currency,
+      });
+    }
+    advance();
+  }
+
+  // ── Loading / empty states ─────────────────────────────────────────────────
+
+  if (loading || !hasOffers || !offer) {
+    // While loading (or after safeDone() on an empty result) show a quiet
+    // centered spinner — Shopify closes the page once done() resolves.
+    return (
+      <BlockStack spacing="loose" alignment="center">
+        <Spinner />
+      </BlockStack>
+    );
+  }
+
+  // ── Page data ──────────────────────────────────────────────────────────────
+
+  const totalPages = offers.length;
+  const pageNumber = safeIndex + 1;
+  const products = offer.products;
+  const copy = offer.copy || { headline: "", body: "", bullets: [] };
+  const bullets = Array.isArray(copy.bullets) ? copy.bullets.filter(Boolean) : [];
+  const discountPct = Math.round(toAmount(offer.discountPct));
+  const showComparePrice = ui.showComparePrice !== false;
+
+  const originalTotal = round2(
+    products.reduce((sum, p) => sum + toAmount(p.price), 0),
+  );
+  const discountedTotalServer = round2(
+    products.reduce((sum, p) => sum + toAmount(p.discountedPrice), 0),
+  );
+  // Prefer the accurate presentment total from calculateChangeset.
+  const nowTotal =
+    calculatedTotal !== null ? calculatedTotal : discountedTotalServer;
+
+  const isBundle =
+    offerData.displayMode === "bundle" && products.length > 1;
+
+  const banners = (
+    <BlockStack spacing="tight">
+      {errorText ? <Banner status="critical">{errorText}</Banner> : null}
+      {justAccepted ? (
+        <Banner status="success">
+          {offer.discountTitle ||
+            t(strings, "discount_applied", { pct: discountPct })}
+        </Banner>
+      ) : null}
+    </BlockStack>
+  );
+
+  const trustAndCountdown = (
+    <BlockStack spacing="xtight">
+      <TextBlock subdued size="small">
+        {t(strings, "ships_free")}
+      </TextBlock>
+      <TextBlock subdued size="small">
+        {t(strings, "one_click_note")}
+      </TextBlock>
+      {showCountdown && secondsLeft !== null ? (
+        <InlineStack spacing="xtight">
+          <Text subdued size="small">
+            {t(strings, "time_left")}
+          </Text>
+          <Text emphasized size="small">
+            {formatClock(secondsLeft)}
+          </Text>
+        </InlineStack>
+      ) : null}
+    </BlockStack>
+  );
+
+  const actionButtons = (
+    <BlockStack spacing="tight">
+      <Button submit loading={processing} onPress={handleAccept}>
+        {isBundle
+          ? t(strings, "add_all_to_order")
+          : t(strings, "add_to_order")}
+      </Button>
+      <Button plain disabled={processing || justAccepted} onPress={handleDecline}>
+        {t(strings, "decline")}
+      </Button>
+      {processing && !justAccepted ? (
+        <TextBlock subdued size="small">
+          {t(strings, "processing")}
+        </TextBlock>
+      ) : null}
+    </BlockStack>
+  );
+
+  const callout = (
+    <CalloutBanner title={t(strings, "offer_badge")}>
+      {totalPages > 1
+        ? t(strings, "offer_x_of_y", { x: pageNumber, y: totalPages })
+        : null}
+    </CalloutBanner>
+  );
+
+  // ── Bundle page: product tiles + combined copy + one accept-all button ────
+  if (isBundle) {
+    return (
+      <BlockStack spacing="loose">
+        {callout}
+        <Tiles maxPerLine={3}>
+          {products.map((product) => (
+            <BlockStack
+              key={product.variantId || product.productId}
+              spacing="tight"
+              alignment="center"
+            >
+              {product.image ? (
+                <Image source={product.image} description={product.title} />
+              ) : (
+                <View />
+              )}
+              <TextContainer alignment="center" spacing="tight">
+                <Text emphasized>{product.title}</Text>
+              </TextContainer>
+              <InlineStack spacing="xtight">
+                {showComparePrice ? (
+                  <Text role="deletion" subdued size="small">
+                    {formatMoney(product.price, currency, locale)}
+                  </Text>
+                ) : null}
+                <Text emphasized appearance="critical">
+                  {formatMoney(product.discountedPrice, currency, locale)}
+                </Text>
+              </InlineStack>
+            </BlockStack>
+          ))}
+        </Tiles>
+        <Separator />
+        <TextContainer spacing="tight">
+          <Heading>{copy.headline}</Heading>
+          <TextBlock>{copy.body}</TextBlock>
+        </TextContainer>
+        {bullets.length > 0 ? (
+          <BlockStack spacing="xtight">
+            {bullets.map((bullet, i) => (
+              <TextBlock key={i} subdued>
+                {`• ${bullet}`}
+              </TextBlock>
+            ))}
+          </BlockStack>
+        ) : null}
+        <Separator />
+        <PriceRow
+          strings={strings}
+          currency={currency}
+          locale={locale}
+          wasAmount={originalTotal}
+          nowAmount={nowTotal}
+          discountPct={discountPct}
+          showWas={showComparePrice}
+        />
+        {trustAndCountdown}
+        {banners}
+        {actionButtons}
+      </BlockStack>
+    );
+  }
+
+  // ── Sequential page: image left, copy + price + actions right ─────────────
+  const product = products[0];
+  return (
+    <BlockStack spacing="loose">
+      {callout}
+      <Layout
+        media={[
+          { viewportSize: "small", sizes: [1, 0, 1], maxInlineSize: 0.9 },
+          { viewportSize: "medium", sizes: [532, 0, 1], maxInlineSize: 420 },
+          { viewportSize: "large", sizes: [560, 38, 340] },
+        ]}
+      >
+        {product.image ? (
+          <Image source={product.image} description={product.title} />
+        ) : (
+          <View />
+        )}
+        <BlockStack />
+        <BlockStack spacing="loose">
+          <TextContainer spacing="tight">
+            <Heading>{copy.headline}</Heading>
+            <TextBlock>{copy.body}</TextBlock>
+          </TextContainer>
+          {bullets.length > 0 ? (
+            <BlockStack spacing="xtight">
+              {bullets.map((bullet, i) => (
+                <TextBlock key={i} subdued>
+                  {`• ${bullet}`}
+                </TextBlock>
+              ))}
+            </BlockStack>
+          ) : null}
+          <Separator />
+          <BlockStack spacing="xtight">
+            <Text emphasized>{product.title}</Text>
+            <PriceRow
+              strings={strings}
+              currency={currency}
+              locale={locale}
+              wasAmount={originalTotal}
+              nowAmount={nowTotal}
+              discountPct={discountPct}
+              showWas={showComparePrice}
+            />
+          </BlockStack>
+          {trustAndCountdown}
+          {banners}
+          {actionButtons}
+        </BlockStack>
+      </Layout>
+    </BlockStack>
+  );
+}
+
+/** Was/Now money row with the save-percentage badge text. */
+function PriceRow({
+  strings,
+  currency,
+  locale,
+  wasAmount,
+  nowAmount,
+  discountPct,
+  showWas,
+}) {
+  return (
+    <InlineStack spacing="tight">
+      {showWas ? (
+        <Text role="deletion" subdued size="large">
+          {`${t(strings, "was")} ${formatMoney(wasAmount, currency, locale)}`}
+        </Text>
+      ) : null}
+      <Text emphasized appearance="critical" size="large">
+        {`${t(strings, "now")} ${formatMoney(nowAmount, currency, locale)}`}
+      </Text>
+      {discountPct > 0 ? (
+        <Text emphasized appearance="success">
+          {t(strings, "save_pct", { pct: discountPct })}
+        </Text>
+      ) : null}
+    </InlineStack>
+  );
+}

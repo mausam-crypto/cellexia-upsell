@@ -1,0 +1,280 @@
+// Cellexia Post-Purchase Upsell — PRODUCTION database schema (Postgres).
+//
+// Field-for-field twin of schema.prisma (SQLite, dev-only). Keep both in
+// sync by hand when models change — `npm run setup:production` generates
+// the Prisma Client and pushes this schema, never schema.prisma.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Required by @shopify/shopify-app-session-storage-prisma — do not alter.
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+}
+
+// One row per installed shop. settingsJson holds AppSettings (see app/types.ts).
+model Shop {
+  id              String    @id @default(cuid())
+  shop            String    @unique
+  settingsJson    String    @default("{}")
+  catalogSyncedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+// Local product catalog cache, kept fresh via products/* webhooks + manual sync.
+// variantsJson: CachedVariant[]  translationsJson: { [locale]: { title, description } }
+model ProductCache {
+  id               String   @id @default(cuid())
+  shop             String
+  productId        String // gid://shopify/Product/123
+  title            String
+  handle           String   @default("")
+  productType      String   @default("")
+  vendor           String   @default("")
+  status           String   @default("ACTIVE")
+  tags             String   @default("") // comma-separated
+  imageUrl         String?
+  descriptionShort String   @default("")
+  variantsJson     String   @default("[]")
+  translationsJson String   @default("{}")
+  updatedAt        DateTime @updatedAt
+
+  @@unique([shop, productId])
+  @@index([shop, status])
+}
+
+// Admin-defined offer rule. triggerJson: RuleTrigger, discountJson: DiscountStrategy | null.
+model OfferRule {
+  id          String      @id @default(cuid())
+  shop        String
+  name        String
+  enabled     Boolean     @default(true)
+  priority    Int         @default(0) // lower number = evaluated first
+  triggerJson String      @default("{}")
+  displayMode String? // null = use global default; "sequential" | "bundle"
+  discountJson String?
+  copyLength  String? // null = global default; "short" | "long"
+  maxOffers   Int? // cap slots shown for this rule
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  slots       OfferSlot[]
+
+  @@index([shop, enabled, priority])
+}
+
+// A slot is one "page" position in the sequenced flow (1..3).
+model OfferSlot {
+  id         String           @id @default(cuid())
+  ruleId     String
+  rule       OfferRule        @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  position   Int              @default(1)
+  candidates OfferCandidate[]
+
+  @@index([ruleId])
+}
+
+// Rotation candidates within a slot. The bandit picks among enabled candidates;
+// impressions/accepts/revenue are running counters used by Thompson sampling.
+model OfferCandidate {
+  id          String    @id @default(cuid())
+  slotId      String
+  slot        OfferSlot @relation(fields: [slotId], references: [id], onDelete: Cascade)
+  productId   String
+  variantId   String // gid://shopify/ProductVariant/123
+  weight      Float     @default(1)
+  enabled     Boolean   @default(true)
+  impressions Int       @default(0)
+  accepts     Int       @default(0)
+  revenue     Float     @default(0)
+  isWinner    Boolean   @default(false)
+
+  @@index([slotId])
+}
+
+// Editable AI prompt templates. key: "single" | "bundle" | "sequential".
+model PromptTemplate {
+  id           String   @id @default(cuid())
+  shop         String
+  key          String
+  systemPrompt String
+  userPrompt   String
+  model        String   @default("claude-haiku-4-5")
+  temperature  Float    @default(0.7)
+  maxTokens    Int      @default(600)
+  version      Int      @default(1) // bumped on save; part of the copy cache key
+  updatedAt    DateTime @updatedAt
+
+  @@unique([shop, key])
+}
+
+// Cache of AI-generated copy keyed by (basket signature, offer, language, prompt version).
+model CopyCache {
+  id                 String   @id @default(cuid())
+  shop               String
+  cacheKey           String
+  language           String
+  headline           String
+  body               String
+  bulletsJson        String   @default("[]")
+  discountSuggestion Float?
+  createdAt          DateTime @default(now())
+
+  @@unique([shop, cacheKey])
+  @@index([shop, createdAt])
+}
+
+// Offers issued to a specific checkout — the server-side source of truth that
+// /api/sign-changeset validates against (never sign client-supplied changes).
+model IssuedOffer {
+  id            String   @id @default(cuid())
+  shop          String
+  referenceId   String
+  offerId       String
+  changesJson   String
+  offerMetaJson String   @default("{}")
+  createdAt     DateTime @default(now())
+  expiresAt     DateTime
+
+  @@unique([referenceId, offerId])
+  @@index([shop, createdAt])
+}
+
+// Analytics event stream. eventType: "impression" | "accepted" | "declined" | "error".
+// surface: "post_purchase" | "thank_you".
+model OfferEvent {
+  id          String   @id @default(cuid())
+  shop        String
+  referenceId String
+  orderId     String?
+  customerId  String?
+  ruleId      String?
+  candidateId String?
+  productId   String?
+  variantId   String?
+  position    Int?
+  eventType   String
+  revenue     Float    @default(0)
+  grossProfit Float    @default(0)
+  discountPct Float    @default(0)
+  market      String?
+  country     String?
+  language    String?
+  surface     String   @default("post_purchase")
+  createdAt   DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([shop, eventType, createdAt])
+  @@index([shop, candidateId])
+  @@index([shop, customerId])
+}
+
+// Race-proof replay guard for extension events: one row per (page, event type),
+// claimed atomically via the unique constraint BEFORE any OfferEvent rows or
+// counters are written. Concurrent duplicates lose the insert and are dropped.
+model EventDedup {
+  id          String   @id @default(cuid())
+  shop        String
+  referenceId String
+  position    Int
+  eventType   String
+  createdAt   DateTime @default(now())
+
+  @@unique([shop, referenceId, position, eventType])
+}
+
+// Order history captured from orders/create — powers co-purchase affinity,
+// suppression of already-owned products, and 60/90-day CLV cohorts.
+model OrderRecord {
+  id             String      @id @default(cuid())
+  shop           String
+  orderId        String
+  customerId     String?
+  totalPrice     Float       @default(0)
+  currency       String      @default("EUR")
+  country        String?
+  hadUpsellOffer Boolean     @default(false)
+  acceptedUpsell Boolean     @default(false)
+  createdAt      DateTime    @default(now())
+  lines          OrderLine[]
+
+  @@unique([shop, orderId])
+  @@index([shop, customerId, createdAt])
+  @@index([shop, createdAt])
+}
+
+model OrderLine {
+  id            String      @id @default(cuid())
+  orderRecordId String
+  order         OrderRecord @relation(fields: [orderRecordId], references: [id], onDelete: Cascade)
+  productId     String
+  variantId     String?
+  title         String      @default("")
+  quantity      Int         @default(1)
+  price         Float       @default(0)
+  isUpsell      Boolean     @default(false)
+
+  @@index([orderRecordId])
+  @@index([productId])
+}
+
+// Per-customer state for frequency capping.
+model CustomerState {
+  id             String    @id @default(cuid())
+  shop           String
+  customerId     String
+  lastOfferAt    DateTime?
+  offersShown    Int       @default(0)
+  offersAccepted Int       @default(0)
+
+  @@unique([shop, customerId])
+}
+
+// Per-market overrides, seeded from the shop's Shopify Markets.
+// countriesJson: string[] of ISO country codes.
+model MarketSetting {
+  id                String  @id @default(cuid())
+  shop              String
+  marketHandle      String
+  name              String
+  countriesJson     String  @default("[]")
+  enabled           Boolean @default(true)
+  discountOverride  Float?
+  languageOverride  String?
+  maxOffersOverride Int?
+
+  @@unique([shop, marketHandle])
+}
+
+// Buyer-facing static UI strings, per language. Seeded for all store locales,
+// editable in the admin, auto-translatable via Claude/DeepL.
+model UiString {
+  id       String @id @default(cuid())
+  shop     String
+  language String
+  key      String
+  value    String
+
+  @@unique([shop, language, key])
+  @@index([shop, language])
+}

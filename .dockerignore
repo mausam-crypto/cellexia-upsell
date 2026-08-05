@@ -1,0 +1,16 @@
+node_modules
+build
+dist
+.git
+.env
+.env.*
+!.env.example
+*.log
+prisma/*.sqlite
+prisma/*.sqlite-journal
+prisma/*.db
+prisma/*.db-journal
+.shopify/
+coverage
+extensions/*/dist
+extensions/*/node_modules

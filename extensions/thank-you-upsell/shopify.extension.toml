@@ -1,0 +1,41 @@
+# Cellexia — Thank-you page upsell fallback extension (Module K).
+#
+# Covers orders paid with Apple Pay / Google Pay / PayPal / Klarna etc., which
+# Shopify excludes from the post-purchase page (credit-card-only platform
+# limitation). This block shows a single discount-code-based offer on the
+# thank-you page instead.
+#
+# Requirements before it renders anything:
+#   1. Network access approval for checkout UI extensions
+#      (Partner Dashboard -> your app -> API access).
+#   2. The merchant must set the "App URL" setting on this block in the
+#      checkout editor (Settings -> Checkout -> Customize -> Thank you page).
+
+api_version = "2025-07"
+
+[[extensions]]
+name = "Cellexia Thank You Upsell"
+handle = "thank-you-upsell"
+type = "ui_extension"
+description = "Discount-code upsell offer on the thank-you page — fallback for wallet and PayPal payments."
+
+  [[extensions.targeting]]
+  module = "./src/ThankYou.jsx"
+  target = "purchase.thank-you.block.render"
+
+  [extensions.capabilities]
+  network_access = true
+
+  [extensions.settings]
+
+    [[extensions.settings.fields]]
+    key = "app_url"
+    type = "single_line_text_field"
+    name = "App URL"
+    description = "Public https URL of the Cellexia Upsell app backend (e.g. https://your-app.fly.dev). The offer will not render until this is set."
+
+    [[extensions.settings.fields]]
+    key = "title_override"
+    type = "single_line_text_field"
+    name = "Title override (optional)"
+    description = "Custom heading for the offer card. Leave empty to use the AI-generated headline."
