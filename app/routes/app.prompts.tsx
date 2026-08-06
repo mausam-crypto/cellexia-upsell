@@ -72,13 +72,15 @@ const TEMPLATE_VARIABLES: Array<{
   },
   {
     name: "basket_summary",
-    description: "What the buyer just ordered (quantity, title, product type).",
-    example: "2× Retinol Night Cream (Cream); 1× Vitamin C Serum (Serum)",
+    description:
+      "What the buyer just ordered — quantity, title, product type and a detailed description per product (the AI context from the Products tab when set, otherwise the Shopify description).",
+    example:
+      "2× Retinol Night Cream (Cream) — slow-release retinol that smooths fine lines overnight…",
   },
   {
     name: "offer_summary",
     description:
-      "The offered product(s): title, type, price and a short description.",
+      "The offered product(s) — title, type, price and a detailed description per product (the AI context from the Products tab when set, otherwise the Shopify description).",
     example: "Collagen Eye Serum (Serum, 49.00 EUR) — firms and brightens the eye area…",
   },
   {
@@ -100,6 +102,43 @@ const TEMPLATE_VARIABLES: Array<{
     name: "total_offers",
     description: "Total number of offer pages in the flow.",
     example: "3",
+  },
+];
+
+// What the model is asked to return — mirrored by OfferCopy in app/types.ts.
+const OUTPUT_FIELDS: Array<{ name: string; description: string }> = [
+  {
+    name: "headline",
+    description: "The hook — ≤ 60 characters.",
+  },
+  {
+    name: "body",
+    description:
+      "The lead: 1–2 sentences shown above the fold, next to the buy button.",
+  },
+  {
+    name: "bullets",
+    description: "2–3 concrete benefit bullets.",
+  },
+  {
+    name: "paragraphs",
+    description:
+      "Long copy only — 2–3 short paragraphs of mechanism, proof and relevance to the order, rendered below the buy button under a “Why it works with your order” heading.",
+  },
+  {
+    name: "proof",
+    description:
+      "Long copy only — 2–3 established research findings about ingredients named in the product descriptions, rendered under the paragraphs; never invented citations.",
+  },
+  {
+    name: "closer",
+    description:
+      "Long copy only — a one-line premium reassurance rendered directly above the buttons.",
+  },
+  {
+    name: "discount_suggestion",
+    description:
+      "Optional discount percentage — applied only when the discount mode is “AI”, clamped to your min/max.",
   },
 ];
 
@@ -156,7 +195,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       userPrompt: row?.userPrompt ?? DEFAULT_PROMPTS[key].userPrompt,
       model: row?.model ?? "claude-haiku-4-5",
       temperature: row?.temperature ?? 0.7,
-      maxTokens: row?.maxTokens ?? 600,
+      maxTokens: row?.maxTokens ?? 4000,
       version: row?.version ?? 1,
     };
   });
@@ -194,8 +233,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!systemPrompt.trim() || !userPrompt.trim()) {
       return respond(false, "System and user prompts cannot be empty.");
     }
+    // Floor of 1000: max_tokens caps thinking + output together on current
+    // Claude models, so anything lower risks truncating the JSON mid-object.
     const maxTokens = Math.round(
-      clampNumber(Number(formData.get("maxTokens")), 100, 4000, 600),
+      clampNumber(Number(formData.get("maxTokens")), 1000, 8000, 4000),
     );
     const model = String(formData.get("model") ?? "claude-haiku-4-5");
     await prisma.promptTemplate.update({
@@ -219,7 +260,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         userPrompt: DEFAULT_PROMPTS[key].userPrompt,
         model: "claude-haiku-4-5",
         temperature: 0.7,
-        maxTokens: 600,
+        maxTokens: 4000,
         version: { increment: 1 },
       },
     });
@@ -249,35 +290,53 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
 
-    const basketRows = products.slice(0, 2);
-    const offerRow =
-      products.length > 2 ? products[2] : products[products.length - 1];
-    const variants = jparse<PreviewVariant[]>(offerRow.variantsJson, []);
-    const variant =
-      variants.find(
-        (v) => v.inventoryQuantity === null || v.inventoryQuantity > 0,
-      ) ?? variants[0];
-    if (!variant) {
+    // A bundle preview must offer MULTIPLE products — previewing the bundle
+    // template with a single offered product forces the model to invent set
+    // members to satisfy the "one bullet per offered product" contract.
+    if (key === "bundle" && products.length < 3) {
+      return respond(
+        false,
+        "The bundle preview needs at least 3 products in the catalog (1 basket + 2 offered) — run a sync from the dashboard first.",
+      );
+    }
+    const basketRows = key === "bundle" ? products.slice(0, 1) : products.slice(0, 2);
+    const offerRows =
+      key === "bundle"
+        ? products.slice(1, 3)
+        : [products.length > 2 ? products[2] : products[products.length - 1]];
+
+    const toOfferProduct = (row: (typeof products)[number]): SelectedOfferProduct | null => {
+      const variants = jparse<PreviewVariant[]>(row.variantsJson, []);
+      const variant =
+        variants.find(
+          (v) => v.inventoryQuantity === null || v.inventoryQuantity > 0,
+        ) ?? variants[0];
+      if (!variant) return null;
+      return {
+        productId: row.productId,
+        variantId: variant.id,
+        title: row.title,
+        image: variant.imageUrl ?? row.imageUrl,
+        price: variant.price,
+        compareAtPrice: variant.compareAtPrice,
+        unitCost: variant.unitCost,
+        productType: row.productType,
+        tags: row.tags
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean),
+      };
+    };
+
+    const offerProducts = offerRows
+      .map(toOfferProduct)
+      .filter((p): p is SelectedOfferProduct => p !== null);
+    if (offerProducts.length === 0) {
       return respond(
         false,
         "The sample product has no variants — re-run the catalog sync.",
       );
     }
-
-    const offerProduct: SelectedOfferProduct = {
-      productId: offerRow.productId,
-      variantId: variant.id,
-      title: offerRow.title,
-      image: variant.imageUrl ?? offerRow.imageUrl,
-      price: variant.price,
-      compareAtPrice: variant.compareAtPrice,
-      unitCost: variant.unitCost,
-      productType: offerRow.productType,
-      tags: offerRow.tags
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean),
-    };
 
     const discount = settings.discount;
     const rawPct = discount.mode === "ai" ? (discount.min + discount.max) / 2 : discount.value;
@@ -298,8 +357,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           title: p.title,
           productType: p.productType,
           quantity: 1,
+          // Same precedence the live engine uses: merchant-written AI context
+          // (Products tab) → full Shopify description → short excerpt.
+          description: p.aiDescription || p.descriptionFull || p.descriptionShort,
         })),
-        offerProducts: [offerProduct],
+        offerProducts,
         discountPct,
         currency: "EUR",
         copyLength: settings.copyLength,
@@ -418,8 +480,9 @@ function PromptCard({
               type="number"
               value={maxTokens}
               onChange={setMaxTokens}
-              min={100}
-              max={4000}
+              min={1000}
+              max={8000}
+              helpText="Caps thinking + output together; keep ≥1000"
               autoComplete="off"
             />
           </Box>
@@ -530,7 +593,9 @@ export default function PromptsPage() {
                   Generates live copy with the saved prompts, using the first
                   products of your catalog cache as a sample basket. The copy
                   cache is bypassed, so this always makes a fresh call. Save
-                  your edits above before previewing them.
+                  your edits above before previewing them. For a pixel-faithful
+                  preview of the full widget with layout, use Preview in the
+                  navigation.
                 </Text>
                 <InlineStack gap="400" wrap blockAlign="end">
                   <Box minWidth="220px">
@@ -599,6 +664,35 @@ export default function PromptsPage() {
                           </Text>
                         ))}
                       </BlockStack>
+                      {(preview.copy.paragraphs?.length ?? 0) > 0 && (
+                        <BlockStack gap="200">
+                          <Text as="h4" variant="headingSm" tone="subdued">
+                            Why it works with your order
+                          </Text>
+                          {(preview.copy.paragraphs ?? []).map((paragraph, i) => (
+                            <Text key={i} as="p" variant="bodyMd">
+                              {paragraph}
+                            </Text>
+                          ))}
+                        </BlockStack>
+                      )}
+                      {(preview.copy.proof?.length ?? 0) > 0 && (
+                        <BlockStack gap="200">
+                          <Text as="h4" variant="headingSm" tone="subdued">
+                            What published research shows
+                          </Text>
+                          {(preview.copy.proof ?? []).map((line, i) => (
+                            <Text key={i} as="p" variant="bodyMd">
+                              {line}
+                            </Text>
+                          ))}
+                        </BlockStack>
+                      )}
+                      {preview.copy.closer && (
+                        <Text as="p" variant="bodyMd" fontWeight="medium">
+                          {preview.copy.closer}
+                        </Text>
+                      )}
                     </BlockStack>
                   </>
                 )}
@@ -630,6 +724,25 @@ export default function PromptsPage() {
                   </Text>
                   <Text as="p" variant="bodySm" tone="subdued">
                     {`e.g. ${variable.example}`}
+                  </Text>
+                </BlockStack>
+              ))}
+              <Divider />
+              <Text as="h3" variant="headingSm">
+                Output fields
+              </Text>
+              <Text as="p" variant="bodyMd" tone="subdued">
+                The prompts ask Claude for a single JSON object with these
+                fields. The long-form fields are only produced when the copy
+                length is “long” (the default).
+              </Text>
+              {OUTPUT_FIELDS.map((field) => (
+                <BlockStack key={field.name} gap="050">
+                  <Text as="p" variant="bodyMd" fontWeight="semibold">
+                    {field.name}
+                  </Text>
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    {field.description}
                   </Text>
                 </BlockStack>
               ))}

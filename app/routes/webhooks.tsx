@@ -10,12 +10,16 @@
 
 import type { ActionFunctionArgs } from "@remix-run/node";
 import prisma from "../db.server";
+import { toGid } from "../lib/json";
 import { authenticate } from "../shopify.server";
+import type { AdminGraphql } from "../types";
 import { recordOrderFromWebhook } from "../services/analytics.server";
 import {
   deleteProductFromWebhook,
+  syncProductTranslations,
   upsertProductFromWebhook,
 } from "../services/catalog.server";
+import { getSettings } from "../services/settings.server";
 import { redactCustomer, redactShop } from "../services/bootstrap.server";
 
 /** Webhooks are POST-only. Answer GET (and anything else) with a 405. */
@@ -38,7 +42,7 @@ async function safely(label: string, fn: () => Promise<unknown>): Promise<void> 
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { topic, shop, session, payload } = await authenticate.webhook(request);
+  const { topic, shop, session, payload, admin } = await authenticate.webhook(request);
   const body = (payload ?? {}) as Record<string, any>;
 
   switch (topic) {
@@ -54,6 +58,34 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await safely(`${topic} (${shop})`, () =>
         upsertProductFromWebhook(shop, body),
       );
+      // Freshness: pull this product's Translate & Adapt values (title +
+      // description per enabled language) in the background when the delivery
+      // carries an admin client. Fire-and-forget — the 200 acknowledgment is
+      // never delayed or failed by GraphQL calls.
+      try {
+        const rawId = body.admin_graphql_api_id ?? body.id;
+        if (admin && rawId !== undefined && rawId !== null && rawId !== "") {
+          const graphql = admin.graphql as unknown as AdminGraphql;
+          const productId = toGid("Product", rawId);
+          void (async () => {
+            const settings = await getSettings(shop);
+            await syncProductTranslations(graphql, shop, {
+              productIds: [productId],
+              locales: settings.languages,
+            });
+          })().catch((error) =>
+            console.error(
+              `[webhooks] ${topic} translations refresh failed for ${shop}`,
+              error,
+            ),
+          );
+        }
+      } catch (error) {
+        console.error(
+          `[webhooks] ${topic} translations refresh setup failed for ${shop}`,
+          error,
+        );
+      }
       break;
     }
 

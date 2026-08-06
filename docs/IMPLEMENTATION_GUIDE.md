@@ -30,6 +30,7 @@ read [MERCHANT_GUIDE.md](MERCHANT_GUIDE.md).
 18. [Troubleshooting](#18-troubleshooting)
 19. [GDPR / privacy notes](#19-gdpr--privacy-notes)
 20. [Known dependency advisories](#20-known-dependency-advisories)
+21. [The offer copy JSON contract (prompt editing)](#21-the-offer-copy-json-contract-prompt-editing)
 
 ---
 
@@ -125,10 +126,16 @@ both extensions, and prints a preview URL. Keep it running for the next steps.
 
 Schema changes are applied the same way: re-run `npm run setup` (i.e.
 `prisma db push`) after pulling updates. The schema has grown since the
-initial release — e.g. the `EventDedup` replay-guard table was added after
-these docs were first written — and `prisma db push` adds any missing
-tables/columns without touching existing data. (During `npm run dev` the
-`predev` hook in `shopify.web.toml` does this automatically.)
+initial release — e.g. the `EventDedup` replay-guard table, and more recently
+two `ProductCache` columns: `descriptionFull` (the full plain-text Shopify
+product description, synced and capped at ~12,000 chars) and `aiDescription`
+(merchant-written AI context from the admin's Products tab, which overrides
+the Shopify description as copywriting grounding when non-empty) — and
+`prisma db push` adds any missing tables/columns without touching existing
+data. (During `npm run dev` the `predev` hook in `shopify.web.toml` does this
+automatically.) After pulling the `ProductCache` change, run a catalog
+**Sync** from the dashboard once so `descriptionFull` gets populated for
+existing products.
 
 ## 6. Install on a development store
 
@@ -145,6 +152,13 @@ tables/columns without touching existing data. (During `npm run dev` the
    the two reminders below (post-purchase page selection, payment-method
    coverage). If the catalog shows as not synced, press the dashboard's
    **Sync** action (it re-runs `syncCatalog` + `syncMarketsAndLocales`).
+
+Catalog freshness after install is two-speed by design: a `products/create` /
+`products/update` webhook refreshes **that product's** cache row — including
+its Translate & Adapt translated names — while the full **Sync** refreshes
+everything (all products, full descriptions, and every language's translated
+names). Day-to-day product edits take care of themselves; run a full Sync
+after bulk imports or bulk translation work in Translate & Adapt.
 
 ## 7. Enable the post-purchase page
 
@@ -237,6 +251,15 @@ Notes:
 - The frequency cap applies to test customers too: by default a customer who
   saw an offer is not shown another for 14 days (`frequencyCapDays`). Test as
   guest, use different customer emails, or lower the cap in Settings.
+
+You don't need a test order just to look at offers and copy: the admin's
+**Preview** page (`/app/preview`, route `app/routes/app.preview.tsx`)
+simulates a purchase — basket, country, language, device — through the
+**production pipeline** (real `selectOffers`, real AI copy generation) and
+renders the result. It records no analytics events and cleans up the
+`IssuedOffer` rows it creates, so previews never pollute stats and can never
+be accepted by a buyer. Test-card orders are still required to verify the
+end-to-end mechanics (changeset signing, payment, webhooks, events).
 
 ## 11. Deploy the extensions
 
@@ -489,6 +512,8 @@ Work through this on a dev store before go-live:
       "Add all to my order" button.
 - [ ] Store language switched (e.g. French storefront) → offer copy and all
       buttons/labels are in that language.
+- [ ] **Preview page** (`/app/preview`): generate an advanced preview in 2–3
+      languages and verify translated product names and copy in each.
 - [ ] Thank-you block renders on the thank-you page, shows a discount code,
       and its CTA opens a cart link with the code applied.
 - [ ] Thank-you block appears for a wallet-paid order (or simulate by only
@@ -501,6 +526,16 @@ Work through this on a dev store before go-live:
       (no 500s, no blank page).
 
 ## 18. Troubleshooting
+
+### Setup / build failures
+
+| Symptom | Cause & fix |
+|---|---|
+| `npm run setup` or `npm run dev` fails with `Validation Error Count: 1 [Context: getConfig]` / `Environment variable not found: DATABASE_URL` | No `.env` file yet. Since v1.4 the setup scripts create one automatically from `.env.example`; on older copies run `cp .env.example .env` first. |
+| `shopify app dev` exits complaining about the client ID / can't find the app | `shopify.app.toml` still has the placeholder `client_id`. Run `shopify app config link` (§3) after creating the app in the Partner Dashboard — the CLI fills it in. |
+| Extension bundling fails resolving `react-reconciler` | Run `npm install` from the repo root (workspaces install it); the dependency is pinned in `extensions/thank-you-upsell/package.json` — do not remove it. |
+
+
 
 ### The post-purchase offer doesn't show
 
@@ -572,6 +607,12 @@ Check in this order — the first four cover ~90% of cases:
 - AI copy falls back to English-ish templates when `ANTHROPIC_API_KEY` is
   missing or Claude timed out (the response is cached in the background, so
   the *next* buyer in that language usually gets real copy).
+- Product **names** inside the copy come verbatim from Shopify's Translate &
+  Adapt — the AI never translates names itself. If a name shows untranslated,
+  add the translation in Translate & Adapt, then either edit/save the product
+  (the `products/update` webhook refreshes that product's translated names)
+  or run the dashboard **Sync** (refreshes everything). The admin's Products
+  tab shows per-product translated-name coverage badges.
 
 ### Webhooks not arriving
 
@@ -626,3 +667,48 @@ How they apply to this app:
   (services, routes, extensions) is unaffected by that migration.
 
 Re-run `npm audit` periodically and reassess whenever new advisories appear.
+
+## 21. The offer copy JSON contract (prompt editing)
+
+The prompt templates (admin → Prompts) instruct the model to return **only
+minified JSON**. If you edit or rewrite a prompt, the output shape you must
+preserve is (authoritative type: `OfferCopy` in `app/types.ts`):
+
+```json
+{
+  "headline": "…",
+  "body": "…",
+  "bullets": ["…", "…", "…"],
+  "paragraphs": ["…", "…"],
+  "proof": ["…", "…"],
+  "closer": "…",
+  "discount_suggestion": null
+}
+```
+
+| Field | What it is | Where it renders |
+|---|---|---|
+| `headline` | The hook | Top of the offer page |
+| `body` | The **lead** — the promise, 1–2 sentences | Above the fold, next to the CTA |
+| `bullets` | 3–4 concrete fact bullets | Under the lead |
+| `closer` | One-line premium reassurance | Directly **above the buttons** |
+| `paragraphs` | 2–3 short paragraphs — mechanism / proof / relevance-to-order | **Below the CTA**, under the "Why it works with your order" heading (the translatable `why_it_works` UI string) |
+| `proof` | 2–3 one-line **research statements** — established published findings about ingredients named in the brief; ingredient-level only, never product-level, no invented citations | Under the paragraphs, beneath the "What published research shows" subheading (the translatable `research_shows` UI string) |
+| `discount_suggestion` | number or `null` | Not rendered — only honored when Settings → Discount mode is *AI-adjusted*, then clamped to the [min, max] band |
+
+Rules that keep the pipeline healthy:
+
+- `paragraphs`, `proof` and `closer` are **optional** in the type
+  (`paragraphs?` / `proof?` / `closer?`) and are expected only for
+  `{{length}}` = `long` (the default since `copyLength` moved to `"long"`).
+  For `short`, the model should produce lead + bullets only. An empty or
+  absent `paragraphs` simply hides the "Why it works" section on the offer
+  page, and an empty or absent `proof` hides the research block — nothing
+  breaks.
+- Everything must be written in `{{language}}`, and product names must be
+  used **verbatim** as given in the prompt — they come from Translate & Adapt
+  and must never be re-translated by the model.
+- The parser is defensive (strips code fences, seeks the first `{`), fields
+  are validated/truncated, and every failure path degrades to deterministic
+  fallback copy. A broken prompt never breaks checkout — it just wastes the
+  AI call, so use the Prompts page's **Preview** after any edit.

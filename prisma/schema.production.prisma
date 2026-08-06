@@ -58,6 +58,11 @@ model ProductCache {
   tags             String   @default("") // comma-separated
   imageUrl         String?
   descriptionShort String   @default("")
+  // Full plain-text Shopify product description (synced, capped ~12000 chars).
+  descriptionFull  String   @default("")
+  // Merchant-written AI context from the Products tab; overrides the Shopify
+  // description as copywriting grounding when non-empty.
+  aiDescription    String   @default("")
   variantsJson     String   @default("[]")
   translationsJson String   @default("{}")
   updatedAt        DateTime @updatedAt
@@ -123,7 +128,9 @@ model PromptTemplate {
   userPrompt   String
   model        String   @default("claude-haiku-4-5")
   temperature  Float    @default(0.7)
-  maxTokens    Int      @default(600)
+  // Cap on thinking + output together (thinking-by-default models). A tight
+  // cap truncates the JSON mid-object; 4000 is headroom, not spend.
+  maxTokens    Int      @default(4000)
   version      Int      @default(1) // bumped on save; part of the copy cache key
   updatedAt    DateTime @updatedAt
 

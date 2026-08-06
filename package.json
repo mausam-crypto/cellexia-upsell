@@ -9,7 +9,8 @@
     "extensions/*"
   ],
   "scripts": {
-    "setup": "prisma generate && prisma db push",
+    "ensure-env": "node -e \"const fs=require('fs');if(!fs.existsSync('.env')){fs.copyFileSync('.env.example','.env');console.log('Created .env from .env.example — fill in your keys (see docs/IMPLEMENTATION_GUIDE.md §4).');}\"",
+    "setup": "npm run ensure-env && prisma generate && prisma db push",
     "dev": "shopify app dev",
     "config:link": "shopify app config link",
     "deploy": "shopify app deploy",

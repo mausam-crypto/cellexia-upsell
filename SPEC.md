@@ -250,7 +250,7 @@ export async function claudeComplete(args: { model: string; system: string; prom
 export interface GenerateCopyArgs {
   shop: string; settings: AppSettings; mode: PromptKey;
   position: number; totalOffers: number; language: string;
-  basket: { title: string; productType: string; quantity: number }[];
+  basket: { title: string; productType: string; quantity: number; description?: string }[];
   offerProducts: SelectedOfferProduct[];
   discountPct: number; currency: string; copyLength: CopyLength;
   bypassCache?: boolean; timeoutMs?: number;
@@ -467,7 +467,8 @@ type: "product", multiple: ... })` — take `sel?.[0]?.id`, `title`,
 - **I `app.prompts.tsx`**: one Card per PromptKey (Single product / Bundle /
   Sequenced offers): system + user prompt TextFields (multiline 8/12),
   model Select (`claude-haiku-4-5` "fast", `claude-sonnet-5` "best"),
-  temperature (0–1 step .1), maxTokens; Save (bumps `version`); "Reset to
+  maxTokens (default 4000 — caps thinking + output on current Claude models,
+  so keep ≥1000; no temperature control, sampling params are not sent); Save (bumps `version`); "Reset to
   default" (intent per key); Preview section: language Select + "Generate
   preview" → action uses first 2 catalog products as fake basket + 1 as offer,
   `bypassCache: true`, renders headline/body/bullets + latency + fallback flag.

@@ -36,7 +36,6 @@ import {
   Spinner,
 } from "@shopify/post-purchase-ui-extensions-react";
 
-// ════════════════════════════════════════════════════════════════════════════
 const APP_URL = "https://cellexia-upsell.onrender.com";
 
 /** Inline English fallbacks — used only when the server strings are missing. */
@@ -55,6 +54,8 @@ const FALLBACK_STRINGS = {
   processing: "Adding to your order…",
   error_try_again: "Something went wrong. Your original order is not affected.",
   discount_applied: "{pct}% off — post-purchase exclusive",
+  why_it_works: "Why it works with your order",
+  research_shows: "What published research shows",
 };
 
 // ── Small helpers ────────────────────────────────────────────────────────────
@@ -492,6 +493,27 @@ export function App() {
   const products = offer.products;
   const copy = offer.copy || { headline: "", body: "", bullets: [] };
   const bullets = Array.isArray(copy.bullets) ? copy.bullets.filter(Boolean) : [];
+  // Long-form copy (optional): deep-dive paragraphs + one-line closer.
+  const paragraphs = Array.isArray(copy.paragraphs)
+    ? copy.paragraphs.filter((p) => typeof p === "string" && p.trim().length > 0)
+    : [];
+  // Research statements (optional): rendered under the paragraphs with their
+  // own sub-heading. Coerce finite numbers, drop anything else non-string.
+  const proof = Array.isArray(copy.proof)
+    ? copy.proof
+        .map((item) =>
+          typeof item === "string"
+            ? item
+            : typeof item === "number" && Number.isFinite(item)
+              ? String(item)
+              : "",
+        )
+        .filter((item) => item.trim().length > 0)
+    : [];
+  const closer =
+    typeof copy.closer === "string" && copy.closer.trim().length > 0
+      ? copy.closer
+      : null;
   const discountPct = Math.round(toAmount(offer.discountPct));
   const showComparePrice = ui.showComparePrice !== false;
 
@@ -558,6 +580,38 @@ export function App() {
       ) : null}
     </BlockStack>
   );
+
+  // Calm one-line reassurance rendered directly above the buttons.
+  const closerLine = closer ? <Text emphasized>{closer}</Text> : null;
+
+  // Deep-dive persuasion (long copy) — rendered BELOW the buttons so the CTA
+  // stays high on every viewport. Hidden entirely when there are neither
+  // paragraphs nor research statements; the section heading always renders
+  // when proof is present so the research block has context.
+  const whyItWorks =
+    paragraphs.length > 0 || proof.length > 0 ? (
+      <BlockStack spacing="tight">
+        <Separator />
+        <TextBlock emphasized>{t(strings, "why_it_works")}</TextBlock>
+        {paragraphs.map((paragraph, i) => (
+          <TextBlock key={i} size="small">
+            {paragraph}
+          </TextBlock>
+        ))}
+        {proof.length > 0 ? (
+          <BlockStack spacing="xtight">
+            <TextBlock emphasized size="small">
+              {t(strings, "research_shows")}
+            </TextBlock>
+            {proof.map((item, i) => (
+              <TextBlock key={i} subdued size="small">
+                {`• ${item}`}
+              </TextBlock>
+            ))}
+          </BlockStack>
+        ) : null}
+      </BlockStack>
+    ) : null;
 
   const callout = (
     <CalloutBanner title={t(strings, "offer_badge")}>
@@ -626,7 +680,9 @@ export function App() {
         />
         {trustAndCountdown}
         {banners}
+        {closerLine}
         {actionButtons}
+        {whyItWorks}
       </BlockStack>
     );
   }
@@ -678,9 +734,11 @@ export function App() {
           </BlockStack>
           {trustAndCountdown}
           {banners}
+          {closerLine}
           {actionButtons}
         </BlockStack>
       </Layout>
+      {whyItWorks}
     </BlockStack>
   );
 }

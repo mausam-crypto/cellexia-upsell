@@ -46,9 +46,11 @@ What you see:
   selected in *Settings → Checkout* in the store admin, and (b) the
   post-purchase page only appears for credit-card payments — other payment
   methods are covered by the thank-you fallback.
-- **Sync** action — refreshes the product catalog, markets and languages from
-  Shopify. Products update automatically via webhooks, but run this after
-  bulk imports or if something looks stale.
+- **Sync** action — refreshes the product catalog (including full product
+  descriptions and every language's Translate & Adapt product names), markets
+  and languages from Shopify. Individual products update automatically via
+  webhooks — including their translated names — but run this after bulk
+  imports, translation sessions, or if something looks stale.
 
 ## Offers (rules)
 
@@ -72,7 +74,11 @@ on/off or delete them here.
    - **Display mode:** *Store default* (sequential), *Sequential* (one offer
      per page, up to 3 pages), or *Bundle* (all products on one page, one
      combined pitch, one "Add all" button).
-   - **Copy length:** short (default — punchy) or long (more persuasion room).
+   - **Copy length:** *Store default* (long, unless you changed it in
+     Settings → General), or force it for this rule. **Long** is the full
+     structure described in *Prompts → What buyers see* — including the
+     "Why it works with your order" section and the research block;
+     **short** is compact: lead + bullets only.
    - **Max offers:** 1–3.
    - **Three slots** — slot 1 is the first page the buyer sees, slot 2 the
      second, etc. Each slot holds one or more **candidates**: put 2+ products
@@ -117,6 +123,42 @@ traffic — except for a 10% exploration share that keeps checking whether
 things changed. You can reset the experiment stats or force a winner-pick from
 Settings.
 
+## Products
+
+The **Products** tab is the catalog as the app sees it, with two things worth
+managing per product:
+
+**AI context.** Each product has a free-text box for what the AI should know
+when it writes copy about that product: the hero ingredient and what it does,
+texture and routine step, who it's for, how it pairs with other products,
+proof points and vetted study facts (the research block builds on facts from
+exactly this text — see [The research block](#the-research-block)). The AI
+grounds its copy in exactly one of two sources, in this order of precedence:
+
+1. **Your AI context text** — when non-empty, it wins and the Shopify
+   description is ignored for copywriting.
+2. **The full Shopify product description** (synced automatically) — used
+   whenever you haven't written anything.
+
+You don't have to fill these in — Shopify descriptions are usually enough.
+Write AI context where a description is thin, written for SEO rather than
+persuasion, or where you want to steer the angle (e.g. "always position the
+eye serum as the finishing step of a retinol routine"). Plain factual
+sentences work best; the AI turns them into copy. Start with the products you
+offer most.
+
+**Translated-name coverage.** Each product shows a badge with how many of your
+store languages have a translated product name. Product names in buyer-facing
+copy come **verbatim from Shopify's Translate & Adapt** — the AI is never
+allowed to translate or restyle a product name itself. If a language has no
+translated name, buyers in that language see the default name, so the badges
+show at a glance where Translate & Adapt needs attention.
+
+**Sync.** The tab's Sync button re-pulls everything from Shopify: titles,
+descriptions, prices, and every language's Translate & Adapt names. Editing a
+product in Shopify also refreshes it automatically (via webhooks), including
+its translated names — Sync is for bulk edits and translation sessions.
+
 ## Prompts (AI copy)
 
 Three templates, one per situation:
@@ -126,9 +168,86 @@ Three templates, one per situation:
 - **Sequenced offers** — page N of M; instructed not to repeat the previous
   pages' angles.
 
-For each you can edit the **system prompt** (the persona/rules) and the
-**user prompt** (the request), pick the **model** — `claude-haiku-4-5` (fast,
-default) or `claude-sonnet-5` (best) — and tune the max tokens.
+### What buyers see: the anatomy of an offer page
+
+Long copy (the default) has a fixed structure. The AI fills the slots; the
+offer page decides where each one renders relative to the buy button:
+
+**Above / next to the button:**
+
+1. **Headline** — the hook.
+2. **Lead** — the promise, 1–2 sentences.
+3. **3–4 fact bullets** — concrete, specific benefits.
+4. **Closer** — one line of premium reassurance directly above the buttons
+   (the "of course you can trust this" note).
+
+**Below the button:**
+
+5. **"Why it works with your order"** — 2–3 short paragraphs covering the
+   **mechanism** (how it works), the **proof** (why to believe it), and the
+   **relevance** (why it belongs with what they just bought). It sits below
+   the CTA deliberately: interested buyers scroll for the full argument, and
+   on mobile the button stays above the fold.
+6. **"What published research shows"** — the optional **research block**:
+   2–3 one-line statements of established published findings about the
+   offered product's ingredients, rendered under the paragraphs with its own
+   subheading. See [The research block](#the-research-block) for exactly what
+   it may and may not say.
+
+The register is classic direct-response done premium — the Schwartz /
+Bencivenga school: lead with the mechanism, be specific, prove every claim,
+and **never use urgency or hype**. The countdown is the only time element on
+the page; the copy itself doesn't push.
+
+**Short copy** (a per-rule option, or the store default in Settings →
+General) drops the paragraphs, the research block and the closer: a compact
+lead + bullets only. Use it for inexpensive impulse add-ons that don't need
+an argument.
+
+The section headings "Why it works with your order" and "What published
+research shows" are static strings, not AI output — they're translated and
+editable on the **Translations** page (keys `why_it_works` and
+`research_shows`) like any button label.
+
+### The research block
+
+Long copy can end with a short science section: 2–3 one-line statements of
+what published research shows about the offered product's **ingredients**,
+under the "What published research shows" subheading. It exists because
+ingredient science is Cellexia's register — a calm, factual note does the
+premium-proof work without hype. Its guardrails, baked into the pipeline:
+
+- **Established findings only, no invented citations.** Only widely
+  replicated, textbook-level results are allowed — never a fabricated study
+  name, journal, author, year, or percentage. The lines are deliberately
+  citation-free summaries ("published research consistently shows…"), not
+  fake footnotes.
+- **Only ingredients actually named in your product descriptions.** The model
+  may only reference ingredients that appear in that product's grounding text
+  — your Products-tab AI context when set, otherwise the Shopify description.
+  If the text names no ingredients, the block simply doesn't render.
+- **Ingredient-level, never product-level.** It may state what research shows
+  about retinol as an ingredient; it must never claim or imply that a study
+  was conducted on the Cellexia product itself.
+
+> **Important — compliance.** These guardrails reduce risk; they don't move
+> responsibility. Research statements are advertising claims next to a buy
+> button, and cosmetic-claims rules differ by market — **you remain
+> responsible for regulatory review of the claims shown in your markets.**
+> Two practical habits: (1) **spot-check the research lines in the
+> [Preview](#preview) page** for your top products, languages and markets,
+> especially after editing prompts or product descriptions; (2) for full
+> control over what the block says, **write your own vetted study facts into
+> the Products tab AI context** — the copywriter treats the brief's facts as
+> its primary source, so the block is built from your sentences instead of
+> the model's general knowledge. That is the most controlled option.
+
+### Editing the templates
+
+For each of the three templates you can edit the **system prompt** (the
+persona/rules) and the **user prompt** (the request), pick the **model** —
+`claude-haiku-4-5` (fast, default) or `claude-sonnet-5` (best) — and tune the
+max tokens.
 Saving bumps the template's version, which invalidates the copy cache so new
 copy is generated.
 
@@ -140,24 +259,60 @@ copy is generated.
 | `{{tone}}` | Tone instruction from Settings |
 | `{{language}}` | The buyer's language — copy is written in it |
 | `{{length}}` | short / long |
-| `{{basket_summary}}` | What the customer just bought, e.g. "2× Retinol Night Cream (Cream); 1× Vitamin C Serum (Serum)" |
-| `{{offer_summary}}` | The offered product(s): title, type, price, short description |
+| `{{basket_summary}}` | What the customer just bought, one line per product including its short description, e.g. "- 2× Retinol Night Cream (Cream) — Overnight formula that smooths the look of fine lines" |
+| `{{offer_summary}}` | The offered product(s): title, type, price, and the description grounding — your Products-tab AI context when set, otherwise the Shopify description |
 | `{{discount_pct}}` | The discount for this offer |
 | `{{currency}}` | Order currency |
 | `{{position}}` / `{{total_offers}}` | "Offer 2 of 3" context for sequenced flows |
 
 **Preview** — pick a language and generate a sample using real catalog
 products, so you can see headline/body/bullets (and generation latency) before
-buyers do.
+buyers do. For a full simulated offer page — chosen basket, country, language
+and device, with the real engine picking the products — use the dedicated
+[Preview page](#preview) instead.
 
 Guardrails baked into the default prompts (keep them if you rewrite): write in
 the buyer's language; concrete benefit tied to what's in the basket; **never**
 imply the original purchase was wrong or incomplete; no medical claims; no
-emojis; mention the discount naturally.
+emojis; no urgency or scarcity talk — the register stays premium; use product
+names exactly as given (they come from Translate & Adapt); mention the
+discount naturally; research statements stay ingredient-level, cover only
+ingredients named in the brief, and never invent citations.
 
 If the AI is unavailable or slow (over ~2.5s), buyers see clean generic
 fallback copy instead of waiting — and the real copy is generated in the
 background for the next buyer. Nothing ever blocks the checkout.
+
+## Preview
+
+The **Preview** page simulates the buyer experience end to end — without
+placing a test order or touching a real checkout. You compose a situation:
+
+- **Basket** — the product(s) the imaginary customer just bought.
+- **Country** — so market settings, overrides and discount tiers apply as
+  they would for a real order shipping there.
+- **Language** — the buyer's storefront language.
+- **Device** — phone or desktop framing, since the offer page lays out
+  differently on each.
+
+Generate, and the app runs the **real recommendation engine** (rules,
+suppression, rotation, auto-pilot) and writes **real AI copy** through the
+same pipeline buyers hit. What you see — offer selection, translated product
+names, discount math, the full copy structure including the research block —
+is what a matching buyer would get, not a mockup. A **Regenerate** toggle
+forces fresh copy instead of reusing the copy cache — useful when judging
+variety or right after a prompt edit.
+
+Previews are invisible to the live system: they record no impressions or
+analytics events (so nothing shifts your stats, experiments or frequency
+caps), and the temporary offer records they create are cleaned up
+automatically — a preview can never be shown to or accepted by a real buyer.
+
+Use it to spot-check your top languages after prompt edits, verify translated
+names before a market launch, review research-block claims (see the
+compliance note in [The research block](#the-research-block)), and
+sanity-check what a new rule will actually offer for a given basket before
+enabling it.
 
 ## Settings
 
@@ -166,8 +321,10 @@ Each section saves independently.
 - **General** — master on/off, thank-you fallback on/off, offers per order:
   **1 for single-product orders, up to 3 for multi-product orders**
   (the defaults; hard maximum is 3 — a Shopify limit), default display mode
-  (sequential), brand context and tone fed to the AI, compare-at price
-  display, countdown (default on, 10 minutes).
+  (sequential), default copy length (**long** — the full structure with the
+  "Why it works with your order" section; *short* cuts it to lead + bullets
+  only), brand context and tone fed to the AI, compare-at price display,
+  countdown (default on, 10 minutes).
 - **Discount** — the global strategy:
   - *Fixed*: always the same %.
   - *Tiered* (default): by order value — 10% / 12% from €60 / 15% from €120.
@@ -194,10 +351,15 @@ Each section saves independently.
 
 ## Translations
 
-The **offer copy** (headline, body, bullets) is generated per-language by the
-AI — you don't translate it. This page manages the **static strings** around
-it: buttons ("Add to my order", "No thanks, complete my order"), price labels
-("Was/Now/Save x%"), the countdown label, the thank-you page texts, etc.
+The **offer copy** (headline, lead, bullets, the "Why it works" paragraphs,
+the research lines, the closer) is generated per-language by the AI — you
+don't translate it. And the product **names** inside that copy come verbatim
+from Shopify's Translate & Adapt (see [Products](#products)). This page
+manages the **static strings** around the copy: buttons ("Add to my order",
+"No thanks, complete my order"), price labels ("Was/Now/Save x%"), the
+countdown label, the **"Why it works with your order"** and **"What published
+research shows"** section headings (keys `why_it_works` and `research_shows`),
+the thank-you page texts, etc.
 
 Pick a language, edit any string (missing ones show the English placeholder),
 and Save. **Auto-translate missing** fills gaps via AI; **Re-translate all**
@@ -279,5 +441,9 @@ analysis.
    thank-you fallback with a 48-hour single-use code — expect lower volume
    from that surface; it's a bonus channel, not the main act.
 10. **Mind the copy guardrails.** The AI is instructed to never suggest the
-    customer bought the wrong thing and to make no medical claims — keep those
-    rules in any prompt edits; they're brand protection, not style.
+    customer bought the wrong thing, to make no medical claims, to keep
+    research statements ingredient-level with no invented citations, and to
+    never use urgency or hype (the countdown is the only time pressure on the
+    page) — keep those rules in any prompt edits; they're brand protection,
+    not style. And remember the research block's compliance note: regulatory
+    review of the claims shown in your markets stays with you.

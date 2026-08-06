@@ -81,6 +81,11 @@ app/
     app.analytics.tsx              Analytics + CSV export
     app.offers._index.tsx          Rules list
     app.offers.$id.tsx             Rule editor ("new" = create)
+    app.preview.tsx                Offer preview sandbox — runs the production
+                                   pipeline, cleans up its IssuedOffer rows,
+                                   records no analytics
+    app.products.tsx               Products tab: AI-context editor +
+                                   translated-name coverage
     app.prompts.tsx                Prompt templates + live preview
     app.settings.tsx               Settings sections
     app.translations.tsx           UI-string editor + auto-translate
@@ -205,7 +210,9 @@ Shopify ──▶ POST /webhooks (app/routes/webhooks.tsx)
                           match accepted OfferEvents by order/reference id →
                           hadUpsellOffer / acceptedUpsell / line.isUpsell,
                           backfill OfferEvent.orderId
-  products/create|update → catalog.upsertProductFromWebhook (ProductCache)
+  products/create|update → catalog.upsertProductFromWebhook (ProductCache,
+                          incl. refreshing that product's Translate & Adapt
+                          translated names; a full sync refreshes everything)
   products/delete       → catalog.deleteProductFromWebhook
   app/uninstalled       → delete Sessions for shop (data kept for reinstall)
   customers/data_request→ log + 200 (minimal data held)
@@ -242,7 +249,7 @@ always read/write them with `jparse`/`jstr` from `app/lib/json.ts`.
 |---|---|
 | `Session` | Shopify OAuth sessions — required shape for `@shopify/shopify-app-session-storage-prisma`; never alter. |
 | `Shop` | One row per installed shop. `settingsJson` holds a *partial* `AppSettings` that `getSettings` deep-merges over `DEFAULT_SETTINGS` (unset keys keep tracking defaults). `catalogSyncedAt` drives the dashboard checklist. |
-| `ProductCache` | Local catalog: title/handle/type/vendor/status/tags/image/short description, `variantsJson: CachedVariant[]` (price, compare-at, inventory, unit cost, sku), `translationsJson` per-locale titles. Kept fresh by `products/*` webhooks + manual sync. All offer selection reads this, never live Shopify. |
+| `ProductCache` | Local catalog: title/handle/type/vendor/status/tags/image, `descriptionShort` (~300 chars, basket summaries), `descriptionFull` (full plain-text Shopify description, capped ~12,000 chars), `aiDescription` (merchant-written AI context from the admin's Products tab), `variantsJson: CachedVariant[]` (price, compare-at, inventory, unit cost, sku), `translationsJson` per-locale titles from Translate & Adapt. Copywriting grounds each offered product in its **effective description**: `aiDescription` when non-empty, otherwise `descriptionFull`. Kept fresh by `products/*` webhooks (which refresh that product's row incl. translated names) + manual full sync. All offer selection reads this, never live Shopify. |
 | `OfferRule` | Admin-defined rule: `triggerJson: RuleTrigger` (AND semantics, empty = any), priority (asc, first match wins), optional per-rule `displayMode` / `discountJson` / `copyLength` / `maxOffers`. |
 | `OfferSlot` | One "page" position (1..3) in a rule's sequenced flow. Cascade-deleted with the rule. |
 | `OfferCandidate` | A rotation candidate within a slot: product/variant, weight, enabled, running `impressions`/`accepts`/`revenue` counters (the Thompson-sampling posteriors), `isWinner` flag set by `autoPickWinners`. |
@@ -302,15 +309,21 @@ the Beta posteriors (2000 draws) and flags a winner at
 
 - `generateCopy` resolves the `PromptTemplate` for the mode, interpolates the
   `{{...}}` variables, and checks `CopyCache` by content hash.
+- **Grounding precedence:** each offered product's description in the prompt
+  is its *effective description* — `ProductCache.aiDescription`
+  (merchant-written AI context, Products tab) when non-empty, otherwise
+  `ProductCache.descriptionFull` (the synced full Shopify description).
 - Cache miss → `claudeComplete` (plain `fetch` to
   `api.anthropic.com/v1/messages`, no SDK, `AbortSignal.timeout`), racing the
   configured `aiTimeoutMs` (default 2500 ms). No sampling parameters
   (`temperature`/`top_p`/`top_k`) are ever sent — newer Claude models reject
   them — so style is steered entirely through the prompts. The response must
-  be minified
-  JSON (`headline`, `body`, `bullets[2..3]`, `discount_suggestion`); parsing is
-  defensive (strips code fences, seeks the first `{`), fields are
-  validated/truncated, then cached.
+  be minified JSON (`headline`, `body` = the lead, `bullets[3..4]`, plus
+  `paragraphs[2..3]`, `proof[2..3]` (ingredient-level research statements) and
+  `closer` for long copy, `discount_suggestion` — see
+  IMPLEMENTATION_GUIDE §21 for the full contract); parsing is defensive
+  (strips code fences, seeks the first `{`), fields are validated/truncated,
+  then cached.
 - Timeout/error → deterministic `fallbackCopy` built from UI strings and
   product titles is returned **immediately**, while the same generation is
   fired again *without* timeout in the background to warm the cache for the
@@ -320,6 +333,92 @@ the Beta posteriors (2000 draws) and flags a winner at
 - Translation of static UI strings goes through Claude or DeepL
   (`translationProvider`); the Claude path likewise sends no temperature
   parameter. DeepL keys ending `:fx` are routed to the free-tier host.
+
+### 6.1 `OfferCopy` — the extended shape and where each part renders
+
+`OfferCopy` (`app/types.ts`) is the contract between the copy pipeline and
+both extensions. Relative to the CTA buttons, the parts render:
+
+```
+headline                          ─┐
+body        (the lead — the       │  above the fold /
+             promise, 1–2         │  next to the CTA
+             sentences)           │
+bullets     (3–4 fact bullets)    │
+closer?     (one-line premium    ─┘  directly above the buttons
+             reassurance)
+[ CTA buttons ]
+paragraphs? (2–3 short paragraphs:   below the CTA, under the
+             mechanism / proof /     "why_it_works" UI-string heading
+             relevance-to-order)     ("Why it works with your order")
+proof?      (2–3 research            under the paragraphs, with its own
+             statements —            "research_shows" UI-string subheading
+             established findings    ("What published research shows")
+             about ingredients
+             named in the brief)
+```
+
+`paragraphs`, `proof` and `closer` are optional (`paragraphs?` / `proof?` /
+`closer?`): empty or absent simply hides those pieces — which is exactly what
+`copyLength: "short"` produces (lead + bullets only). The default
+`copyLength` is `"long"` (`DEFAULT_SETTINGS` in `app/types.ts`), overridable
+globally in Settings and per rule. Putting `paragraphs` **below** the CTA is
+deliberate: the full persuasion argument is there for buyers who scroll,
+while the button stays above the fold on mobile. The section headings are the
+`why_it_works` and `research_shows` UI strings — seeded, editable and
+translatable like every other `UiString`. The `why_it_works` heading renders
+whenever paragraphs **or** proof are present, so the research subheading
+never appears without its parent section.
+
+`proof` is the **research block**: 2–3 statements of widely established
+published findings, constrained to the ingredient level (never claims about
+the product itself), to ingredients actually named in the product's grounding
+text, and to citation-free phrasing (no invented studies, journals, or
+percentages). The merchant-facing rules and the compliance note live in
+MERCHANT_GUIDE ("The research block").
+
+Full render order of a sequential post-purchase page (top → bottom), as
+implemented in `extensions/post-purchase-upsell/src/index.jsx`:
+
+1. `CalloutBanner` — `offer_badge` (+ `offer_x_of_y` when the flow has
+   multiple pages)
+2. Product image (left column on medium/large viewports)
+3. `headline` → `body` (the lead) → `bullets`
+4. Product title + price row — `was` (strikethrough) / `now` / `save_pct`
+5. Trust lines — `ships_free`, `one_click_note` — and the countdown
+   (`time_left` + mm:ss, when enabled)
+6. Error banner (only after a failed accept)
+7. `closer`
+8. Accept + decline buttons
+9. "Why it works with your order" (`why_it_works`) — the `paragraphs`
+10. "What published research shows" (`research_shows`) — the `proof` lines,
+    as bullets
+
+The bundle page keeps the same tail (4→10, with a combined price row and one
+accept-all button) but opens with per-product tiles (image, title, was/now
+price) before the combined headline/lead/bullets.
+
+### 6.2 Translated product names
+
+Product names shown to buyers are never generated or translated by the model
+— they flow verbatim from Shopify:
+
+```
+Translate & Adapt (merchant edits names per locale)
+      │  Admin GraphQL: translations(locale:) per store language
+      ▼
+ProductCache.translationsJson   { [locale]: { title } }
+      │
+      ├─▶ prompt interpolation   (the model is instructed to use the
+      │                           given name verbatim, never re-translate)
+      └─▶ buyer payload          (SelectedOfferProduct.translatedTitle →
+                                  the titles the extensions display)
+```
+
+Freshness: a `products/create|update` webhook refreshes **that product's**
+translated names; a full catalog sync refreshes every product. The admin's
+Products tab surfaces per-product translated-name coverage so missing locales
+are visible before buyers see a default-language name.
 
 ## 7. The two extensions
 

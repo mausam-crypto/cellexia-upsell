@@ -24,6 +24,12 @@ export interface CachedVariant {
   sku: string;
 }
 
+/** Per-locale Translate & Adapt values mirrored from Shopify. */
+export interface ProductTranslationEntry {
+  title?: string;
+  description?: string; // plain text, capped at TRANSLATED_DESCRIPTION_MAX chars
+}
+
 export interface CatalogProduct {
   productId: string; // gid
   title: string;
@@ -34,8 +40,26 @@ export interface CatalogProduct {
   tags: string[];
   imageUrl: string | null;
   descriptionShort: string; // plain text, first ~300 chars — used in AI prompts
+  descriptionFull: string; // plain text, full Shopify description (capped at DESCRIPTION_FULL_MAX)
+  aiDescription: string; // merchant-written AI grounding; overrides descriptions when set
   variants: CachedVariant[];
-  translations: Record<string, { title?: string }>;
+  translations: Record<string, ProductTranslationEntry>;
+}
+
+/**
+ * Copywriting grounding for a product: the merchant-written aiDescription wins
+ * when non-empty, then the full synced description, then the short one.
+ */
+export function effectiveDescription(p: {
+  aiDescription?: string | null;
+  descriptionFull?: string | null;
+  descriptionShort?: string | null;
+}): string {
+  const ai = (p.aiDescription ?? "").trim();
+  if (ai) return ai;
+  const full = (p.descriptionFull ?? "").trim();
+  if (full) return full;
+  return (p.descriptionShort ?? "").trim();
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -47,6 +71,10 @@ const VARIANTS_PAGE_SIZE = 10;
 const MAX_PAGES = 500; // 500 × 20 products (≥ 10,000) — hard stop against runaway loops
 const MAX_VARIANT_PAGES = 20; // follow-up variant pages per product (10 + 20 × 10 = 210 variants)
 const DESCRIPTION_MAX = 300;
+// Generous: the AI prompt consumes the full stored text, so truncating here
+// would silently discard copywriting grounding. ~12K chars ≈ 3K tokens.
+const DESCRIPTION_FULL_MAX = 12_000;
+const TRANSLATED_DESCRIPTION_MAX = 2_000;
 
 /**
  * Executes a GraphQL call, awaits the fetch Response, and throws a descriptive
@@ -131,6 +159,8 @@ function rowToProduct(row: {
   tags: string;
   imageUrl: string | null;
   descriptionShort: string;
+  descriptionFull: string;
+  aiDescription: string;
   variantsJson: string;
   translationsJson: string;
 }): CatalogProduct {
@@ -144,8 +174,10 @@ function rowToProduct(row: {
     tags: normalizeTags(row.tags),
     imageUrl: row.imageUrl,
     descriptionShort: row.descriptionShort,
+    descriptionFull: row.descriptionFull,
+    aiDescription: row.aiDescription,
     variants: jparse<CachedVariant[]>(row.variantsJson, []),
-    translations: jparse<Record<string, { title?: string }>>(row.translationsJson, {}),
+    translations: jparse<Record<string, ProductTranslationEntry>>(row.translationsJson, {}),
   };
 }
 
@@ -239,6 +271,22 @@ const PRODUCT_TRANSLATIONS_QUERY = `#graphql
         endCursor
       }
       nodes {
+        id
+        translations(locale: $locale) {
+          key
+          value
+        }
+      }
+    }
+  }
+`;
+
+// Translations for a specific set of products (webhook freshness path).
+// Ids are chunked to PRODUCTS_PAGE_SIZE per call to stay far under the cap.
+const PRODUCT_TRANSLATIONS_BY_IDS_QUERY = `#graphql
+  query CatalogProductTranslationsByIds($ids: [ID!]!, $locale: String!) {
+    nodes(ids: $ids) {
+      ... on Product {
         id
         translations(locale: $locale) {
           key
@@ -393,6 +441,8 @@ function mapGraphqlProduct(node: any): CatalogProduct {
     tags: normalizeTags(node?.tags),
     imageUrl: typeof node?.featuredImage?.url === "string" ? node.featuredImage.url : null,
     descriptionShort: toPlainTextShort(node?.description),
+    descriptionFull: toPlainTextShort(node?.description, DESCRIPTION_FULL_MAX),
+    aiDescription: "", // merchant-written — never sourced from Shopify, preserved on writes
     variants: variantNodes.map(mapGraphqlVariant),
     translations: {},
   };
@@ -401,18 +451,17 @@ function mapGraphqlProduct(node: any): CatalogProduct {
 // ── Catalog sync ─────────────────────────────────────────────────────────────
 
 /**
- * Full paginated catalog sync into ProductCache, including per-locale title
- * translations for every settings language beyond the default. Sets
- * Shop.catalogSyncedAt on completion. Throws only when the very first page
- * cannot be fetched at all; later-page and translation errors are logged and
- * the sync continues with what was retrieved.
+ * Full paginated catalog sync into ProductCache, including per-locale
+ * Translate & Adapt values (via syncProductTranslations) for every settings
+ * language beyond the default. Sets Shop.catalogSyncedAt on completion.
+ * Throws only when the very first page cannot be fetched at all; later-page
+ * and translation errors are logged and the sync continues with what was
+ * retrieved.
  */
 export async function syncCatalog(
   graphql: AdminGraphql,
   shop: string,
 ): Promise<{ count: number }> {
-  const settings = await getSettings(shop);
-
   // 1) Base product pass.
   const products: CatalogProduct[] = [];
   let after: string | null = null;
@@ -491,86 +540,11 @@ export async function syncCatalog(
   }
   if (hasNextPage) endedEarly = true; // stopped at MAX_PAGES with pages remaining
 
-  // 2) Per-locale title translations (best-effort — a missing read_locales
-  //    scope or a bad locale must never break the sync).
-  const extraLocales = (settings.languages ?? []).filter(
-    (l) => typeof l === "string" && l && l !== settings.defaultLanguage,
-  );
-  const translationsByProduct = new Map<string, Record<string, { title?: string }>>();
-  const syncedLocales = new Set<string>(); // locales fully fetched this run — safe to overlay
-  for (const locale of extraLocales) {
-    try {
-      let tAfter: string | null = null;
-      let tHasNext = true;
-      let tPage = 0;
-      while (tHasNext && tPage < MAX_PAGES) {
-        tPage += 1;
-        const json = await gqlJson(graphql, PRODUCT_TRANSLATIONS_QUERY, {
-          first: PRODUCTS_PAGE_SIZE,
-          after: tAfter,
-          locale,
-        });
-        const connection: any = json?.data?.products;
-        if (!connection) throw new Error("products connection missing from translations response");
-        const nodes: any[] = Array.isArray(connection?.nodes) ? connection.nodes : [];
-        for (const node of nodes) {
-          const productId = String(node?.id ?? "");
-          if (!productId) continue;
-          const list: any[] = Array.isArray(node?.translations) ? node.translations : [];
-          const title = list.find(
-            (t) => t?.key === "title" && typeof t?.value === "string" && t.value.length > 0,
-          );
-          if (title) {
-            const existing = translationsByProduct.get(productId) ?? {};
-            existing[locale] = { title: title.value as string };
-            translationsByProduct.set(productId, existing);
-          }
-        }
-        tHasNext = Boolean(connection?.pageInfo?.hasNextPage);
-        tAfter =
-          typeof connection?.pageInfo?.endCursor === "string" ? connection.pageInfo.endCursor : null;
-        if (!tAfter) tHasNext = false;
-      }
-      if (!tHasNext) {
-        syncedLocales.add(locale);
-      } else {
-        console.error(`[catalog] translations fetch for locale "${locale}" on ${shop} hit the page cap — treating as partial`);
-      }
-    } catch (error) {
-      console.error(`[catalog] translations fetch failed for locale "${locale}" on ${shop} — skipping`, error);
-    }
-  }
-
-  // 3) Upsert into ProductCache. Translations are MERGED with each existing
-  //    row's translationsJson: only locales that were fully fetched this run
-  //    are overlaid, so a failed per-locale fetch never wipes prior entries.
-  const existingTranslationsByProduct = new Map<string, Record<string, { title?: string }>>();
-  try {
-    const existingRows = await prisma.productCache.findMany({
-      where: { shop },
-      select: { productId: true, translationsJson: true },
-    });
-    for (const row of existingRows) {
-      existingTranslationsByProduct.set(
-        row.productId,
-        jparse<Record<string, { title?: string }>>(row.translationsJson, {}),
-      );
-    }
-  } catch (error) {
-    console.error(`[catalog] failed to load existing translations for ${shop} — proceeding without merge`, error);
-  }
-
+  // 2) Upsert into ProductCache. translationsJson is untouched here (merged
+  //    separately by syncProductTranslations below) and aiDescription is
+  //    merchant-written — omitting both from the upsert preserves them.
   let count = 0;
   for (const product of products) {
-    const fetched = translationsByProduct.get(product.productId) ?? {};
-    const translations: Record<string, { title?: string }> = {
-      ...(existingTranslationsByProduct.get(product.productId) ?? {}),
-    };
-    for (const locale of syncedLocales) {
-      const entry = fetched[locale];
-      if (entry) translations[locale] = entry;
-      else delete translations[locale];
-    }
     const data = {
       title: product.title,
       handle: product.handle,
@@ -580,8 +554,8 @@ export async function syncCatalog(
       tags: product.tags.join(","),
       imageUrl: product.imageUrl,
       descriptionShort: product.descriptionShort,
+      descriptionFull: product.descriptionFull,
       variantsJson: jstr(product.variants),
-      translationsJson: jstr(translations),
     };
     try {
       await prisma.productCache.upsert({
@@ -593,6 +567,15 @@ export async function syncCatalog(
     } catch (error) {
       console.error(`[catalog] upsert failed for ${product.productId} on ${shop}`, error);
     }
+  }
+
+  // 3) Per-locale Translate & Adapt values for every settings language beyond
+  //    the default (best-effort — a missing read_locales scope or a bad locale
+  //    must never break the sync).
+  try {
+    await syncProductTranslations(graphql, shop);
+  } catch (error) {
+    console.error(`[catalog] translations sync failed for ${shop} (best-effort, continuing)`, error);
   }
 
   // 3b) Remove stale rows — only when the base pass fully enumerated the
@@ -624,6 +607,143 @@ export async function syncCatalog(
 
   console.log(`[catalog] synced ${count} products for ${shop}`);
   return { count };
+}
+
+/**
+ * Fetches Translate & Adapt product values (title + body_html, the latter
+ * stored plain-text and capped at TRANSLATED_DESCRIPTION_MAX chars) and MERGES
+ * them into each ProductCache row's translationsJson: only locales fully
+ * fetched this run are overlaid, so a failed per-locale fetch never wipes
+ * prior entries. Scope with opts.productIds to refresh specific products
+ * (webhook freshness) or omit to cover the whole catalog; opts.locales
+ * defaults to every settings language beyond the default (the default
+ * language is always excluded — it has no translations). Page/chunk sizes
+ * stay small so each query is far under the cost cap. Best-effort per locale
+ * and per row after the initial settings read.
+ */
+export async function syncProductTranslations(
+  graphql: AdminGraphql,
+  shop: string,
+  opts?: { productIds?: string[]; locales?: string[] },
+): Promise<void> {
+  const settings = await getSettings(shop);
+  const requested = opts?.locales ?? settings.languages ?? [];
+  const locales = Array.from(
+    new Set(
+      requested.filter(
+        (l) => typeof l === "string" && l && l !== settings.defaultLanguage,
+      ),
+    ),
+  );
+  const productIds = Array.from(
+    new Set((opts?.productIds ?? []).filter(Boolean).map((id) => toGid("Product", id))),
+  );
+  if (locales.length === 0) return;
+
+  // 1) Fetch per-locale values. syncedLocales = locales fully fetched this
+  //    run — the only ones safe to overlay (set AND delete) during the merge.
+  const translationsByProduct = new Map<string, Record<string, ProductTranslationEntry>>();
+  const syncedLocales = new Set<string>();
+  const collect = (node: any, locale: string): void => {
+    const productId = String(node?.id ?? "");
+    if (!productId) return;
+    const list: any[] = Array.isArray(node?.translations) ? node.translations : [];
+    const entry: ProductTranslationEntry = {};
+    const title = list.find(
+      (t) => t?.key === "title" && typeof t?.value === "string" && t.value.length > 0,
+    );
+    if (title) entry.title = title.value as string;
+    const body = list.find(
+      (t) => t?.key === "body_html" && typeof t?.value === "string" && t.value.length > 0,
+    );
+    if (body) {
+      const description = toPlainTextShort(body.value, TRANSLATED_DESCRIPTION_MAX);
+      if (description) entry.description = description;
+    }
+    if (entry.title === undefined && entry.description === undefined) return;
+    const existing = translationsByProduct.get(productId) ?? {};
+    existing[locale] = entry;
+    translationsByProduct.set(productId, existing);
+  };
+
+  for (const locale of locales) {
+    try {
+      if (productIds.length > 0) {
+        for (let i = 0; i < productIds.length; i += PRODUCTS_PAGE_SIZE) {
+          const ids = productIds.slice(i, i + PRODUCTS_PAGE_SIZE);
+          const json = await gqlJson(graphql, PRODUCT_TRANSLATIONS_BY_IDS_QUERY, {
+            ids,
+            locale,
+          });
+          const nodes: any[] = Array.isArray(json?.data?.nodes) ? json.data.nodes : [];
+          for (const node of nodes) collect(node, locale);
+        }
+        syncedLocales.add(locale);
+      } else {
+        let tAfter: string | null = null;
+        let tHasNext = true;
+        let tPage = 0;
+        while (tHasNext && tPage < MAX_PAGES) {
+          tPage += 1;
+          const json = await gqlJson(graphql, PRODUCT_TRANSLATIONS_QUERY, {
+            first: PRODUCTS_PAGE_SIZE,
+            after: tAfter,
+            locale,
+          });
+          const connection: any = json?.data?.products;
+          if (!connection) throw new Error("products connection missing from translations response");
+          const nodes: any[] = Array.isArray(connection?.nodes) ? connection.nodes : [];
+          for (const node of nodes) collect(node, locale);
+          tHasNext = Boolean(connection?.pageInfo?.hasNextPage);
+          tAfter =
+            typeof connection?.pageInfo?.endCursor === "string" ? connection.pageInfo.endCursor : null;
+          if (!tAfter) tHasNext = false;
+        }
+        if (!tHasNext) {
+          syncedLocales.add(locale);
+        } else {
+          console.error(`[catalog] translations fetch for locale "${locale}" on ${shop} hit the page cap — treating as partial`);
+        }
+      }
+    } catch (error) {
+      console.error(`[catalog] translations fetch failed for locale "${locale}" on ${shop} — skipping`, error);
+    }
+  }
+  if (syncedLocales.size === 0) return; // nothing fully fetched — leave rows alone
+
+  // 2) Merge into translationsJson per row (aiDescription and every other
+  //    column untouched). Failed locales keep whatever was stored before.
+  let rows: Array<{ productId: string; translationsJson: string }>;
+  try {
+    rows = await prisma.productCache.findMany({
+      where: productIds.length > 0 ? { shop, productId: { in: productIds } } : { shop },
+      select: { productId: true, translationsJson: true },
+    });
+  } catch (error) {
+    console.error(`[catalog] failed to load rows for translations merge on ${shop}`, error);
+    return;
+  }
+  for (const row of rows) {
+    const merged: Record<string, ProductTranslationEntry> = {
+      ...jparse<Record<string, ProductTranslationEntry>>(row.translationsJson, {}),
+    };
+    const fetched = translationsByProduct.get(row.productId) ?? {};
+    for (const locale of syncedLocales) {
+      const entry = fetched[locale];
+      if (entry) merged[locale] = entry;
+      else delete merged[locale];
+    }
+    const next = jstr(merged);
+    if (next === row.translationsJson) continue;
+    try {
+      await prisma.productCache.update({
+        where: { shop_productId: { shop, productId: row.productId } },
+        data: { translationsJson: next },
+      });
+    } catch (error) {
+      console.error(`[catalog] translations update failed for ${row.productId} on ${shop}`, error);
+    }
+  }
 }
 
 // ── Locales & markets sync ───────────────────────────────────────────────────
@@ -789,6 +909,7 @@ export async function syncMarketsAndLocales(
  * Upserts one product from a products/create or products/update REST webhook.
  * REST payloads carry no unit cost and no translations, so existing
  * unitCost values (matched by variant gid) and translationsJson are preserved.
+ * aiDescription is merchant-written and never touched by this path.
  */
 export async function upsertProductFromWebhook(shop: string, payload: any): Promise<void> {
   const rawId = payload?.admin_graphql_api_id ?? payload?.id;
@@ -856,6 +977,10 @@ export async function upsertProductFromWebhook(shop: string, payload: any): Prom
       payload && Object.prototype.hasOwnProperty.call(payload, "body_html")
         ? toPlainTextShort(payload.body_html)
         : existing?.descriptionShort ?? "",
+    descriptionFull:
+      payload && Object.prototype.hasOwnProperty.call(payload, "body_html")
+        ? toPlainTextShort(payload.body_html, DESCRIPTION_FULL_MAX)
+        : existing?.descriptionFull ?? "",
     variantsJson: jstr(variants),
     translationsJson: existing?.translationsJson ?? "{}", // preserved
   };

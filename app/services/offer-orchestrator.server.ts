@@ -36,7 +36,11 @@ import {
   type GenerateCopyArgs,
   type PromptKey,
 } from "./ai.server";
-import { getProductsByIds, type CatalogProduct } from "./catalog.server";
+import {
+  effectiveDescription,
+  getProductsByIds,
+  type CatalogProduct,
+} from "./catalog.server";
 
 /** Issued offers can be signed for up to 2 hours after they were assembled. */
 const OFFER_TTL_MS = 2 * 60 * 60 * 1000;
@@ -110,6 +114,27 @@ function translationTitle(
   return undefined;
 }
 
+/** Best-effort translated description lookup from the catalog translations map. */
+function translationDescription(
+  translations: Record<string, { title?: string; description?: string }> | undefined,
+  language: string,
+): string | undefined {
+  if (!translations) return undefined;
+  const direct = translations[language]?.description;
+  if (direct) return direct;
+  const lower = language.toLowerCase();
+  for (const [key, value] of Object.entries(translations)) {
+    if (key.toLowerCase() === lower && value?.description) return value.description;
+  }
+  const base = lower.split("-")[0];
+  for (const [key, value] of Object.entries(translations)) {
+    if (key.toLowerCase().split("-")[0] === base && value?.description) {
+      return value.description;
+    }
+  }
+  return undefined;
+}
+
 async function safeGetUiStrings(
   shop: string,
   language: string,
@@ -165,13 +190,31 @@ async function loadCatalog(
 function buildBasket(
   ctx: PurchaseContext,
   catalogById: Map<string, CatalogProduct>,
-): { title: string; productType: string; quantity: number }[] {
+  language: string,
+): { title: string; productType: string; quantity: number; description: string }[] {
   return ctx.lineItems.map((line) => {
     const cached = catalogById.get(line.productId);
+    // Grounding text for the copywriter, best first: merchant-written AI
+    // context (aiDescription, via effectiveDescription) → the Translate &
+    // Adapt description for the buyer's language (keeps the pitch consistent
+    // with the translated product names) → the synced Shopify description.
+    const translatedDescription =
+      cached && !cached.aiDescription.trim()
+        ? translationDescription(cached.translations, language)
+        : undefined;
     return {
-      title: cached?.title ?? line.title ?? "Item from this order",
+      // Exact Translate & Adapt name for the buyer's language, so prompts
+      // reference products by the names the customer actually shopped.
+      title:
+        (cached ? translationTitle(cached.translations, language) : undefined) ??
+        cached?.title ??
+        line.title ??
+        "Item from this order",
       productType: cached?.productType ?? "",
       quantity: line.quantity,
+      // What the purchased product does — lets the copywriter ground the
+      // pitch in the customer's actual routine instead of category guesses.
+      description: cached ? translatedDescription ?? effectiveDescription(cached) : "",
     };
   });
 }
@@ -227,7 +270,7 @@ async function buildOfferPage(args: {
   totalOffers: number;
   language: string;
   strings: Record<string, string>;
-  basket: { title: string; productType: string; quantity: number }[];
+  basket: { title: string; productType: string; quantity: number; description: string }[];
   catalogById: Map<string, CatalogProduct>;
   marketHandle: string | null;
 }): Promise<OfferPage | null> {
@@ -484,7 +527,7 @@ export async function assembleOfferResponse(ctx: PurchaseContext): Promise<Offer
   if (!settings || !selection || selection.offers.length === 0) return response;
 
   const catalogById = await loadCatalog(ctx, selection);
-  const basket = buildBasket(ctx, catalogById);
+  const basket = buildBasket(ctx, catalogById, language);
   const totalOffers = selection.offers.length;
 
   for (const offer of selection.offers) {
@@ -597,6 +640,23 @@ async function rebuildStoredThankYouOffer(
   const language = typeof meta?.language === "string" && meta.language ? meta.language : "en";
   const strings = await safeGetUiStrings(ctx.shop, language);
   const discountPct = Number(meta?.discountPct);
+  // Optional copy fields round-trip verbatim: a rebuilt offer must render
+  // exactly like the original, so stored paragraphs/closer are never stripped.
+  const rebuiltCopy: OfferCopy = {
+    headline: copy.headline,
+    body: copy.body,
+    bullets: Array.isArray(copy.bullets)
+      ? copy.bullets.filter((b: unknown): b is string => typeof b === "string")
+      : [],
+  };
+  if (Array.isArray(copy.paragraphs)) {
+    rebuiltCopy.paragraphs = copy.paragraphs.filter(
+      (p: unknown): p is string => typeof p === "string",
+    );
+  }
+  if (typeof copy.closer === "string" && copy.closer) {
+    rebuiltCopy.closer = copy.closer;
+  }
   return {
     offerId: row.offerId,
     referenceId: row.referenceId,
@@ -604,13 +664,7 @@ async function rebuildStoredThankYouOffer(
     discountPct: Number.isFinite(discountPct) ? discountPct : 0,
     discountCode: typeof meta?.discountCode === "string" ? meta.discountCode : "",
     checkoutUrl: typeof meta?.checkoutUrl === "string" ? meta.checkoutUrl : "",
-    copy: {
-      headline: copy.headline,
-      body: copy.body,
-      bullets: Array.isArray(copy.bullets)
-        ? copy.bullets.filter((b: unknown): b is string => typeof b === "string")
-        : [],
-    },
+    copy: rebuiltCopy,
     strings,
     language,
     currency: typeof meta?.currency === "string" && meta.currency ? meta.currency : ctx.currency,
@@ -723,7 +777,7 @@ export async function assembleThankYouOffer(
     const language = resolveLanguage(ctx.locale, settings, market?.languageOverride ?? null);
     const strings = await safeGetUiStrings(ctx.shop, language);
     const catalogById = await loadCatalog(ctx, selection);
-    const basket = buildBasket(ctx, catalogById);
+    const basket = buildBasket(ctx, catalogById, language);
 
     const enriched: SelectedOfferProduct = {
       ...product,
@@ -772,7 +826,9 @@ export async function assembleThankYouOffer(
       offerProducts: [enriched],
       discountPct,
       currency: ctx.currency,
-      copyLength: selection.copyLength,
+      // The thank-you card is a small block on an already-busy page — always
+      // short copy, never the extended paragraphs section long copy carries.
+      copyLength: "short",
     };
 
     let copy: OfferCopy;

@@ -109,13 +109,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   frequencyCapDays: 14,
   suppressionDays: 60,
   minInventory: 1,
-  copyLength: "short",
+  copyLength: "long",
   tone: "warm, expert, confident — never salesy, never implying the original purchase was incomplete",
   brandContext:
     "Cellexia Labs — Precision Beauty™. Professional-grade anti-aging skincare for mature skin: serums, creams, eye serums, lip formulas, body creams and neck treatments. 60-day money-back guarantee. Customers are discerning adults who value efficacy and ingredient science.",
   aiEnabled: true,
   aiModel: "claude-haiku-4-5",
-  aiTimeoutMs: 2500,
+  aiTimeoutMs: 3500,
   translationProvider: "claude",
   translationModel: "claude-sonnet-5",
   optimizeMetric: "gp_per_impression",
@@ -246,8 +246,24 @@ export interface OfferProductView {
 
 export interface OfferCopy {
   headline: string;
+  /** Lead — the promise, 1–2 sentences shown above the fold next to the CTA. */
   body: string;
   bullets: string[];
+  /**
+   * Extended persuasion section (copyLength "long"): 2–3 short paragraphs of
+   * mechanism / proof / relevance-to-order, rendered BELOW the CTA so the
+   * button stays above the fold on mobile. Empty/absent → section hidden.
+   */
+  paragraphs?: string[];
+  /** One-line premium reassurance rendered directly above the buttons. */
+  closer?: string;
+  /**
+   * Research block (copyLength "long"): 2–3 statements of widely-established
+   * published findings about ingredients explicitly named in the brief —
+   * rendered under the paragraphs with its own heading. Never product-level
+   * claims, never invented citations. Empty/absent → block hidden.
+   */
+  proof?: string[];
 }
 
 export interface OfferPage {
@@ -318,6 +334,8 @@ export const DEFAULT_UI_STRINGS_EN: Record<string, string> = {
   processing: "Adding to your order…",
   error_try_again: "Something went wrong. Your original order is not affected.",
   discount_applied: "{pct}% off — post-purchase exclusive",
+  why_it_works: "Why it works with your order",
+  research_shows: "What published research shows",
   thank_you_title: "A little something extra",
   thank_you_cta: "Claim this offer",
   thank_you_code_note: "Code {code} — applied automatically at checkout",

@@ -22,7 +22,9 @@ export default function App() {
           Dashboard
         </Link>
         <Link to="/app/offers">Offer rules</Link>
+        <Link to="/app/products">Products</Link>
         <Link to="/app/prompts">AI &amp; Prompts</Link>
+        <Link to="/app/preview">Preview</Link>
         <Link to="/app/translations">Translations</Link>
         <Link to="/app/analytics">Analytics</Link>
         <Link to="/app/settings">Settings</Link>
