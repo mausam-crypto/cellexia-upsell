@@ -1,4 +1,21 @@
 import "@shopify/shopify-app-remix/adapters/node";
+
+// Last-resort process guards: Node's default is to KILL the process on an
+// unhandled promise rejection — on a single-instance host (Render/Fly) that
+// turns one stray async error anywhere (including inside dependencies) into
+// a full 502 outage for every buyer. Log loudly and stay alive instead.
+// Registered once per process; individual code paths still carry their own
+// try/catch — this is the safety net, not the error handling.
+const processGuards = globalThis as typeof globalThis & { __upsellProcessGuards?: boolean };
+if (!processGuards.__upsellProcessGuards) {
+  processGuards.__upsellProcessGuards = true;
+  process.on("unhandledRejection", (reason) => {
+    console.error("[process] UNHANDLED REJECTION — kept alive, please report:", reason);
+  });
+  process.on("uncaughtException", (error) => {
+    console.error("[process] UNCAUGHT EXCEPTION — kept alive, please report:", error);
+  });
+}
 import {
   ApiVersion,
   AppDistribution,

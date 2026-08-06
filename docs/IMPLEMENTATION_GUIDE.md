@@ -396,6 +396,33 @@ Keep exactly **one** primary region/instance if you stay on SQLite (single
 writer file DB); with Postgres you can scale instances freely — the app is
 otherwise stateless (sessions and all state live in the DB).
 
+### Render
+
+If you host on Render, configure the web service exactly like this — the
+Pre-Deploy Command is NOT optional (schema changes like the v1.3+ ProductCache
+columns must be applied before the new code serves traffic, or every catalog
+query throws and the app appears broken):
+
+| Render setting | Value |
+|---|---|
+| Build Command | `npm ci && npm run build` |
+| Pre-Deploy Command | `npx prisma db push` |
+| Start Command | `npm run start` |
+| Environment | `NODE_VERSION=20` (or newer), all `.env` keys from §4 |
+
+Use a **Postgres database** (Render's SQLite disk is ephemeral — data is lost
+on every deploy/restart unless you attach a persistent disk; Postgres is the
+right choice, see §13). On the free/starter tier the instance sleeps and
+cold-starts (~30-60s of "Bad Gateway" after idle) — use a paid instance for a
+production checkout surface.
+
+**If the service shows "Bad Gateway":** open Render → your service → Logs.
+Look for the crash reason (commonly: `Environment variable not found`,
+Prisma `P2022` column-does-not-exist = Pre-Deploy Command missing, or an
+out-of-memory kill = upgrade the instance). Then Manual Deploy → Restart.
+Since v1.4.1 the app also installs process-level guards so an unhandled
+async error logs loudly instead of killing the process.
+
 ## 13. Switch the database to Postgres
 
 The schema was written to be portable: all JSON payloads are `String` columns
