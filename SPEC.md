@@ -4,9 +4,12 @@
 > direct-response copy (lead / bullets / paragraphs / proof / closer), the
 > two-stage buyer copy pipeline (fast core call + background extended patch +
 > `/api/offer-extended` polling), buyer-locale-first language resolution, the
-> Products tab (per-product AI context), the Preview page, and the EventDedup
-> replay guard. Where this document and the code disagree, the code plus its
-> test harness are the tiebreaker — then fix whichever is wrong.
+> Products tab (per-product AI context + manual per-language product names),
+> the Preview page, the EventDedup replay guard, multi-currency display
+> (shop-currency engine, presentment display via the implied order rate,
+> preview-only market FX rates), the em-dash policy, and self-healing
+> UI-string translations. Where this document and the code disagree, the code
+> plus its test harness are the tiebreaker — then fix whichever is wrong.
 
 This document is the single source of truth for every module in this app.
 Read it fully before writing any file. Also read: `prisma/schema.prisma`,
@@ -30,6 +33,12 @@ right after checkout:
   "What published research shows" block below it, and a one-line closer above
   the buttons. Copy is grounded in per-product descriptions: the merchant's
   **AI context** (Products tab) wins over the synced Shopify description.
+  Buyer-facing product NAMES are resolved per language with the precedence
+  **manual override (`ProductCache.nameOverridesJson`, Products tab) >
+  Translate & Adapt synced translation > base title** and used verbatim —
+  the model never writes or translates a name. Buyer-facing text contains no
+  em dashes (prompt rule + sanitizer; `DEFAULT_UI_STRINGS_EN` is itself
+  em-dash-free).
 - **Two-stage buyer copy pipeline**: the buyer-blocking call generates only
   the above-the-fold core (fast model, tight token cap, inside the
   post-purchase time budget); the below-CTA sections complete in a background
@@ -182,6 +191,11 @@ export interface CatalogProduct {
   aiDescription: string;    // merchant-written AI grounding (Products tab); overrides descriptions when set
   variants: CachedVariant[];
   translations: Record<string, ProductTranslationEntry>;
+  /** Merchant-set per-language names from the Products tab
+   *  (ProductCache.nameOverridesJson). Name precedence everywhere a buyer
+   *  sees a name: nameOverrides[lang] > translations[lang].title > title.
+   *  Merchant-owned — never touched by syncs or webhooks. */
+  nameOverrides: Record<string, string>;
 }
 /** aiDescription (non-empty) → descriptionFull → descriptionShort. */
 export function effectiveDescription(p: { aiDescription?: string | null; descriptionFull?: string | null; descriptionShort?: string | null }): string;
@@ -205,20 +219,24 @@ export function pickPrimaryVariant(p: CatalogProduct): CachedVariant | null; // 
   into `translationsJson`. Descriptions are stored plain-text: strip HTML,
   decode common entities, collapse whitespace; `descriptionShort` cut at ~300
   chars, `descriptionFull` at 12 000. Upsert into `ProductCache`, PRESERVING
-  `aiDescription` (merchant-owned, never touched by sync). Set
-  `Shop.catalogSyncedAt`. Wrap per-locale translation fetch in try/catch
-  (missing `read_locales` must not break sync).
+  `aiDescription` AND `nameOverridesJson` (merchant-owned, never touched by
+  sync). Set `Shop.catalogSyncedAt`. Wrap per-locale translation fetch in
+  try/catch (missing `read_locales` must not break sync).
 - `syncMarketsAndLocales`: `shopLocales { locale primary published }` → update
   settings `languages`/`defaultLanguage` (published only, keep order, primary
   first) via `saveSettings`. `markets(first: 50) { nodes { handle name enabled
   regions(first: 100) { nodes { ... on MarketRegionCountry { code } } } } }` →
   upsert `MarketSetting` (do not overwrite admin-set overrides on re-sync;
-  only name/countries/new rows). Tolerate schema differences with try/catch —
-  markets sync is best-effort.
+  only name/countries/currency/new rows). Also sync each market's base
+  currency into `MarketSetting.currency` (best-effort, from the Markets API's
+  currency settings); NEVER touch `previewFxRate` — it is admin-owned and
+  preview-only. Tolerate schema differences with try/catch — markets sync is
+  best-effort.
 - Webhook upserts map REST payload fields (`product_type`, `compare_at_price`,
   `inventory_quantity`, `image.src`, tags as comma string; `body_html` →
   plain-texted `descriptionShort`/`descriptionFull`); preserve existing
-  `unitCost`/`translationsJson`/`aiDescription` when the webhook lacks them.
+  `unitCost`/`translationsJson`/`aiDescription`/`nameOverridesJson` when the
+  webhook lacks them.
 
 ### A — `bootstrap.server.ts`
 
@@ -324,6 +342,7 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{ copy:
 export async function completeExtendedCopy(args: GenerateCopyArgs, core: OfferCopy): Promise<{ paragraphs: string[]; proof: string[]; closer: string } | null>;
 export function fallbackCopy(args: GenerateCopyArgs, strings: Record<string, string>): OfferCopy; // deterministic, per-language-safe
 export async function ensureUiStrings(shop: string, languages: string[]): Promise<void>;
+export async function ensureUiStringsFresh(shop: string): Promise<void>; // self-healing pass, fired fire-and-forget from the dashboard loader; cheap no-op when current; NEVER throws
 export async function getUiStrings(shop: string, language: string): Promise<Record<string, string>>; // requested lang → base lang ("pt-PT"→"pt") → "en" → DEFAULT_UI_STRINGS_EN, per key
 export async function translateUiStrings(shop: string, languages: string[], opts?: { onlyMissing?: boolean }): Promise<{ translated: number; errors: string[] }>;
 export async function translateTexts(settings: AppSettings, texts: string[], targetLang: string): Promise<string[]>; // Claude or DeepL per settings.translationProvider
@@ -360,7 +379,7 @@ export async function translateTexts(settings: AppSettings, texts: string[], tar
   exact schema `{"headline": string, "lead": string, "bullets": string[],
   "paragraphs": string[], "proof": string[], "closer": string,
   "discount_suggestion": number|null}`; headline ≤ 60 chars, lead ≤ 240 chars
-  (1–2 sentences, the promise), bullets 3–4 × ≤ 90 chars (bundle: EXACTLY one
+  (1–2 sentences, the promise), bullets 3–4 × 8–18 words (hard display cap 170 chars — validator buffers sit above prompt guidance so overruns render intact, never chopped with an ellipsis) (bundle: EXACTLY one
   bullet per offered product), paragraphs `{{length}}` (long: 2–3 × ≤ 450
   chars under "Why it works with your order" — mechanism / proof /
   relevance; short: `[]`), closer ≤ 120 chars (one calm reassurance line, no
@@ -370,7 +389,8 @@ export async function translateTexts(settings: AppSettings, texts: string[], tar
   journals/authors/statistics; no recognizable named ingredient → `[]`.
   NEVER imply the original purchase was wrong or incomplete; cosmetic claims
   only (no medical/drug claims); no emojis, no urgency/scarcity language;
-  mention the discount exactly once (lead or closer, never
+  NEVER use an em dash (—) in any field — restructure with commas, periods
+  or colons instead; mention the discount exactly once (lead or closer, never
   bullets/paragraphs/proof); every product name verbatim from the brief; the
   brief is the complete universe of products and facts. `bundle` variant
   sells the set as one routine; `sequential` variant fixes a distinct angle
@@ -381,6 +401,15 @@ export async function translateTexts(settings: AppSettings, texts: string[], tar
   is absent (merchant-edited old templates); require headline + lead;
   truncate word-boundary-aware (headline cap +20 slack, lead +60); bullets ≤ 4;
   paragraphs/proof kept ONLY when copyLength is `long` (≤ 3 each), else `[]`.
+- **Em-dash policy (prompt rule + sanitizer)**: buyer-facing text must never
+  contain an em dash. Layer 1: the copy AND translation prompts forbid it
+  (see the DEFAULT_PROMPTS rules above). Layer 2: a sanitizer in
+  `ai.server.ts` rewrites any em dash that slips through — in validated
+  model copy and in translated UI strings — to natural punctuation BEFORE
+  the text is cached or served, so a merchant-edited prompt that drops the
+  rule can never leak one to a buyer. `DEFAULT_UI_STRINGS_EN`
+  (`app/types.ts`) is itself em-dash-free (commas instead). Admin-facing
+  text is out of scope.
 - `generateCopy`: cacheKey = sha256 of
   `JSON.stringify([mode, sortedOfferVariantIds, sortedBasketTitles(first 6),
   language, copyLength, String(roundedDiscountPct), String(promptVersion)])`
@@ -438,6 +467,17 @@ export async function translateTexts(settings: AppSettings, texts: string[], tar
   best-effort (catch errors — never throw from bootstrap). UI string keys
   include the long-copy headings `why_it_works` ("Why it works with your
   order") and `research_shows` ("What published research shows").
+- `ensureUiStringsFresh(shop)` (**self-healing UI strings** — bootstrap only
+  runs at install, so keys added to `DEFAULT_UI_STRINGS_EN` by later app
+  updates would otherwise wait for a reinstall): (a) seed missing `en` rows
+  for newly added keys; (b) **old-default normalization** — rows still
+  holding a PREVIOUS compiled default value (e.g. the pre-policy em-dash
+  variants) are updated to the current default and their translations
+  refreshed; merchant-edited values are NEVER overwritten; (c) translate the
+  missing keys for the other enabled languages
+  (`translateUiStrings(..., { onlyMissing: true })`). Must be a cheap no-op
+  when everything is current (the dashboard calls it on every load,
+  fire-and-forget) and must never throw.
 - Translations: preserve `{placeholders}`; an empty or placeholder-losing
   translation is skipped (never upsert the English source — `onlyMissing`
   would never retry it).
@@ -562,10 +602,15 @@ export async function assembleThankYouOffer(ctx: PurchaseContext, graphql: Admin
    country. Fall back to `settings.defaultLanguage`. Report the resolution
    via `options.languageResolution`.
 4. `getUiStrings(shop, language)` (merged over `DEFAULT_UI_STRINGS_EN`).
-5. For each SelectedOffer (`buildOfferPage`): attach translated titles from
-   catalog translations (exact → case-insensitive → base-prefix); drop
+5. For each SelectedOffer (`buildOfferPage`): attach buyer-facing product
+   titles with the **name precedence** — manual override
+   (`nameOverrides[lang]`) → Translate & Adapt translation
+   (`translations[lang].title`) → base title — each level matched exact →
+   case-insensitive → base-prefix; the resolved name feeds BOTH the prompt
+   brief (used verbatim by the model) and the payload
+   (`SelectedOfferProduct.translatedTitle` → `OfferProductView.title`). Drop
    products whose variant id can't convert to the numeric changeset format.
-   Basket lines carry translated titles and grounding descriptions
+   Basket lines carry the same name resolution and grounding descriptions
    (merchant `aiDescription` → translated description for the buyer's
    language → synced description). Copy mode: `bundle` if displayMode bundle
    && >1 product; `sequential` if totalOffers>1; else `single`. Copy path:
@@ -602,7 +647,14 @@ export async function assembleThankYouOffer(ctx: PurchaseContext, graphql: Admin
    the core produced none), `page.extendedPending = false`,
    `meta.extendedReady = true`. Every step guarded; a failure leaves the page
    permanently on its complete-in-itself core copy.
-9. Prices in `OfferProductView` as decimal strings rounded to 2. The response
+9. Prices in `OfferProductView` as decimal strings rounded to 2.
+   **Multi-currency display**: when `ctx.presentmentCurrency` and
+   `ctx.presentmentRate` are present (and the currency differs from the shop
+   currency), the `OfferProductView` prices are converted with that rate for
+   DISPLAY and the response `currency` names the display currency — engine
+   math, rule thresholds, discount tiers, changesets, `IssuedOffer` meta and
+   analytics revenue/GP all stay in SHOP currency (percentage discounts are
+   currency-agnostic). Fields absent → shop-currency display. The response
    `ui` object carries `{ showCountdown, countdownMinutes, copyLength,
    showComparePrice }`.
 
@@ -619,8 +671,14 @@ with status 200):
   `ctx.currency` MUST come from **shopMoney** (fallback presentment only when
   shopMoney is absent): rule min/max totals, discount tiers, and catalog
   prices are all shop-currency, so threshold math in another currency is
-  wrong (a ¥12,000 order is not "≥ €120"). Buyer-accurate presentment totals
-  come from `calculateChangeset` client-side for display. The request body is
+  wrong (a ¥12,000 order is not "≥ €120"). Additionally set
+  `ctx.presentmentCurrency`/`ctx.presentmentRate` from the order's
+  presentmentMoney — the rate is the **implied order rate**
+  `presentmentTotal / shopTotal`, i.e. Shopify's own conversion for this
+  exact order; leave both unset when presentment equals the shop currency or
+  either total is missing/unparseable/zero. These drive DISPLAY-only price
+  conversion (§5-E step 9); buyer-exact accept totals still come from
+  `calculateChangeset` client-side. The request body is
   NEVER read: `referenceId` comes EXCLUSIVELY from the verified token's
   `initialPurchase` — when the token carries none (e.g. a thank-you token),
   fall back to `crypto.randomUUID()` so IssuedOffers are never minted under
@@ -726,7 +784,11 @@ type: "product", multiple: ... })` — take `sel?.[0]?.id`, `title`,
   to select this app; reminder that post-purchase shows for card payments only
   + thank-you fallback covers the rest). Action `intent=sync` → syncCatalog +
   syncMarketsAndLocales with the admin client; also call `autoPickWinners`
-  opportunistically in loader (try/catch).
+  opportunistically in loader (try/catch). The loader additionally fires
+  `ensureUiStringsFresh(shop)` (ai.server) **fire-and-forget** — `void
+  promise.catch(log)` inside a try/catch — so UI-string keys added by app
+  updates self-heal their translations without waiting for a reinstall; it
+  must never block or break the dashboard.
   **G `app.analytics.tsx`**: `?days=7|30|90` Select; funnel stats; offer
   performance table; breakdowns by country / language / surface; experiment
   table (probBest %, winner badge); CLV cohort cards for 60 and 90 days with a
@@ -764,7 +826,15 @@ type: "product", multiple: ... })` — take `sel?.[0]?.id`, `title`,
   (mode select + value/min/max + tier rows add/remove), Frequency & hygiene,
   Optimization (metric, rotation fields, "Reset experiment stats" + "Pick
   winners now" buttons), Markets (table from MarketSetting: enabled,
-  discountOverride, languageOverride, maxOffersOverride; "Re-sync" button),
+  discountOverride, languageOverride, maxOffersOverride, the synced
+  `currency` (read-only) and an editable `previewFxRate` — **preview-only**,
+  used exclusively to simulate the market's currency on the Preview page,
+  never on a live-buyer path (live buyers get the rate implied by their own
+  order); per-row **health checks** flag a market with no synced currency
+  (fix: "Re-sync") and a market whose currency differs from the shop
+  currency but has no previewFxRate (its previews fall back to shop-currency
+  display; live buyers unaffected); "Re-sync" button — never overwrites
+  admin-set overrides incl. previewFxRate),
   Languages (checkboxes from settings.languages ∪ CELLEXIA_LANGUAGES,
   defaultLanguage select), AI (aiEnabled, **copy model** + **core copy
   model** — the core model generates the above-the-fold copy inside the
@@ -779,17 +849,28 @@ type: "product", multiple: ... })` — take `sel?.[0]?.id`, `title`,
   per-language by AI, these are the static button/labels.
 - **M `app.products.tsx` (Products — the AI copywriter's product knowledge)**:
   paginated (20/page), title-searchable list of the `ProductCache` rows.
-  Per product: thumbnail, type, translation-coverage badge
-  (`x/y names translated`, default language counts via the base title),
-  Shopify-description length badge (or "No Shopify description" warning),
-  "AI context set" badge, and a collapsible **AI context** editor
-  (multiline TextField, `maxLength` 20 000 with character count — the cap is
-  ALSO enforced server-side; saved via a `saveAi` intent into
-  `ProductCache.aiDescription`; empty = cleared, Shopify description used).
-  Primary action "Sync catalog & translations" (`sync` intent → syncCatalog +
-  syncMarketsAndLocales). Explainer card: grounding precedence AI context →
-  full Shopify description → short excerpt; translated names come from
-  Translate & Adapt via the sync. Empty state prompts a first sync.
+  Per product: thumbnail, type, name-coverage badge
+  (`x/y names covered` — a language counts when it has a manual override OR
+  a synced Translate & Adapt translation OR is the default language, covered
+  by the base title), Shopify-description length badge (or "No Shopify
+  description" warning), "AI context set" badge, and a collapsible section
+  with (a) the **AI context** editor (multiline TextField, `maxLength`
+  20 000 with character count — the cap is ALSO enforced server-side; saved
+  via a `saveAi` intent into `ProductCache.aiDescription`; empty = cleared,
+  Shopify description used) and (b) the **"Product names by language"
+  grid**: one TextField per enabled language (settings.languages, default
+  language first), prefilled with the manual override, placeholder = the
+  synced Translate & Adapt name, else the base title with a subdued
+  "(default title)" note; helpText "Manual names always win over Translate &
+  Adapt and survive every sync."; per-product **Save names** button →
+  `saveNames` intent writing `ProductCache.nameOverridesJson` (values
+  trimmed, capped at 300 chars each — server-enforced; empty = remove the
+  override; submitted keys restricted to enabled languages; overrides for
+  since-disabled languages are preserved). Primary action "Sync catalog &
+  translations" (`sync` intent → syncCatalog + syncMarketsAndLocales).
+  Explainer card: grounding precedence AI context → full Shopify description
+  → short excerpt; NAME precedence manual override → Translate & Adapt →
+  base title. Empty state prompts a first sync.
 - **N `app.preview.tsx` (Preview — exactly what a buyer sees)**: merchant
   builds a fake basket (Combobox picker over the catalog cache, quantities,
   EUR total), picks shipping country (COMMON_COUNTRIES ∪ all MarketSetting
@@ -800,7 +881,14 @@ type: "product", multiple: ... })` — take `sel?.[0]?.id`, `title`,
   (client never sends money), `PurchaseContext` with a throwaway
   `referenceId = "preview:" + uuid` (so per-referenceId reuse never kicks
   in), `assembleOfferResponse(ctx, { copyTimeoutMs: 30_000, diagnostics })` —
-  previews wait for real AI copy instead of the buyer budget. `finally`:
+  previews wait for real AI copy instead of the buyer budget.
+  **Market currency simulation**: when the selected country's MarketSetting
+  has a `currency` differing from the shop currency AND a `previewFxRate`,
+  set `ctx.presentmentCurrency`/`ctx.presentmentRate` from them so the
+  preview shows that market's prices in its own currency (display-only, per
+  §5-E step 9); without a rate the preview falls back to shop-currency
+  display (surfaced by the Markets health checks). Live buyers never read
+  `previewFxRate` — their rate is implied by their own order. `finally`:
   delete the preview's IssuedOffer rows (never pollute the sign-changeset
   table or analytics). Renders through `PostPurchasePreview` (module N shared
   component — a faithful replica of the extension layout, desktop/390px

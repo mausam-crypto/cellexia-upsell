@@ -44,6 +44,11 @@ export interface CatalogProduct {
   aiDescription: string; // merchant-written AI grounding; overrides descriptions when set
   variants: CachedVariant[];
   translations: Record<string, ProductTranslationEntry>;
+  /**
+   * Merchant-set per-language product names (Products tab), e.g. { "fr": "…" }.
+   * Always wins over Translate & Adapt synced names; never touched by syncs.
+   */
+  nameOverrides: Record<string, string>;
 }
 
 /**
@@ -60,6 +65,64 @@ export function effectiveDescription(p: {
   const full = (p.descriptionFull ?? "").trim();
   if (full) return full;
   return (p.descriptionShort ?? "").trim();
+}
+
+/**
+ * Per-language map lookup with the language-precedence chain used everywhere
+ * name resolution happens: exact key → case-insensitive key → base-prefix
+ * ("pt-PT" matches "pt", and vice versa). Entries whose extracted value is
+ * empty/whitespace are treated as unset so the chain keeps falling through.
+ */
+function pickLanguageValue<T>(
+  map: Record<string, T> | null | undefined,
+  language: string,
+  get: (entry: T) => string | undefined,
+): string | undefined {
+  if (!map) return undefined;
+  const useful = (value: string | undefined): string | undefined =>
+    typeof value === "string" && value.trim().length > 0 ? value : undefined;
+  if (map[language] !== undefined) {
+    const direct = useful(get(map[language]));
+    if (direct) return direct;
+  }
+  // String() guard: public paths never throw, even on a malformed locale.
+  const lower = String(language ?? "").toLowerCase();
+  for (const [key, entry] of Object.entries(map)) {
+    if (key.toLowerCase() === lower) {
+      const value = useful(get(entry));
+      if (value) return value;
+    }
+  }
+  const base = lower.split("-")[0];
+  for (const [key, entry] of Object.entries(map)) {
+    if (key.toLowerCase().split("-")[0] === base) {
+      const value = useful(get(entry));
+      if (value) return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * THE single name-resolution helper: the buyer-facing product name for a
+ * language. Precedence — merchant nameOverrides[language] (exact →
+ * case-insensitive → base-prefix chain, same as translations) → Translate &
+ * Adapt translations[language].title (same chain) → the base title. Pure and
+ * never throws; safe on public paths.
+ */
+export function effectiveProductName(
+  p: {
+    nameOverrides?: Record<string, string> | null;
+    translations?: Record<string, ProductTranslationEntry> | null;
+    title: string;
+  },
+  language: string,
+): string {
+  const override = pickLanguageValue(p.nameOverrides, language, (v) => v);
+  if (override) return override;
+  const translated = pickLanguageValue(p.translations, language, (t) => t?.title);
+  if (translated) return translated;
+  return p.title;
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -163,6 +226,7 @@ function rowToProduct(row: {
   aiDescription: string;
   variantsJson: string;
   translationsJson: string;
+  nameOverridesJson: string;
 }): CatalogProduct {
   return {
     productId: row.productId,
@@ -178,6 +242,7 @@ function rowToProduct(row: {
     aiDescription: row.aiDescription,
     variants: jparse<CachedVariant[]>(row.variantsJson, []),
     translations: jparse<Record<string, ProductTranslationEntry>>(row.translationsJson, {}),
+    nameOverrides: jparse<Record<string, string>>(row.nameOverridesJson, {}),
   };
 }
 
@@ -309,7 +374,9 @@ const SHOP_LOCALES_QUERY = `#graphql
 
 // Unified markets shape (2026-01+): Market.enabled/regions are deprecated in
 // favour of status + conditions.regionsCondition. Page sizes (20 markets ×
-// 40 regions) keep each query under the 1,000-point cost cap.
+// 40 regions) keep each query under the 1,000-point cost cap; the
+// currencySettings sub-selection adds a scalar per market node, which is
+// negligible against that budget.
 const MARKETS_QUERY_UNIFIED = `#graphql
   query MarketsWithConditions($after: String) {
     markets(first: 20, after: $after) {
@@ -322,6 +389,11 @@ const MARKETS_QUERY_UNIFIED = `#graphql
         handle
         name
         status
+        currencySettings {
+          baseCurrency {
+            currencyCode
+          }
+        }
         conditions {
           regionsCondition {
             regions(first: 40) {
@@ -365,9 +437,46 @@ const MARKET_REGIONS_QUERY_UNIFIED = `#graphql
 `;
 
 // Legacy markets shape (pre-2026-01) — used as a fallback when the unified
-// query is rejected by older API versions.
+// query is rejected by older API versions. currencySettings is requested here
+// too (it predates the unified shape); if even that field is rejected, the
+// bare variant below runs and the market currency is left "".
 const MARKETS_QUERY_LEGACY = `#graphql
   query MarketsWithRegions($after: String) {
+    markets(first: 20, after: $after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        handle
+        name
+        enabled
+        currencySettings {
+          baseCurrency {
+            currencyCode
+          }
+        }
+        regions(first: 40) {
+          nodes {
+            ... on MarketRegionCountry {
+              code
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+  }
+`;
+
+// Final fallback: legacy shape without currencySettings, for API versions
+// where that field is unavailable — markets still sync, currency stays "".
+const MARKETS_QUERY_LEGACY_BARE = `#graphql
+  query MarketsWithRegionsBare($after: String) {
     markets(first: 20, after: $after) {
       pageInfo {
         hasNextPage
@@ -445,6 +554,7 @@ function mapGraphqlProduct(node: any): CatalogProduct {
     aiDescription: "", // merchant-written — never sourced from Shopify, preserved on writes
     variants: variantNodes.map(mapGraphqlVariant),
     translations: {},
+    nameOverrides: {}, // merchant-written — never sourced from Shopify, preserved on writes
   };
 }
 
@@ -541,8 +651,9 @@ export async function syncCatalog(
   if (hasNextPage) endedEarly = true; // stopped at MAX_PAGES with pages remaining
 
   // 2) Upsert into ProductCache. translationsJson is untouched here (merged
-  //    separately by syncProductTranslations below) and aiDescription is
-  //    merchant-written — omitting both from the upsert preserves them.
+  //    separately by syncProductTranslations below); aiDescription and
+  //    nameOverridesJson are merchant-written — omitting all three from the
+  //    upsert preserves them (creates fall back to the schema defaults).
   let count = 0;
   for (const product of products) {
     const data = {
@@ -803,7 +914,12 @@ interface FetchedMarket {
   name: string;
   enabled: boolean;
   countries: string[];
+  /** Market base currency code (e.g. "USD"); "" when the shape can't fetch it. */
+  currency: string;
 }
+
+/** Which GraphQL document set fetchMarkets uses (tried in this order). */
+type MarketsQueryShape = "unified" | "legacy" | "legacy-bare";
 
 function regionCodes(connection: any): string[] {
   const nodes: any[] = Array.isArray(connection?.nodes) ? connection.nodes : [];
@@ -817,13 +933,19 @@ function regionCodes(connection: any): string[] {
  * market's first regions page has more (Cellexia can have ~80 countries in one
  * market) the remaining regions are fetched with follow-up market-scoped
  * queries until exhausted. Both loops are bounded by MAX_MARKET_PAGES.
- * Throws on GraphQL errors so callers can fall back to the other shape.
+ * Throws on GraphQL errors so callers can fall back to the next shape
+ * (unified → legacy → legacy-bare).
  */
 async function fetchMarkets(
   graphql: AdminGraphql,
-  shape: "unified" | "legacy",
+  shape: MarketsQueryShape,
 ): Promise<FetchedMarket[]> {
-  const marketsQuery = shape === "unified" ? MARKETS_QUERY_UNIFIED : MARKETS_QUERY_LEGACY;
+  const marketsQuery =
+    shape === "unified"
+      ? MARKETS_QUERY_UNIFIED
+      : shape === "legacy"
+        ? MARKETS_QUERY_LEGACY
+        : MARKETS_QUERY_LEGACY_BARE;
   const regionsQuery =
     shape === "unified" ? MARKET_REGIONS_QUERY_UNIFIED : MARKET_REGIONS_QUERY_LEGACY;
   const pickRegions = (market: any): any =>
@@ -872,7 +994,16 @@ async function fetchMarkets(
           : market?.enabled === false
             ? false
             : true;
-      result.push({ handle, name: String(market?.name ?? handle), enabled, countries });
+      const currencyRaw = market?.currencySettings?.baseCurrency?.currencyCode;
+      const currency =
+        typeof currencyRaw === "string" ? currencyRaw.trim().toUpperCase() : "";
+      result.push({
+        handle,
+        name: String(market?.name ?? handle),
+        enabled,
+        countries,
+        currency,
+      });
     }
     hasNextPage = Boolean(connection?.pageInfo?.hasNextPage);
     after =
@@ -888,9 +1019,10 @@ async function fetchMarkets(
  * order kept, primary-first for new ones), so languages the merchant disabled
  * in the app are never re-added by later syncs. defaultLanguage is kept when
  * still enabled, else reset to the Shopify primary. Shopify Markets sync into
- * MarketSetting rows. Best-effort: every GraphQL call is guarded, and re-syncs
- * never overwrite admin-set overrides (enabled/discount/language/maxOffers) on
- * existing rows.
+ * MarketSetting rows: Shopify-owned data (name, countries, base currency) is
+ * written on create and refreshed on re-sync, while admin-set overrides
+ * (enabled/discount/language/maxOffers/previewFxRate) are never overwritten on
+ * existing rows. Best-effort: every GraphQL call is guarded.
  */
 export async function syncMarketsAndLocales(
   graphql: AdminGraphql,
@@ -942,20 +1074,38 @@ export async function syncMarketsAndLocales(
         `[catalog] unified markets query failed for ${shop} — falling back to legacy shape`,
         error,
       );
-      markets = await fetchMarkets(graphql, "legacy");
+      try {
+        markets = await fetchMarkets(graphql, "legacy");
+      } catch (legacyError) {
+        console.error(
+          `[catalog] legacy markets query (with currencySettings) failed for ${shop} — retrying without currency`,
+          legacyError,
+        );
+        markets = await fetchMarkets(graphql, "legacy-bare");
+      }
     }
     for (const market of markets) {
       try {
         await prisma.marketSetting.upsert({
           where: { shop_marketHandle: { shop, marketHandle: market.handle } },
-          // Never clobber admin-set overrides on re-sync — name/countries only.
-          update: { name: market.name, countriesJson: jstr(market.countries) },
+          // Shopify-owned data (name/countries/currency) is refreshed on every
+          // re-sync; admin-owned overrides (enabled/discountOverride/
+          // languageOverride/maxOffersOverride/previewFxRate) are never
+          // clobbered. currency is only refreshed when this run actually
+          // fetched one — a legacy-bare fallback ("") must not blank a value
+          // stored by an earlier sync.
+          update: {
+            name: market.name,
+            countriesJson: jstr(market.countries),
+            ...(market.currency ? { currency: market.currency } : {}),
+          },
           create: {
             shop,
             marketHandle: market.handle,
             name: market.name,
             countriesJson: jstr(market.countries),
             enabled: market.enabled,
+            currency: market.currency,
           },
         });
       } catch (error) {
@@ -973,7 +1123,8 @@ export async function syncMarketsAndLocales(
  * Upserts one product from a products/create or products/update REST webhook.
  * REST payloads carry no unit cost and no translations, so existing
  * unitCost values (matched by variant gid) and translationsJson are preserved.
- * aiDescription is merchant-written and never touched by this path.
+ * aiDescription and nameOverridesJson are merchant-written and never touched
+ * by this path (both omitted from the upsert, like the sync upsert).
  */
 export async function upsertProductFromWebhook(shop: string, payload: any): Promise<void> {
   const rawId = payload?.admin_graphql_api_id ?? payload?.id;

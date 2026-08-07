@@ -154,6 +154,15 @@ async function contextFromOrderRecord(
       totalAmount: record.totalPrice,
       lineItems,
       surface: "thank_you",
+      // The orders/create webhook stores SHOP-currency totals only, and the
+      // OrderRecord model belongs to the analytics module — not extended here
+      // to carry presentment amounts. Without both sides of the order's
+      // totalPriceSet no per-order FX rate can be derived, so this path
+      // deliberately leaves presentment null and the offer displays
+      // shop-currency prices (always correct, just not localized). The
+      // admin-fetch path below derives the real rate when it runs instead.
+      presentmentCurrency: null,
+      presentmentRate: null,
     };
   } catch (error) {
     console.error(`[api.typ-offer] order record lookup failed for ${shop}`, error);
@@ -230,6 +239,10 @@ async function contextFromAdminOrder(
     // discount tiers and catalog prices are shop-currency, so threshold math
     // in presentment currency would be wrong); presentment only as fallback.
     const money = order?.totalPriceSet?.shopMoney ?? order?.totalPriceSet?.presentmentMoney;
+    // Buyer-facing DISPLAY conversion implied by this order's own totals —
+    // engine math stays on the shop-currency values; the orchestrator only
+    // uses these to convert the prices shown on the thank-you card.
+    const presentment = derivePresentment(order?.totalPriceSet);
     const nodes: any[] = Array.isArray(order?.lineItems?.nodes) ? order.lineItems.nodes : [];
     const lineItems: PurchaseLineItem[] = [];
     for (const node of nodes) {
@@ -264,6 +277,8 @@ async function contextFromAdminOrder(
       totalAmount: toAmount(money?.amount) ?? 0,
       lineItems,
       surface: "thank_you",
+      presentmentCurrency: presentment.currency,
+      presentmentRate: presentment.rate,
     };
   } catch (error) {
     console.error(`[api.typ-offer] admin order lookup failed for ${shop}`, error);
@@ -302,4 +317,33 @@ function toAmount(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Derives the buyer's display currency and the FX rate implied by the order's
+ * own totals (mirrors api.offer.tsx): presentmentMoney.amount /
+ * shopMoney.amount, only when BOTH amounts parse to > 0 and the two currency
+ * codes are present and differ. Same currency (or missing/unparseable
+ * amounts) → rate null, so display falls back to shop-currency prices.
+ */
+function derivePresentment(totalPriceSet: any): {
+  currency: string | null;
+  rate: number | null;
+} {
+  const shopMoney = totalPriceSet?.shopMoney;
+  const presentmentMoney = totalPriceSet?.presentmentMoney;
+  const shopCurrency =
+    typeof shopMoney?.currencyCode === "string" ? shopMoney.currencyCode : "";
+  const presentmentCurrency =
+    typeof presentmentMoney?.currencyCode === "string" ? presentmentMoney.currencyCode : "";
+  if (!shopCurrency || !presentmentCurrency || shopCurrency === presentmentCurrency) {
+    return { currency: null, rate: null };
+  }
+  const shopAmount = toAmount(shopMoney?.amount);
+  const presentmentAmount = toAmount(presentmentMoney?.amount);
+  const rate =
+    shopAmount !== null && presentmentAmount !== null && shopAmount > 0 && presentmentAmount > 0
+      ? presentmentAmount / shopAmount
+      : null;
+  return { currency: presentmentCurrency, rate };
 }

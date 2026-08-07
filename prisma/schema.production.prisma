@@ -65,6 +65,9 @@ model ProductCache {
   aiDescription    String   @default("")
   variantsJson     String   @default("[]")
   translationsJson String   @default("{}")
+  // Merchant-set per-language product names (Products tab): { "fr": "…" }.
+  // Always wins over Translate & Adapt synced names; never touched by syncs.
+  nameOverridesJson String  @default("{}")
   updatedAt        DateTime @updatedAt
 
   @@unique([shop, productId])
@@ -271,6 +274,11 @@ model MarketSetting {
   discountOverride  Float?
   languageOverride  String?
   maxOffersOverride Int?
+  // Market base currency synced from Shopify Markets (e.g. "USD").
+  currency          String  @default("")
+  // Admin-set FX rate used ONLY to simulate this market in the Preview page
+  // (live buyers get the exact rate implied by their own order's totals).
+  previewFxRate     Float?
 
   @@unique([shop, marketHandle])
 }

@@ -52,6 +52,11 @@ What you see:
   webhooks — including their translated names — but run this after bulk
   imports, translation sessions, or if something looks stale.
 
+Opening the dashboard also quietly keeps your buyer-facing button and label
+translations complete: when an app update introduces new text, the missing
+strings are seeded and auto-translated in the background — no reinstall
+needed. Review or edit the results any time on the Translations page.
+
 ## Offers (rules)
 
 **Offers → list page.** Your offer rules, in evaluation order. For each
@@ -147,17 +152,37 @@ eye serum as the finishing step of a retinol routine"). Plain factual
 sentences work best; the AI turns them into copy. Start with the products you
 offer most.
 
-**Translated-name coverage.** Each product shows a badge with how many of your
-store languages have a translated product name. Product names in buyer-facing
-copy come **verbatim from Shopify's Translate & Adapt** — the AI is never
-allowed to translate or restyle a product name itself. If a language has no
-translated name, buyers in that language see the default name, so the badges
-show at a glance where Translate & Adapt needs attention.
+**Product names by language.** Product names in buyer-facing copy are never
+written or translated by the AI — it always uses the name it is given,
+verbatim. Which name that is follows a strict precedence, per language:
+
+1. **Your manual name** — set in the "Product names by language" grid inside
+   the product's expandable section: one field per enabled store language
+   (default language first), saved with the per-product **Save names** button
+   (300 characters max per name). Manual names always win over Translate &
+   Adapt and survive every sync.
+2. **The Translate & Adapt translation** — synced from Shopify.
+3. **The base title** — the product's default name.
+
+Each field's placeholder shows what buyers get while the field is empty: the
+synced Translate & Adapt name, or the base title (marked with a subdued
+"(default title)" note). Leave a field empty — or clear it and save — to fall
+back down the list. Use manual names where a Translate & Adapt translation is
+missing or off, or when you want a different name in upsell offers than on
+the storefront.
+
+**Name coverage badge.** Each product shows `x/y names covered`: a language
+counts as covered when it has a manual name **or** a synced Translate & Adapt
+translation **or** is the default language (the base title covers it). The
+warning badge shows at a glance where buyers would still see a
+default-language name.
 
 **Sync.** The tab's Sync button re-pulls everything from Shopify: titles,
 descriptions, prices, and every language's Translate & Adapt names. Editing a
 product in Shopify also refreshes it automatically (via webhooks), including
-its translated names — Sync is for bulk edits and translation sessions.
+its translated names — Sync is for bulk edits and translation sessions. Your
+manual names and AI context are merchant-owned and are never touched by any
+sync or webhook.
 
 ## Prompts (AI copy)
 
@@ -280,9 +305,13 @@ Guardrails baked into the default prompts (keep them if you rewrite): write in
 the buyer's language; concrete benefit tied to what's in the basket; **never**
 imply the original purchase was wrong or incomplete; no medical claims; no
 emojis; no urgency or scarcity talk — the register stays premium; use product
-names exactly as given (they come from Translate & Adapt); mention the
-discount naturally; research statements stay ingredient-level, cover only
-ingredients named in the brief, and never invent citations.
+names exactly as given (your manual names, else Translate & Adapt); mention
+the discount naturally; research statements stay ingredient-level, cover only
+ingredients named in the brief, and never invent citations; no em dashes —
+that long dash is a telltale of machine-written text, so the prompts forbid
+it and a sanitizer rewrites any that slip through (in AI copy and in
+auto-translated UI strings) before a buyer ever sees them. The sanitizer runs
+regardless of your prompt edits.
 
 The copy is written in two stages so nothing ever blocks the checkout:
 the headline, lead, bullets and closer — the complete short pitch — are
@@ -300,7 +329,11 @@ placing a test order or touching a real checkout. You compose a situation:
 
 - **Basket** — the product(s) the imaginary customer just bought.
 - **Country** — so market settings, overrides and discount tiers apply as
-  they would for a real order shipping there.
+  they would for a real order shipping there. When the country belongs to a
+  market that sells in a different currency than the shop, the preview shows
+  prices in that market's currency using its **preview FX rate**
+  (the Markets page). The rate affects the preview only — live buyers get
+  Shopify's own conversion, read from their own order.
 - **Language** — the buyer's storefront language.
 - **Device** — phone or desktop framing, since the offer page lays out
   differently on each.
@@ -318,11 +351,12 @@ analytics events (so nothing shifts your stats, experiments or frequency
 caps), and the temporary offer records they create are cleaned up
 automatically — a preview can never be shown to or accepted by a real buyer.
 
-Use it to spot-check your top languages after prompt edits, verify translated
-names before a market launch, review research-block claims (see the
-compliance note in [The research block](#the-research-block)), and
-sanity-check what a new rule will actually offer for a given basket before
-enabling it.
+Use it to spot-check your top languages after prompt edits, verify product
+names (manual or translated) before a market launch, check that a
+foreign-currency market shows prices in its own currency, review
+research-block claims (see the compliance note in
+[The research block](#the-research-block)), and sanity-check what a new rule
+will actually offer for a given basket before enabling it.
 
 ## Settings
 
@@ -350,8 +384,17 @@ Each section saves independently.
   winner can be picked, confidence threshold, auto-pick on/off), plus
   **Reset experiment stats** and **Pick winners now** buttons.
 - **Markets** — one row per Shopify Market: enable/disable offers there,
-  override the discount %, set a language, cap the number of offers.
-  **Re-sync** pulls new markets from Shopify without touching your overrides.
+  override the discount %, set a language, cap the number of offers. Each row
+  also shows the market's **currency** (synced from Shopify) and a **health
+  check** that flags what needs attention before you rely on that market —
+  typically a market whose currency hasn't been synced yet (run **Re-sync**),
+  or a market that sells in a different currency than the shop with no
+  **preview FX rate** set. The preview FX rate is **preview-only**: the
+  Preview page uses it to simulate that market's prices in its own currency.
+  It never touches live buyers, real prices, discounts or analytics — a live
+  buyer's prices are converted by Shopify itself, and the app reads the exact
+  rate implied by the buyer's own order totals. **Re-sync** pulls new markets
+  and currencies from Shopify without touching your overrides.
   Note on the language override: the buyer's own language always wins — the
   override only applies when the buyer's language isn't one of your enabled
   store languages. A customer who checks out in English is never switched to
@@ -373,12 +416,18 @@ Each section saves independently.
 The **offer copy** (headline, lead, bullets, the "Why it works" paragraphs,
 the research lines, the closer) is generated per-language by the AI — you
 don't translate it. And the product **names** inside that copy come verbatim
-from Shopify's Translate & Adapt (see [Products](#products)). This page
-manages the **static strings** around the copy: buttons ("Add to my order",
+from your manual per-language names, else Shopify's Translate & Adapt (see
+[Products](#products) — manual names always win). This page manages the
+**static strings** around the copy: buttons ("Add to my order",
 "No thanks, complete my order"), price labels ("Was/Now/Save x%"), the
 countdown label, the **"Why it works with your order"** and **"What published
 research shows"** section headings (keys `why_it_works` and `research_shows`),
 the thank-you page texts, etc.
+
+New strings ship with app updates from time to time; you don't have to do
+anything — missing keys are seeded and auto-translated in the background when
+the dashboard is opened (see [Dashboard](#dashboard-app-home)). Strings you
+have edited yourself are never overwritten by that self-healing pass.
 
 Pick a language, edit any string (missing ones show the English placeholder),
 and Save. **Auto-translate missing** fills gaps via AI; **Re-translate all**

@@ -30,6 +30,7 @@ import {
   getTimeSeries,
 } from "../services/analytics.server";
 import { autoPickWinners } from "../services/recommendation.server";
+import { ensureUiStringsFresh } from "../services/ai.server";
 import { syncCatalog, syncMarketsAndLocales } from "../services/catalog.server";
 import type { AdminGraphql } from "../types";
 import { MiniChart } from "../components/MiniChart";
@@ -47,6 +48,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     await autoPickWinners(shop, settings);
   } catch (error) {
     console.error("[dashboard] autoPickWinners failed", error);
+  }
+
+  // Fire-and-forget: self-heal buyer-facing UI strings. Newly added keys in
+  // DEFAULT_UI_STRINGS_EN are seeded and auto-translated in the background —
+  // no reinstall needed — and stale old-default values are normalized. Must
+  // never block or break the dashboard.
+  try {
+    void ensureUiStringsFresh(shop).catch((error: unknown) => {
+      console.error("[dashboard] ensureUiStringsFresh failed", error);
+    });
+  } catch (error) {
+    console.error("[dashboard] ensureUiStringsFresh failed", error);
   }
 
   // Housekeeping: prune IssuedOffer rows that expired more than a day ago,

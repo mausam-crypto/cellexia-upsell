@@ -16,13 +16,20 @@
 //   CopyCache packs {bullets, paragraphs, closer, proof} into the existing
 //   bulletsJson column (no schema migration; legacy array rows and packed
 //   rows without `pr` still parse — missing proof degrades to []).
-// - UiString seeding + translation via Claude or DeepL.
+// - UiString seeding + translation via Claude or DeepL. ensureUiStringsFresh
+//   is the loader-cheap self-heal: keys added by app updates get seeded AND
+//   auto-translated (scoped via translateUiStrings' keys option), and EN rows
+//   still holding a superseded default (OLD_DEFAULTS) are upgraded with their
+//   translations re-queued.
+// - Buyer copy is em-dash/en-dash free by contract: SYSTEM_CORE rule 11 bans
+//   them and stripDashes deterministically rewrites any that slip through —
+//   in validateModelCopy, the extended-stage parse, and fallbackCopy alike.
 //
-// ensurePromptTemplates / ensureUiStrings / translateUiStrings never throw —
-// they log and collect errors so bootstrap and admin actions degrade
-// gracefully. translateTexts is the low-level primitive and DOES throw on
-// provider failure; translateUiStrings catches it per language and reports it
-// in `errors`.
+// ensurePromptTemplates / ensureUiStrings / ensureUiStringsFresh /
+// translateUiStrings never throw — they log and collect errors so bootstrap
+// and admin actions degrade gracefully. translateTexts is the low-level
+// primitive and DOES throw on provider failure; translateUiStrings catches it
+// per language and reports it in `errors`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createHash } from "node:crypto";
@@ -48,6 +55,12 @@ const BACKGROUND_TIMEOUT_MS = 45_000;
 /** Timeout for translation calls (admin-triggered, not buyer-latency-critical). */
 const TRANSLATE_TIMEOUT_MS = 30_000;
 
+// Two-tier length control: the PROMPT guides the model in words (models
+// follow word counts far better than character counts), and the HARD caps
+// below sit comfortably ABOVE that guidance so a natural overrun is shown
+// intact instead of being chopped mid-sentence with an ellipsis (the "text
+// not displayed completely" bug). Truncation is a last resort for runaway
+// output, not the enforcement mechanism.
 const HEADLINE_MAX = 60;
 /** Lead (OfferCopy.body) — the 1–2 sentence promise above the fold. */
 const LEAD_MAX = 240;
@@ -58,6 +71,11 @@ const PARAGRAPH_MAX = 450;
 const CLOSER_MAX = 120;
 /** Each "What published research shows" statement (long copy only). */
 const PROOF_MAX = 200;
+// Hard display caps (validator-side) — generous buffers over the guidance.
+const BULLET_HARD_MAX = 170;
+const PARAGRAPH_HARD_MAX = 620;
+const CLOSER_HARD_MAX = 170;
+const PROOF_HARD_MAX = 280;
 /**
  * Cap per-product description text injected into prompts (word-boundary).
  * Matches the Products-tab AI-context storage cap so nothing a merchant
@@ -96,16 +114,17 @@ Non-negotiable rules:
 8. Use every product name EXACTLY as written in the brief — the names are already in the customer's language; never translate, shorten, or restyle a product name.
 9. Fact discipline: every claim must trace to something stated in the brief — the product descriptions, the prices, or the brand context. No invented studies, statistics, awards, reviews, or ingredient percentages. If the brief lacks the proof for a claim, write the weaker statement that is true instead.
 10. Research proof — the "proof" field ONLY. This is the single, narrow exception to rule 9's ban on studies, and every condition below is mandatory: (a) each statement is about exactly ONE ingredient, and that ingredient must appear BY NAME in the brief's product descriptions (e.g. retinol, vitamin C / ascorbic acid, peptides, hyaluronic acid, niacinamide, caffeine) — if the descriptions name no recognizable cosmetic ingredient, return "proof": []. (b) State only findings that are broadly established and replicated across the published literature — the kind summarized in dermatology reviews — never one study's isolated result. (c) NEVER invent or name specific journals, universities, authors, years, sample sizes, or precise percentages unless they are genuinely canonical; prefer formulations like "In published clinical studies, topical retinol has been shown to visibly reduce the appearance of fine lines over 8–12 weeks". (d) Each finding describes the INGREDIENT, never this product — "studies on niacinamide", never "studies on this cream". (e) Rule 3 applies in full: appearance, look and feel only, no medical claims. (f) Proof statements never mention the discount.
+11. Never use em dashes (—) or en dashes (–) anywhere in your output, in any language. Use a comma, colon, or period instead.
 
 Output contract — any violation breaks the page:
 - Respond with ONLY one minified JSON object. No markdown, no code fences, no text before or after it.
 - Exact schema: {"headline": string, "lead": string, "bullets": string[], "paragraphs": string[], "closer": string, "proof": string[], "discount_suggestion": number|null}
-- "headline": at most 60 characters, benefit-led, no trailing punctuation.
-- "lead": 1–2 sentences, at most 240 characters — the promise: the concrete result the offered product adds on top of the order they just placed.
-- "bullets": 3 or 4 items (unless the brief fixes an exact count), each at most 90 characters, no trailing periods. Each bullet is ONE concrete fact or benefit — an ingredient, a percentage from the brief, a mechanism, a texture, a sensory result. Never filler like "premium quality". A bullet may only reference products listed in the brief — never pad the list by inventing an item.
+- "headline": at most 8 words (~60 characters), benefit-led, no trailing punctuation.
+- "lead": 1–2 complete sentences, at most ~40 words — the promise: the concrete result the offered product adds on top of the order they just placed.
+- "bullets": 3 or 4 items (unless the brief fixes an exact count), each ONE concrete fact or benefit stated in 8–18 words as a COMPLETE statement — an ingredient, a percentage from the brief, a mechanism, a texture, a sensory result. Never a cut-off phrase, never filler like "premium quality", no trailing periods. A bullet may only reference products listed in the brief — never pad the list by inventing an item.
 - "paragraphs": {{length}}
-- "proof": when "paragraphs" are required (long copy), 2 or 3 statements, each at most ${PROOF_MAX} characters; otherwise the empty array []. The page renders them under the heading "What published research shows", so each statement must read like sourced evidence — calm, specific, factual, no hype. Governed entirely by rule 10: widely-established published findings about ingredients explicitly named in the brief's product descriptions; no recognizable named ingredient → [].
-- "closer": ONE calm reassurance line, at most 120 characters — e.g. the guarantee or the ships-with-their-order framing. No urgency.
+- "proof": when "paragraphs" are required (long copy), 2 or 3 statements, each ONE complete sentence of at most ~30 words; otherwise the empty array []. The page renders them under the heading "What published research shows", so each statement must read like sourced evidence — calm, specific, factual, no hype. Governed entirely by rule 10: widely-established published findings about ingredients explicitly named in the brief's product descriptions; no recognizable named ingredient → [].
+- "closer": ONE calm, complete reassurance sentence of at most ~18 words — e.g. the guarantee or the ships-with-their-order framing. No urgency.
 - "discount_suggestion": an integer percentage ONLY if you are confident a different discount inside the merchant's allowed range would clearly convert better for this specific basket; otherwise null.`;
 
 export const DEFAULT_PROMPTS: Record<
@@ -304,7 +323,7 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 
 function lengthSpec(copyLength: CopyLength): string {
   return copyLength === "long"
-    ? `exactly 2 or 3 paragraphs, each 2–4 sentences and at most ${PARAGRAPH_MAX} characters, rendered under the heading "Why it works with your order". Paragraph 1 — the MECHANISM: how the offered product's ingredients and actions produce the visible result, concrete and specific to THIS product. Paragraph 2 — PROOF and believability: composition facts, textures, usage specifics, and the money-back guarantee from the brand context — only facts stated in the brief count as proof. Optional paragraph 3 — RELEVANCE: tie the offer back to the exact products they bought and the routine the two form together. Never mention the discount inside paragraphs. Below the paragraphs the page renders the "proof" research block — fill it per its own contract line and rule 10.`
+    ? `exactly 2 or 3 paragraphs, each 2–4 complete sentences (~40–80 words per paragraph), rendered under the heading "Why it works with your order". Paragraph 1 — the MECHANISM: how the offered product's ingredients and actions produce the visible result, concrete and specific to THIS product. Paragraph 2 — PROOF and believability: composition facts, textures, usage specifics, and the money-back guarantee from the brand context — only facts stated in the brief count as proof. Optional paragraph 3 — RELEVANCE: tie the offer back to the exact products they bought and the routine the two form together. Never mention the discount inside paragraphs. Below the paragraphs the page renders the "proof" research block — fill it per its own contract line and rule 10.`
     : `the empty array [] — this page uses only headline, lead and bullets; write no paragraphs, and return "proof": [] as well.`;
 }
 
@@ -499,11 +518,35 @@ function truncate(value: string, max: number): string {
   return (lastSpace > max * 0.6 ? slice.slice(0, lastSpace) : slice).trimEnd() + "…";
 }
 
-/** Non-empty strings from a model array, truncated at `max`, capped at `count`. */
+/**
+ * Deterministic em/en-dash removal for every buyer-facing string. SYSTEM_CORE
+ * rule 11 bans dashes, but models slip and merchant-stored strings (edited UI
+ * strings, product names, brand context) predate the rule — so the ban is
+ * ENFORCED here, not just requested. Spaced (" — ") and bare ("—"/"–") dashes
+ * both become ", ", then the artifacts the swap can leave behind are
+ * collapsed (", ," → ","; "  " → " ").
+ */
+function stripDashes(value: string): string {
+  if (!/[—–]/.test(value)) return value;
+  let out = value.replace(/ [—–] /g, ", ").replace(/[—–]/g, ", ");
+  while (/,\s*,/.test(out)) out = out.replace(/,\s*,/g, ",");
+  return out
+    .replace(/ {2,}/g, " ")
+    .replace(/ +,/g, ",")
+    .replace(/^[\s,]+/, "")
+    .trimEnd();
+}
+
+/**
+ * Non-empty strings from a model array, dash-sanitized, truncated at `max`,
+ * capped at `count`. Used by validateModelCopy AND the extended-stage parse,
+ * so both stages emit dash-free items.
+ */
 function stringItems(value: unknown, max: number, count: number): string[] {
   return (Array.isArray(value) ? value : [])
     .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    .map((item) => truncate(item, max))
+    .map((item) => truncate(stripDashes(item), max))
+    .filter((item) => item.length > 0)
     .slice(0, count);
 }
 
@@ -525,14 +568,16 @@ function validateModelCopy(
   if (!headline || !lead) {
     throw new Error("Model output missing headline or lead");
   }
-  const bullets = stringItems(parsed.bullets, BULLET_MAX, 4);
+  const bullets = stringItems(parsed.bullets, BULLET_HARD_MAX, 4);
   // "short" is lead + bullets only — drop paragraphs even if the model wrote them.
   const paragraphs =
-    copyLength === "long" ? stringItems(parsed.paragraphs, PARAGRAPH_MAX, 3) : [];
+    copyLength === "long" ? stringItems(parsed.paragraphs, PARAGRAPH_HARD_MAX, 3) : [];
   // Research block is long-copy only — same discipline as paragraphs.
-  const proof = copyLength === "long" ? stringItems(parsed.proof, PROOF_MAX, 3) : [];
+  const proof = copyLength === "long" ? stringItems(parsed.proof, PROOF_HARD_MAX, 3) : [];
   const closer =
-    typeof parsed.closer === "string" ? truncate(parsed.closer.trim(), CLOSER_MAX) : "";
+    typeof parsed.closer === "string"
+      ? truncate(stripDashes(parsed.closer.trim()), CLOSER_HARD_MAX)
+      : "";
   const suggestionRaw = parsed.discount_suggestion;
   const discountSuggestion =
     typeof suggestionRaw === "number" && Number.isFinite(suggestionRaw)
@@ -540,8 +585,8 @@ function validateModelCopy(
       : null;
   return {
     copy: {
-      headline: truncate(headline, HEADLINE_MAX + 20),
-      body: truncate(lead, LEAD_MAX + 60),
+      headline: truncate(stripDashes(headline), HEADLINE_MAX + 20),
+      body: truncate(stripDashes(lead), LEAD_MAX + 60),
       bullets,
       paragraphs,
       closer,
@@ -1049,8 +1094,8 @@ export async function completeExtendedCopy(
       timeoutMs: BACKGROUND_TIMEOUT_MS,
     });
     const parsed = parseModelObject(raw);
-    const paragraphs = stringItems(parsed.paragraphs, PARAGRAPH_MAX, 3);
-    const proof = stringItems(parsed.proof, PROOF_MAX, 3);
+    const paragraphs = stringItems(parsed.paragraphs, PARAGRAPH_HARD_MAX, 3);
+    const proof = stringItems(parsed.proof, PROOF_HARD_MAX, 3);
     if (paragraphs.length === 0) {
       // A "merged" copy without paragraphs is a core-only result in disguise —
       // never cache it under the full cacheKey (proof alone may be [] by rule 10).
@@ -1132,12 +1177,16 @@ export function fallbackCopy(
   const discountLine = hasDiscount ? s("discount_applied").replace("{pct}", pct) : "";
   const saveLine = hasDiscount ? s("save_pct").replace("{pct}", pct) : "";
 
-  const headline = truncate(titles.join(" + "), HEADLINE_MAX);
+  // stripDashes is the final pass over every assembled field: the UI-string
+  // DEFAULTS are dash-free, but merchant-EDITED strings, product names and
+  // brand-context text may not be.
+  const headline = truncate(stripDashes(titles.join(" + ")), HEADLINE_MAX);
   const body = truncate(
-    [s("offer_badge"), discountLine].filter(Boolean).join(" — "),
+    stripDashes([s("offer_badge"), discountLine].filter(Boolean).join(", ")),
     LEAD_MAX,
   );
   const bullets = [saveLine, s("ships_free"), s("one_click_note")]
+    .map((b) => stripDashes(b))
     .filter((b) => b.length > 0)
     .slice(0, 3);
   if (args.copyLength !== "long") {
@@ -1147,11 +1196,11 @@ export function fallbackCopy(
   // Long form: one paragraph per offered product (first ~2 sentences of its
   // effective description), capped at 2. No description → no paragraph.
   const paragraphs = args.offerProducts
-    .map((p) => firstSentences(args.offerDescriptions?.[p.productId] ?? ""))
+    .map((p) => stripDashes(firstSentences(args.offerDescriptions?.[p.productId] ?? "")))
     .filter((paragraph) => paragraph.length > 0)
     .slice(0, 2);
   const closer = truncate(
-    guaranteeLine(args.settings.brandContext) || s("ships_free"),
+    stripDashes(guaranteeLine(args.settings.brandContext) || s("ships_free")),
     CLOSER_MAX,
   );
   // Research proof stays EMPTY in the deterministic fallback — by design.
@@ -1168,15 +1217,23 @@ export function fallbackCopy(
 
 /**
  * Seed English UI strings from the defaults (skipping existing rows), then
- * best-effort translate missing strings for the other languages. Never throws.
+ * best-effort translate missing strings for the other languages. Keys seeded
+ * on an EXISTING shop (i.e. added by an app update after install — the
+ * "research heading is English-only" root cause) additionally get their own
+ * fire-and-forget translation scoped to exactly those keys, and are excluded
+ * from the awaited pass so the two never race on the same rows and callers on
+ * a request path return fast. Never throws.
  */
 export async function ensureUiStrings(shop: string, languages: string[]): Promise<void> {
+  let seededKeys: string[] = [];
+  let existingShop = false;
   try {
     const existing = await prisma.uiString.findMany({
       where: { shop, language: "en" },
       select: { key: true },
     });
     const have = new Set(existing.map((row) => row.key));
+    existingShop = have.size > 0;
     const missing = UI_STRING_KEYS.filter((key) => !have.has(key));
     if (missing.length > 0) {
       await prisma.uiString.createMany({
@@ -1187,6 +1244,7 @@ export async function ensureUiStrings(shop: string, languages: string[]): Promis
           value: DEFAULT_UI_STRINGS_EN[key] ?? "",
         })),
       });
+      seededKeys = missing;
     }
   } catch (error) {
     console.error(`[ai] ensureUiStrings seeding failed for ${shop}:`, error);
@@ -1194,14 +1252,113 @@ export async function ensureUiStrings(shop: string, languages: string[]): Promis
 
   const others = languages.filter((lang) => lang && lang !== "en");
   if (others.length === 0) return;
+
+  // New keys on an existing shop: translate exactly those in the background.
+  const backgroundKeys = existingShop ? seededKeys : [];
+  if (backgroundKeys.length > 0) {
+    void translateUiStrings(shop, others, {
+      onlyMissing: true,
+      keys: backgroundKeys,
+    }).catch((error) =>
+      console.error(
+        `[ai] ensureUiStrings background translation failed for ${shop}:`,
+        error,
+      ),
+    );
+  }
+
   try {
-    const { errors } = await translateUiStrings(shop, others, { onlyMissing: true });
+    // Awaited pass over the remaining keys (all keys on a fresh install). On
+    // a healthy existing shop nothing is missing here, so it costs one DB
+    // query per language and no provider calls.
+    const foregroundKeys =
+      backgroundKeys.length > 0
+        ? UI_STRING_KEYS.filter((key) => !backgroundKeys.includes(key))
+        : undefined;
+    if (foregroundKeys && foregroundKeys.length === 0) return;
+    const { errors } = await translateUiStrings(shop, others, {
+      onlyMissing: true,
+      ...(foregroundKeys ? { keys: foregroundKeys } : {}),
+    });
     for (const message of errors) {
       console.error(`[ai] ensureUiStrings translation issue for ${shop}: ${message}`);
     }
   } catch (error) {
     // translateUiStrings collects its own errors; this is belt-and-braces.
     console.error(`[ai] ensureUiStrings translation pass failed for ${shop}:`, error);
+  }
+}
+
+/**
+ * Superseded English defaults: the four strings that carried em dashes before
+ * the em-dash-free copy contract. A stored EN row whose value still matches
+ * one of these VERBATIM is an untouched old seed, never a merchant edit, so
+ * it is safe to upgrade in place. Extend this map whenever a default in
+ * DEFAULT_UI_STRINGS_EN is reworded, keyed by UI string key → old value.
+ */
+const OLD_DEFAULTS: Record<string, string> = {
+  ships_free: "Ships with your order — no extra shipping",
+  one_click_note: "One click — charged to the payment method you just used",
+  discount_applied: "{pct}% off — post-purchase exclusive",
+  thank_you_code_note: "Code {code} — applied automatically at checkout",
+};
+
+/**
+ * Loader-cheap self-heal for UI strings — safe to call from any request path.
+ * ONE small DB read decides everything; all repair work is fire-and-forget:
+ * - EN keys missing (added by an app update after install): ensureUiStrings
+ *   seeds them and auto-translates exactly those keys in the background.
+ * - EN rows still holding a superseded default (OLD_DEFAULTS): upgraded to
+ *   the current DEFAULT_UI_STRINGS_EN value and their translations re-queued
+ *   for every configured non-default language (overwriting the stale ones).
+ * Never throws.
+ */
+export async function ensureUiStringsFresh(shop: string): Promise<void> {
+  try {
+    const enRows = await prisma.uiString.findMany({
+      where: { shop, language: "en" },
+      select: { key: true, value: true },
+    });
+    const have = new Set(enRows.map((row) => row.key));
+    const missing = UI_STRING_KEYS.some((key) => !have.has(key));
+    const staleKeys = enRows
+      .filter((row) => OLD_DEFAULTS[row.key] === row.value)
+      .map((row) => row.key);
+    if (!missing && staleKeys.length === 0) return;
+
+    void (async () => {
+      const settings = await getSettings(shop);
+      if (staleKeys.length > 0) {
+        for (const key of staleKeys) {
+          const value = DEFAULT_UI_STRINGS_EN[key];
+          if (!value) continue;
+          await prisma.uiString.update({
+            where: { shop_language_key: { shop, language: "en", key } },
+            data: { value },
+          });
+        }
+        const others = settings.languages.filter((lang) => lang && lang !== "en");
+        if (others.length > 0) {
+          // NOT onlyMissing — the stale translations must be overwritten. The
+          // EN rows were updated first, so the new values are the source.
+          const { errors } = await translateUiStrings(shop, others, {
+            keys: staleKeys,
+          });
+          for (const message of errors) {
+            console.error(
+              `[ai] ensureUiStringsFresh retranslation issue for ${shop}: ${message}`,
+            );
+          }
+        }
+      }
+      if (missing) {
+        await ensureUiStrings(shop, settings.languages);
+      }
+    })().catch((error) =>
+      console.error(`[ai] ensureUiStringsFresh repair failed for ${shop}:`, error),
+    );
+  } catch (error) {
+    console.error(`[ai] ensureUiStringsFresh failed for ${shop}:`, error);
   }
 }
 
@@ -1254,14 +1411,21 @@ function extractPlaceholders(text: string): string[] {
 
 /**
  * Translate UI strings into the given languages using the configured provider.
- * Never throws — failures are collected per language into `errors`.
+ * `opts.keys` scopes the pass to exactly those keys (unknown keys are
+ * ignored); `opts.onlyMissing` further filters to keys the target language
+ * has no row for — the two compose. Never throws — failures are collected
+ * per language into `errors`.
  */
 export async function translateUiStrings(
   shop: string,
   languages: string[],
-  opts?: { onlyMissing?: boolean },
+  opts?: { onlyMissing?: boolean; keys?: string[] },
 ): Promise<{ translated: number; errors: string[] }> {
   const onlyMissing = opts?.onlyMissing ?? false;
+  const keyScope = opts?.keys;
+  const scopedKeys = keyScope
+    ? UI_STRING_KEYS.filter((key) => keyScope.includes(key))
+    : UI_STRING_KEYS;
   let translated = 0;
   const errors: string[] = [];
 
@@ -1287,7 +1451,7 @@ export async function translateUiStrings(
   for (const language of languages) {
     if (!language || language === "en") continue;
     try {
-      let keys = [...UI_STRING_KEYS];
+      let keys = [...scopedKeys];
       if (onlyMissing) {
         const existing = await prisma.uiString.findMany({
           where: { shop, language },

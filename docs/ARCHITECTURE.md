@@ -69,7 +69,9 @@ app/
                                    resetExperimentStats
     ai.server.ts                   DEFAULT_PROMPTS, claudeComplete, generateCopy
                                    (+ CopyCache), fallbackCopy, UI-string
-                                   seeding/lookup/translation, DeepL client
+                                   seeding/lookup/translation (+ self-healing
+                                   ensureUiStringsFresh), em-dash sanitizer,
+                                   DeepL client
     analytics.server.ts            recordExtensionEvent, recordOrderFromWebhook,
                                    backfillPendingRevenue (payment recovery),
                                    dashboard stats, time series, breakdowns,
@@ -78,15 +80,16 @@ app/
                                    (language resolution, copy, IssuedOffer)
   routes/
     app.tsx                        Embedded app frame + nav
-    app._index.tsx                 Dashboard (KPIs, chart, checklist, sync)
+    app._index.tsx                 Dashboard (KPIs, chart, checklist, sync;
+                                   fires ensureUiStringsFresh in background)
     app.analytics.tsx              Analytics + CSV export
     app.offers._index.tsx          Rules list
     app.offers.$id.tsx             Rule editor ("new" = create)
     app.preview.tsx                Offer preview sandbox — runs the production
                                    pipeline, cleans up its IssuedOffer rows,
                                    records no analytics
-    app.products.tsx               Products tab: AI-context editor +
-                                   translated-name coverage
+    app.products.tsx               Products tab: AI-context editor, manual
+                                   per-language names, name coverage
     app.prompts.tsx                Prompt templates + live preview
     app.settings.tsx               Settings sections
     app.translations.tsx           UI-string editor + auto-translate
@@ -284,6 +287,11 @@ merchant deliberately removes in Settings → Languages is never re-added by a
 later sync. Newly published locales still appear automatically on the next
 sync (and `defaultLanguage` keeps following the store's primary locale).
 
+Bootstrap-time seeding is complemented by a self-healing pass after install:
+UI-string keys added by later app updates are seeded, translated, and
+old-default values normalized by `ensureUiStringsFresh`, fired
+fire-and-forget from the dashboard loader — no reinstall needed (see §6).
+
 ## 4. Database (prisma/schema.prisma)
 
 JSON payloads are stored in `String` columns for SQLite/Postgres portability;
@@ -293,7 +301,7 @@ always read/write them with `jparse`/`jstr` from `app/lib/json.ts`.
 |---|---|
 | `Session` | Shopify OAuth sessions — required shape for `@shopify/shopify-app-session-storage-prisma`; never alter. |
 | `Shop` | One row per installed shop. `settingsJson` holds a *partial* `AppSettings` that `getSettings` deep-merges over `DEFAULT_SETTINGS` (unset keys keep tracking defaults). `catalogSyncedAt` drives the dashboard checklist. |
-| `ProductCache` | Local catalog: title/handle/type/vendor/status/tags/image, `descriptionShort` (~300 chars, basket summaries), `descriptionFull` (full plain-text Shopify description, capped ~12,000 chars), `aiDescription` (merchant-written AI context from the admin's Products tab), `variantsJson: CachedVariant[]` (price, compare-at, inventory, unit cost, sku), `translationsJson` per-locale titles from Translate & Adapt. Copywriting grounds each offered product in its **effective description**: `aiDescription` when non-empty, otherwise `descriptionFull`. Kept fresh by `products/*` webhooks (which refresh that product's row incl. translated names) + manual full sync. All offer selection reads this, never live Shopify. |
+| `ProductCache` | Local catalog: title/handle/type/vendor/status/tags/image, `descriptionShort` (~300 chars, basket summaries), `descriptionFull` (full plain-text Shopify description, capped ~12,000 chars), `aiDescription` (merchant-written AI context from the admin's Products tab), `variantsJson: CachedVariant[]` (price, compare-at, inventory, unit cost, sku), `translationsJson` per-locale titles from Translate & Adapt, `nameOverridesJson` (merchant-set per-language product names from the Products tab — always win over Translate & Adapt, never touched by syncs/webhooks; see §6.2). Copywriting grounds each offered product in its **effective description**: `aiDescription` when non-empty, otherwise `descriptionFull`. Kept fresh by `products/*` webhooks (which refresh that product's row incl. translated names) + manual full sync — merchant-owned columns (`aiDescription`, `nameOverridesJson`) are always preserved. All offer selection reads this, never live Shopify. |
 | `OfferRule` | Admin-defined rule: `triggerJson: RuleTrigger` (AND semantics, empty = any), priority (asc, first match wins), optional per-rule `displayMode` / `discountJson` / `copyLength` / `maxOffers`. |
 | `OfferSlot` | One "page" position (1..3) in a rule's sequenced flow. Cascade-deleted with the rule. |
 | `OfferCandidate` | A rotation candidate within a slot: product/variant, weight, enabled, running `impressions`/`accepts`/`revenue` counters (the Thompson-sampling posteriors), `isWinner` flag set by `autoPickWinners`. |
@@ -304,7 +312,7 @@ always read/write them with `jparse`/`jstr` from `app/lib/json.ts`.
 | `EventDedup` | Race-proof replay guard for extension events: one claim per offer page and event type, unique on `(shop, referenceId, position, eventType)`, inserted in the **same transaction** as the `OfferEvent` rows — concurrent duplicates lose the insert and are dropped, and a failed write releases the claim instead of losing the event. Claims older than 7 days are pruned from the dashboard loader (replay protection only needs to outlive the offer TTL). |
 | `OrderRecord` / `OrderLine` | Order history from `orders/create`: totals, currency, country, customer id, per-line product/variant/qty/price, `isUpsell` marking, `hadUpsellOffer`/`acceptedUpsell` flags. Powers co-purchase affinity, suppression, repeat-purchase rates and CLV cohorts. |
 | `CustomerState` | Per-customer frequency capping: `lastOfferAt`, counters. Only exists for logged-in customers (guests can't be capped). |
-| `MarketSetting` | Per-Shopify-Market overrides: enabled, discount %, language, max offers, `countriesJson`. Seeded from the Markets API; re-sync never overwrites admin-set overrides. |
+| `MarketSetting` | Per-Shopify-Market overrides: enabled, discount %, language, max offers, `countriesJson`, plus `currency` (market base currency, synced from the Markets API) and `previewFxRate` (admin-set FX rate used ONLY to simulate the market on the Preview page — never read on live-buyer paths; live buyers get the rate implied by their own order, see §6.4). Seeded from the Markets API; re-sync never overwrites admin-set overrides (incl. `previewFxRate`). |
 | `UiString` | Buyer-facing static strings per (shop, language, key). Seeded from `DEFAULT_UI_STRINGS_EN`, editable, auto-translatable. Lookup falls back requested lang → base lang (`pt-PT`→`pt`) → `en` → compiled defaults, per key. |
 
 ## 5. The recommendation engine (technical)
@@ -411,6 +419,21 @@ the Beta posteriors (2000 draws) and flags a winner at
 - Translation of static UI strings goes through Claude or DeepL
   (`translationProvider`); the Claude path likewise sends no temperature
   parameter. DeepL keys ending `:fx` are routed to the free-tier host.
+- **Em-dash policy.** Buyer-facing text never contains an em dash (`—`) —
+  the long dash reads as machine-written and is off-register for the brand.
+  Enforced in two layers so neither can silently regress: the prompts (copy
+  and translation) forbid it, and a sanitizer in `ai.server.ts` rewrites any
+  em dash that slips through in generated copy and auto-translated UI
+  strings before the text is cached or served. `DEFAULT_UI_STRINGS_EN`
+  (`app/types.ts`) is itself em-dash-free. Admin UI text is out of scope.
+- **Self-healing UI strings.** `ensureUiStringsFresh(shop)` — fired
+  fire-and-forget from the dashboard loader — seeds keys newly added to
+  `DEFAULT_UI_STRINGS_EN` by app updates, auto-translates the gaps in every
+  enabled language, and normalizes rows still holding an old compiled
+  default (e.g. the pre-policy em-dash variants) to the current default +
+  re-translation. Merchant-edited values are never overwritten; the pass is
+  a cheap no-op when everything is current, never blocks the dashboard and
+  never throws. No reinstall is ever needed to pick up new strings.
 
 ### 6.1 `OfferCopy` — the extended shape and where each part renders
 
@@ -476,16 +499,19 @@ The bundle page keeps the same tail (4→10, with a combined price row and one
 accept-all button) but opens with per-product tiles (image, title, was/now
 price) before the combined headline/lead/bullets.
 
-### 6.2 Translated product names
+### 6.2 Product names (manual overrides + Translate & Adapt)
 
 Product names shown to buyers are never generated or translated by the model
-— they flow verbatim from Shopify:
+— per language they are resolved with a strict precedence and used verbatim:
 
 ```
-Translate & Adapt (merchant edits names per locale)
-      │  Admin GraphQL: translations(locale:) per store language
-      ▼
-ProductCache.translationsJson   { [locale]: { title } }
+1. ProductCache.nameOverridesJson   { [lang]: name }   ← merchant-set in the
+   (Products tab "Product names by language"; always     admin, never touched
+   wins, survives every sync/webhook)                     by any sync
+2. ProductCache.translationsJson    { [locale]: { title } }
+   (Translate & Adapt, synced via Admin GraphQL
+   translations(locale:) per store language)
+3. ProductCache.title               (base title)
       │
       ├─▶ prompt interpolation   (the model is instructed to use the
       │                           given name verbatim, never re-translate)
@@ -494,9 +520,13 @@ ProductCache.translationsJson   { [locale]: { title } }
 ```
 
 Freshness: a `products/create|update` webhook refreshes **that product's**
-translated names; a full catalog sync refreshes every product. The admin's
-Products tab surfaces per-product translated-name coverage so missing locales
-are visible before buyers see a default-language name.
+translated names; a full catalog sync refreshes every product; neither ever
+touches `nameOverridesJson` (merchant-owned, like `aiDescription`). The
+admin's Products tab surfaces per-product name coverage (`x/y names covered`
+= manual override OR synced translation OR the default language) so missing
+locales are visible before buyers see a default-language name, and lets the
+merchant fix a gap instantly with a manual name instead of waiting on
+Translate & Adapt.
 
 ### 6.3 Language resolution precedence
 
@@ -518,6 +548,31 @@ The function returns `{ language, source }` where `source` is
 `assembleOfferResponse` reports it through the
 `AssembleOfferOptions.languageResolution` out-param so the admin Preview can
 show *why* a language was chosen, not just which one.
+
+### 6.4 Multi-currency display
+
+One rule governs all money code: **engine math stays in the shop currency;
+presentment currency is display-only.**
+
+- Rule `minTotal`/`maxTotal` thresholds, discount tiers, catalog prices,
+  GP/margin math, changesets and analytics are all shop-currency amounts.
+  `/api/offer` therefore builds `PurchaseContext.totalAmount`/`currency` from
+  the order's **shopMoney** (a ¥12,000 presentment total is not "≥ €120").
+- `PurchaseContext` additionally carries `presentmentCurrency` and
+  `presentmentRate` (`app/types.ts`) — the buyer-facing DISPLAY currency and
+  the **implied order rate**: `presentmentTotal / shopTotal` from the buyer's
+  own order totals, i.e. Shopify's own conversion for that exact order. The
+  orchestrator uses the pair only to convert the prices shown on the page
+  (`OfferProductView`); percentage discounts are currency-agnostic, and the
+  changeset itself carries no converted amounts. Fields absent → display
+  falls back to shop currency. The post-purchase extension's accept flow
+  additionally shows exact Shopify-computed presentment totals via
+  `calculateChangeset`.
+- The admin Preview has no real order to imply a rate from, so a simulated
+  market uses `MarketSetting.currency` + `MarketSetting.previewFxRate`
+  (admin-set, preview-only — see the Markets page's health checks). A
+  wrong preview rate can only make a preview look wrong; it is never read on
+  a live-buyer path.
 
 ## 7. The two extensions
 

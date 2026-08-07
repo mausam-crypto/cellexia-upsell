@@ -144,6 +144,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     languages: settings.languages,
     defaultLanguage: settings.defaultLanguage,
     countries,
+    // Market simulation choices for the primary "Market" select. countries
+    // are pre-cleaned so every market's first country is guaranteed to exist
+    // in the country select above (the loader merges them into countrySet).
+    markets: markets
+      .map((m) => ({
+        handle: m.marketHandle,
+        name: m.name,
+        currency: (m.currency || "").trim().toUpperCase(),
+        countries: jparse<string[]>(m.countriesJson, [])
+          .map((c) => String(c).trim().toUpperCase())
+          .filter((c) => /^[A-Z]{2}$/.test(c)),
+        enabled: m.enabled,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
     aiKeySet: Boolean(process.env.ANTHROPIC_API_KEY),
     aiEnabled: settings.aiEnabled,
   });
@@ -171,6 +185,20 @@ interface GenerateResult {
    * so the preview still renders; the chip is simply hidden).
    */
   languageResolution: { language: string; source: LanguageSource } | null;
+  /**
+   * Market/currency simulation summary for the result header chips.
+   * marketName is the market resolved from the shipping country (same
+   * first-match-by-country logic as the orchestrator) regardless of whether
+   * presentment was simulated. rate is the ctx.presentmentRate the action
+   * passed to the engine — null means no simulation ran and prices are plain
+   * shop-currency amounts. rateIsDefault flags the 1.0 fallback used when
+   * the market has no preview FX rate configured yet.
+   */
+  presentment: {
+    marketName: string | null;
+    rate: number | null;
+    rateIsDefault: boolean;
+  };
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -196,7 +224,51 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const requestedLanguage = String(formData.get("language") ?? "");
     const countryRaw = String(formData.get("countryCode") ?? "").trim().toUpperCase();
     const countryCode = /^[A-Z]{2}$/.test(countryRaw) ? countryRaw : null;
+    const marketHandle = String(formData.get("marketHandle") ?? "").trim();
     const regenerate = String(formData.get("regenerate") ?? "") === "1";
+
+    // Market simulation. The MarketSetting row is re-read server-side (the
+    // client only names a handle, never currency or rate); an unknown/stale
+    // handle simply degrades to a plain country preview.
+    const marketRows = await prisma.marketSetting.findMany({ where: { shop } });
+    const simulatedMarket = marketHandle
+      ? marketRows.find((m) => m.marketHandle === marketHandle) ?? null
+      : null;
+
+    // Keep the country consistent with the simulated market: if the submitted
+    // country is not one of the market's countries (stale client state), snap
+    // to the market's first country — the value the Market select applies.
+    let effectiveCountry = countryCode;
+    if (simulatedMarket) {
+      const marketCountries = jparse<string[]>(simulatedMarket.countriesJson, [])
+        .map((c) => String(c).trim().toUpperCase())
+        .filter((c) => /^[A-Z]{2}$/.test(c));
+      if (!effectiveCountry || !marketCountries.includes(effectiveCountry)) {
+        effectiveCountry = marketCountries[0] ?? effectiveCountry;
+      }
+    }
+
+    // Simulated presentment: the display currency comes from the market when
+    // synced; the rate is the merchant-set preview FX rate, defaulting to 1
+    // (flagged as the default in the result header). Currency and rate travel
+    // as a pair — a market with no synced currency simulates nothing rather
+    // than converting amounts that would still be labelled in shop currency.
+    const presentmentCurrency = simulatedMarket?.currency?.trim().toUpperCase() || null;
+    const presentmentRate = presentmentCurrency
+      ? simulatedMarket?.previewFxRate ?? 1
+      : null;
+
+    // Resolved the way the orchestrator resolves it (first market whose
+    // country list contains the shipping country) — differs from the selected
+    // market only in the "No market" case where the chosen country happens to
+    // belong to one; the chip then shows the market that actually applied.
+    const resolvedMarket = effectiveCountry
+      ? marketRows.find((m) =>
+          jparse<string[]>(m.countriesJson, []).some(
+            (c) => String(c).trim().toUpperCase() === effectiveCountry,
+          ),
+        ) ?? null
+      : null;
 
     // Re-derive prices/variants server-side from the catalog cache — the
     // client only names products and quantities, never money.
@@ -261,12 +333,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       shop,
       referenceId,
       customerId: null, // frequency caps never apply to previews
-      countryCode,
+      countryCode: effectiveCountry,
       locale: requestedLanguage,
       currency: "EUR", // shop currency — catalog prices/tiers are EUR amounts
       totalAmount,
       lineItems,
       surface: "post_purchase",
+      // Simulated buyer-facing display currency + rate (engine math stays in
+      // shop currency; live buyers get the rate implied by their own order).
+      presentmentCurrency,
+      presentmentRate,
     };
 
     const started = Date.now();
@@ -317,6 +393,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       generatedAt: Date.now(),
       diagnostics,
       languageResolution: options.languageResolution ?? null,
+      presentment: {
+        marketName: resolvedMarket?.name ?? null,
+        rate: presentmentRate,
+        rateIsDefault:
+          presentmentRate !== null && simulatedMarket?.previewFxRate == null,
+      },
     };
     return json({ ok: true as const, message: "", result });
   } catch (error) {
@@ -394,6 +476,8 @@ export default function PreviewPage() {
 
   const [basket, setBasket] = useState<BasketLine[]>([]);
   const [pickerQuery, setPickerQuery] = useState("");
+  // "" = no market (store default) — the free country select is the driver.
+  const [market, setMarket] = useState("");
   const [country, setCountry] = useState(data.countries[0] ?? "FR");
   const [language, setLanguage] = useState(
     data.defaultLanguage || data.languages[0] || "en",
@@ -456,10 +540,31 @@ export default function PreviewPage() {
     return sum + (product ? product.price * line.quantity : 0);
   }, 0);
 
+  // Market select drives the country: picking a market snaps the country to
+  // the market's first country (always present in the country options — the
+  // loader merges every market country into the list).
+  const handleMarketChange = (value: string) => {
+    setMarket(value);
+    if (!value) return;
+    const picked = data.markets.find((m) => m.handle === value);
+    if (picked && picked.countries.length > 0) setCountry(picked.countries[0]);
+  };
+
+  // The country select stays available as a secondary control for non-market
+  // countries: picking a country outside the selected market clears the
+  // market (keeping it would simulate a currency that country never sees).
+  const handleCountryChange = (value: string) => {
+    setCountry(value);
+    if (!market) return;
+    const picked = data.markets.find((m) => m.handle === market);
+    if (!picked || !picked.countries.includes(value)) setMarket("");
+  };
+
   const handleGenerate = () => {
     const fd = new FormData();
     fd.set("intent", "generate");
     fd.set("basket", JSON.stringify(basket));
+    fd.set("marketHandle", market);
     fd.set("countryCode", country);
     fd.set("language", language);
     fd.set("regenerate", regenerate ? "1" : "0");
@@ -478,6 +583,15 @@ export default function PreviewPage() {
   const anyCache = diags.some((d) => d.source === "cache");
   const fallbackReason = diags.find((d) => d.source === "fallback")?.reason ?? null;
 
+  const marketOptions = [
+    { label: "No market (store default)", value: "" },
+    ...data.markets.map((m) => ({
+      label: `${m.name}${m.currency ? `, ${m.currency}` : ""}${
+        m.enabled ? "" : " (disabled)"
+      }`,
+      value: m.handle,
+    })),
+  ];
   const countryOptions = data.countries.map((code) => ({
     label: countryLabel(code),
     value: code,
@@ -611,11 +725,18 @@ export default function PreviewPage() {
 
               <Divider />
               <Select
+                label="Market"
+                options={marketOptions}
+                value={market}
+                onChange={handleMarketChange}
+                helpText="Simulates the market's display currency with its preview FX rate. Picking a market sets the shipping country."
+              />
+              <Select
                 label="Shipping country"
                 options={countryOptions}
                 value={country}
-                onChange={setCountry}
-                helpText="Drives market overrides (enabled, discount, language, max offers)."
+                onChange={handleCountryChange}
+                helpText="Drives market overrides (enabled, discount, language, max offers). A country outside the selected market clears the market."
               />
               <Select
                 label="Buyer language"
@@ -705,6 +826,19 @@ export default function PreviewPage() {
                         </Badge>
                       </>
                     ) : null}
+                    <Badge tone="info">
+                      {result.presentment.marketName
+                        ? `Market: ${result.presentment.marketName}`
+                        : "No market (store default)"}
+                    </Badge>
+                    <Badge>{`Display currency: ${result.response.currency}`}</Badge>
+                    {result.presentment.rate !== null ? (
+                      <Badge
+                        tone={result.presentment.rateIsDefault ? "warning" : "info"}
+                      >
+                        {`FX rate: ${result.presentment.rate}`}
+                      </Badge>
+                    ) : null}
                     <Badge>
                       {`${result.offerCount} offer${result.offerCount === 1 ? "" : "s"}`}
                     </Badge>
@@ -741,6 +875,19 @@ export default function PreviewPage() {
                     The selected country’s market has a language override
                     configured in Settings → Markets — it applied because the
                     selected language is not an enabled store language.
+                  </Text>
+                </Box>
+              ) : null}
+              {result && result.presentment.rate !== null ? (
+                <Box paddingBlockStart="200">
+                  <Text
+                    as="p"
+                    variant="bodySm"
+                    tone={result.presentment.rateIsDefault ? "caution" : "subdued"}
+                  >
+                    {result.presentment.rateIsDefault
+                      ? "Prices are simulated with the market's preview FX rate (1, the default — no rate is configured for this market yet, so amounts equal shop-currency values). Live buyers see Shopify's exact checkout conversion; set a preview FX rate on the Markets page for realistic amounts."
+                      : `Prices are simulated with the market's preview FX rate (${result.presentment.rate}) — live buyers see Shopify's exact checkout conversion.`}
                   </Text>
                 </Box>
               ) : null}
@@ -799,7 +946,7 @@ export default function PreviewPage() {
                       </Text>
                       <Text as="p" tone="subdued" alignment="center">
                         Pick the products a customer “just bought”, choose the
-                        country and language, then generate. The preview runs
+                        market, country and language, then generate. The preview runs
                         the live recommendation engine and the live AI
                         copywriter — the same code path buyers hit after
                         checkout.

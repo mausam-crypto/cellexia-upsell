@@ -196,7 +196,7 @@ function ThankYouUpsell() {
     ? tpl(
         firstNonEmpty(
           strings.thank_you_code_note,
-          "Code {code} — applied automatically at checkout",
+          "Code {code}, applied automatically at checkout",
         ),
         { code },
       )

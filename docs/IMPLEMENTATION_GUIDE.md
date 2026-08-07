@@ -32,6 +32,8 @@ read [MERCHANT_GUIDE.md](MERCHANT_GUIDE.md).
 20. [Known dependency advisories](#20-known-dependency-advisories)
 21. [The offer copy JSON contract (prompt editing)](#21-the-offer-copy-json-contract-prompt-editing)
 22. [The two-stage copy pipeline & Anthropic API notes](#22-the-two-stage-copy-pipeline--anthropic-api-notes)
+23. [Multi-currency display & the Markets health checks](#23-multi-currency-display--the-markets-health-checks)
+24. [Manual product names, the em-dash policy & self-healing UI strings](#24-manual-product-names-the-em-dash-policy--self-healing-ui-strings)
 
 ---
 
@@ -138,16 +140,21 @@ both extensions, and prints a preview URL. Keep it running for the next steps.
 
 Schema changes are applied the same way: re-run `npm run setup` (i.e.
 `prisma db push`) after pulling updates. The schema has grown since the
-initial release — e.g. the `EventDedup` replay-guard table, and more recently
-two `ProductCache` columns: `descriptionFull` (the full plain-text Shopify
-product description, synced and capped at ~12,000 chars) and `aiDescription`
-(merchant-written AI context from the admin's Products tab, which overrides
-the Shopify description as copywriting grounding when non-empty) — and
+initial release — e.g. the `EventDedup` replay-guard table; the `ProductCache`
+columns `descriptionFull` (the full plain-text Shopify product description,
+synced and capped at ~12,000 chars), `aiDescription` (merchant-written AI
+context from the admin's Products tab, which overrides the Shopify
+description as copywriting grounding when non-empty) and `nameOverridesJson`
+(merchant-set per-language product names — see
+[§24](#24-manual-product-names-the-em-dash-policy--self-healing-ui-strings));
+and the `MarketSetting` columns `currency` (market base currency synced from
+Shopify Markets) and `previewFxRate` (admin-set, **preview-only** FX rate —
+see [§23](#23-multi-currency-display--the-markets-health-checks)) — and
 `prisma db push` adds any missing tables/columns without touching existing
 data. (During `npm run dev` the `predev` hook in `shopify.web.toml` does this
-automatically.) After pulling the `ProductCache` change, run a catalog
-**Sync** from the dashboard once so `descriptionFull` gets populated for
-existing products.
+automatically.) After pulling `ProductCache`/`MarketSetting` changes, run a
+catalog **Sync** from the dashboard once so `descriptionFull` and market
+currencies get populated for existing rows.
 
 ## 6. Install on a development store
 
@@ -571,6 +578,15 @@ Work through this on a dev store before go-live:
       buttons/labels are in that language.
 - [ ] **Preview page** (`/app/preview`): generate an advanced preview in 2–3
       languages and verify translated product names and copy in each.
+- [ ] **Multi-currency preview**: set a preview FX rate on a USD market
+      (the Markets page), preview with a country from that market, and
+      verify the offer page shows USD prices (engine thresholds and analytics
+      stay in the shop currency — only the displayed prices convert).
+- [ ] **Manual product name**: set a manual name for a product in one
+      language (Products tab → "Product names by language" → Save names),
+      preview in that language, and confirm the manual name appears both in
+      the AI copy and in the offer payload's product title — then run a
+      catalog Sync and confirm the manual name survives.
 - [ ] Thank-you block renders on the thank-you page, shows a discount code,
       and its CTA opens a cart link with the code applied.
 - [ ] Thank-you block appears for a wallet-paid order (or simulate by only
@@ -681,12 +697,17 @@ Check in this order — the first four cover ~90% of cases:
 - AI copy falls back to English-ish templates when `ANTHROPIC_API_KEY` is
   missing or Claude timed out (the response is cached in the background, so
   the *next* buyer in that language usually gets real copy).
-- Product **names** inside the copy come verbatim from Shopify's Translate &
-  Adapt — the AI never translates names itself. If a name shows untranslated,
-  add the translation in Translate & Adapt, then either edit/save the product
-  (the `products/update` webhook refreshes that product's translated names)
-  or run the dashboard **Sync** (refreshes everything). The admin's Products
-  tab shows per-product translated-name coverage badges.
+- Product **names** inside the copy are never translated by the AI — per
+  language the app uses, in order of precedence: the merchant's **manual
+  name** (Products tab → "Product names by language"; always wins, survives
+  every sync) → the **Translate & Adapt** translation → the base title. If a
+  name shows untranslated, either set a manual name in the Products tab
+  (instant), or add the translation in Translate & Adapt and then edit/save
+  the product (the `products/update` webhook refreshes that product's
+  translated names) or run the dashboard **Sync** (refreshes everything).
+  The admin's Products tab shows per-product name-coverage badges
+  (`x/y names covered` = manual name OR synced translation OR the default
+  language).
 
 ### Webhooks not arriving
 
@@ -840,3 +861,111 @@ handled explicitly in `claudeComplete`:
 Also unchanged but worth restating: **no sampling parameters** —
 `temperature`, `top_p` and `top_k` are never sent (newer Claude models reject
 them with a 400); style is steered entirely through the prompts.
+
+## 23. Multi-currency display & the Markets health checks
+
+The store sells in ~80 markets, many with their own currency. The design rule
+is simple and worth internalizing before touching any money code:
+
+**All engine math stays in the SHOP currency; presentment currency is
+display-only.**
+
+- **Shop currency (engine):** rule `minTotal`/`maxTotal` thresholds, discount
+  tiers, catalog prices in `ProductCache.variantsJson`, GP math, changesets,
+  and every analytics number are shop-currency amounts. `/api/offer` builds
+  `PurchaseContext.totalAmount`/`currency` from the order's **shopMoney** for
+  exactly this reason — comparing a ¥12,000 presentment total against a €120
+  tier would be meaningless.
+- **Presentment currency (display):** `PurchaseContext` additionally carries
+  `presentmentCurrency` and `presentmentRate` (`app/types.ts`). For a live
+  buyer these come from the order itself: the presentment currency from
+  `presentmentMoney`, and the rate as the **implied order rate** —
+  `presentmentTotal / shopTotal` from the buyer's own order totals. That is
+  Shopify's own conversion for that exact order (rounding included), not a
+  rate we look up anywhere. The orchestrator uses the pair only to convert
+  the prices shown on the offer page; discounts are percentages, so they are
+  currency-agnostic by construction. When the fields are absent, display
+  falls back to shop currency. (The post-purchase extension additionally
+  calls `calculateChangeset` client-side, which returns exact
+  Shopify-computed presentment totals for the accept flow.)
+- **Preview simulation:** the admin Preview has no real order to imply a rate
+  from, so `MarketSetting.previewFxRate` fills that role — an admin-set rate
+  used **only** to simulate the market on the Preview page
+  (`presentmentCurrency` = the market's `currency`, `presentmentRate` =
+  `previewFxRate`). It is never read on any live-buyer path; a wrong or stale
+  preview rate can only make a preview look wrong, never charge a buyer
+  wrongly.
+
+**The Markets health checks** (the Markets page) surface, per market row,
+whatever would make offers or previews misbehave there — most relevantly for
+currency: a market with no synced `currency` (run **Re-sync**; the field is
+populated by `syncMarketsAndLocales` from the Shopify Markets API), and a
+market whose currency differs from the shop currency but has no
+`previewFxRate` (its previews render in shop currency until one is set —
+live buyers are unaffected either way, since their conversion comes from
+their own order). Re-sync updates names/countries/currencies and adds new
+markets, but never overwrites admin-set overrides, including the preview FX
+rate.
+
+## 24. Manual product names, the em-dash policy & self-healing UI strings
+
+### Manual per-language product names
+
+Buyer-facing product names are resolved per language with a strict
+precedence, everywhere a name appears (AI prompt briefs, rendered copy, offer
+payload titles, thank-you offers, previews):
+
+1. **Manual override** — `ProductCache.nameOverridesJson`
+   (`{ [lang]: name }`), edited in the Products tab's "Product names by
+   language" grid (`intent=saveNames`; values trimmed, capped at 300 chars,
+   empty = remove). Manual names always win over Translate & Adapt and
+   survive every sync — `syncCatalog` and the `products/*` webhooks never
+   touch the column (like `aiDescription`, it is merchant-owned).
+2. **Translate & Adapt translation** — `ProductCache.translationsJson`,
+   synced from Shopify.
+3. **Base title** — `ProductCache.title`.
+
+The Products tab badge counts a language as covered when any of the three
+applies (override, synced translation, or the default language via the base
+title). The AI is instructed to use the given names verbatim — the precedence
+decides what it is given, never how it may restyle them.
+
+### The em-dash policy
+
+Buyer-facing text must not contain em dashes (`—`): the long dash is a
+well-known tell of machine-written copy and off-register for the brand. The
+policy is enforced in two layers, so neither can silently regress:
+
+- **Prompt rule** — the default prompts (and the translation prompts)
+  instruct the model to never use em dashes. Keep the rule in any prompt
+  rewrite.
+- **Sanitizer** — `ai.server.ts` rewrites any em dash that slips through in
+  generated copy and in auto-translated UI strings before the text is cached
+  or served, so even a merchant-edited prompt that drops the rule cannot leak
+  one to a buyer.
+
+`DEFAULT_UI_STRINGS_EN` (`app/types.ts`) is itself em-dash-free — the
+compiled defaults use commas instead (e.g. "Ships with your order, no extra
+shipping"). Admin-facing text and these docs are not covered by the policy.
+
+### Self-healing UI-string translations
+
+Historically, a new key added to `DEFAULT_UI_STRINGS_EN` in an app update was
+only seeded at install time (`ensureUiStrings` during bootstrap), so existing
+shops kept English fallbacks until a reinstall. This is now self-healing: the
+dashboard loader fires `ensureUiStringsFresh(shop)` (from
+`app/services/ai.server.ts`) as a fire-and-forget background task on every
+dashboard visit. It:
+
+- seeds any **new keys** into the `en` rows and auto-translates the missing
+  keys for every other enabled language;
+- **normalizes old defaults**: rows whose value still equals a previous
+  compiled default (e.g. the pre-policy em-dash variants) are updated to the
+  current default and re-translated — values the merchant edited are never
+  overwritten;
+- is cheap when there is nothing to do, never blocks the dashboard response,
+  and never throws (failures are logged with the `[dashboard]`/`[ai]`
+  prefixes).
+
+Merchants can still review or override every string on the Translations page
+— the self-healing pass respects those edits.

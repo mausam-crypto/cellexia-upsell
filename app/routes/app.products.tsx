@@ -1,10 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Products — the AI copywriter's product knowledge, per product.
 //
-// Shows the cached catalog with translation coverage and Shopify description
-// presence, and lets the merchant write an "AI context" per product that
-// overrides the Shopify description as copywriting grounding. Translated
-// product names come from Shopify's Translate & Adapt app via the catalog sync.
+// Shows the cached catalog with name coverage and Shopify description
+// presence, and lets the merchant (a) write an "AI context" per product that
+// overrides the Shopify description as copywriting grounding, and (b) set
+// manual per-language product names (ProductCache.nameOverridesJson). Name
+// precedence everywhere buyers see a name: manual override > Translate &
+// Adapt synced translation > base title. Manual names always win over
+// Translate & Adapt and survive every sync.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { useEffect, useState } from "react";
@@ -25,6 +28,7 @@ import {
   Collapsible,
   Divider,
   EmptyState,
+  InlineGrid,
   InlineStack,
   Layout,
   Page,
@@ -37,15 +41,28 @@ import { ImageIcon } from "@shopify/polaris-icons";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
-import { jparse } from "../lib/json";
+import { jparse, jstr } from "../lib/json";
 import { getSettings } from "../services/settings.server";
 import { syncCatalog, syncMarketsAndLocales } from "../services/catalog.server";
+import { LANGUAGE_LABELS } from "../types";
 import type { AdminGraphql } from "../types";
 
 const PAGE_SIZE = 20;
 // Fed to the AI copywriter in full (the prompt-side cap matches) — give the
 // merchant room for genuinely detailed product knowledge.
 const AI_DESCRIPTION_MAX = 20_000;
+// Manual per-language product names are buyer-facing titles — keep them short.
+const NAME_OVERRIDE_MAX = 300;
+
+/** nameOverridesJson, sanitized: only non-empty string values survive. */
+function parseNameOverrides(raw: string): Record<string, string> {
+  const parsed = jparse<Record<string, unknown>>(raw, {});
+  const out: Record<string, string> = {};
+  for (const [lang, value] of Object.entries(parsed)) {
+    if (typeof value === "string" && value.trim()) out[lang] = value;
+  }
+  return out;
+}
 
 // ── Loader ──────────────────────────────────────────────────────────────────
 
@@ -57,8 +74,15 @@ interface ProductRowData {
   /** Length of the plain-text Shopify description (full, else short excerpt). */
   descriptionLength: number;
   aiDescription: string;
-  /** Languages with a name for this product (default language counts via the base title). */
-  translatedCount: number;
+  /**
+   * Languages covered by a name: manual override OR synced Translate & Adapt
+   * translation OR the default language (covered by the base title).
+   */
+  coveredCount: number;
+  /** Manual per-language name overrides ({ [lang]: name }). */
+  nameOverrides: Record<string, string>;
+  /** Synced Translate & Adapt titles ({ [lang]: title }). */
+  translatedTitles: Record<string, string>;
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -88,16 +112,31 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     take: PAGE_SIZE,
   });
 
-  const languages = settings.languages;
+  // Enabled languages, default language first — the order of the names grid.
+  const languages = [
+    ...settings.languages.filter((lang) => lang === settings.defaultLanguage),
+    ...settings.languages.filter((lang) => lang !== settings.defaultLanguage),
+  ];
   const products: ProductRowData[] = rows.map((row) => {
     const translations = jparse<Record<string, { title?: string }>>(
       row.translationsJson,
       {},
     );
-    const translatedCount = languages.filter(
+    const nameOverrides = parseNameOverrides(row.nameOverridesJson);
+    const translatedTitles: Record<string, string> = {};
+    for (const lang of languages) {
+      const title = translations[lang]?.title;
+      if (typeof title === "string" && title.trim()) {
+        translatedTitles[lang] = title;
+      }
+    }
+    // Coverage: manual override OR synced translation OR default language
+    // (the base title covers the default language by definition).
+    const coveredCount = languages.filter(
       (lang) =>
-        lang === settings.defaultLanguage ||
-        Boolean(translations[lang]?.title),
+        Boolean(nameOverrides[lang]) ||
+        Boolean(translatedTitles[lang]) ||
+        lang === settings.defaultLanguage,
     ).length;
     return {
       productId: row.productId,
@@ -106,7 +145,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       imageUrl: row.imageUrl,
       descriptionLength: (row.descriptionFull || row.descriptionShort).length,
       aiDescription: row.aiDescription,
-      translatedCount,
+      coveredCount,
+      nameOverrides,
+      translatedTitles,
     };
   });
 
@@ -116,12 +157,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     page,
     totalPages,
     q,
-    languageCount: languages.length,
+    languages,
+    defaultLanguage: settings.defaultLanguage,
     catalogSynced: Boolean(shopRow?.catalogSyncedAt),
   });
 };
 
-// ── Action (sync / saveAi intents) ──────────────────────────────────────────
+// ── Action (sync / saveAi / saveNames intents) ──────────────────────────────
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session, admin } = await authenticate.admin(request);
@@ -182,6 +224,58 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  if (intent === "saveNames") {
+    const productId = String(formData.get("productId") ?? "");
+    if (!productId) {
+      return json({ ok: false, message: "Missing product id." }, { status: 400 });
+    }
+    // Submitted names, restricted to the enabled languages — never trust the
+    // client with arbitrary keys.
+    const submitted = jparse<Record<string, unknown>>(
+      String(formData.get("namesJson") ?? "{}"),
+      {},
+    );
+    try {
+      const settings = await getSettings(shop);
+      const enabled = new Set(settings.languages);
+      const row = await prisma.productCache.findUnique({
+        where: { shop_productId: { shop, productId } },
+      });
+      if (!row) {
+        return json({
+          ok: false,
+          message: "Product not found in the catalog cache — run a sync first.",
+        });
+      }
+      // Start from what is stored (preserves overrides for languages the
+      // merchant has since disabled), then apply the submitted values:
+      // trimmed, capped at NAME_OVERRIDE_MAX; empty = remove the override.
+      const merged = parseNameOverrides(row.nameOverridesJson);
+      for (const [lang, value] of Object.entries(submitted)) {
+        if (!enabled.has(lang)) continue;
+        const text =
+          typeof value === "string"
+            ? value.trim().slice(0, NAME_OVERRIDE_MAX).trim()
+            : "";
+        if (text) merged[lang] = text;
+        else delete merged[lang];
+      }
+      await prisma.productCache.update({
+        where: { shop_productId: { shop, productId } },
+        data: { nameOverridesJson: jstr(merged) },
+      });
+      return json({
+        ok: true,
+        message: Object.keys(merged).length
+          ? "Names saved. Manual names always win over Translate & Adapt."
+          : "Names cleared — Translate & Adapt translations will be used.",
+      });
+    } catch (error) {
+      console.error("[products] saveNames failed", error);
+      return json({ ok: false, message: "Saving names failed — try again." });
+    }
+  }
+
   return json({ ok: false, message: "Unknown action." }, { status: 400 });
 };
 
@@ -189,22 +283,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 function ProductRow({
   product,
-  languageCount,
+  languages,
+  defaultLanguage,
 }: {
   product: ProductRowData;
-  languageCount: number;
+  languages: string[];
+  defaultLanguage: string;
 }) {
   const shopify = useAppBridge();
   const fetcher = useFetcher<typeof action>();
+  const namesFetcher = useFetcher<typeof action>();
   const [open, setOpen] = useState(false);
   const [text, setText] = useState(product.aiDescription);
+  const [names, setNames] = useState<Record<string, string>>(
+    product.nameOverrides,
+  );
   const saving = fetcher.state !== "idle";
+  const savingNames = namesFetcher.state !== "idle";
 
   useEffect(() => {
     if (fetcher.state === "idle" && fetcher.data) {
       shopify.toast.show(fetcher.data.message, { isError: !fetcher.data.ok });
     }
   }, [fetcher.state, fetcher.data, shopify]);
+
+  useEffect(() => {
+    if (namesFetcher.state === "idle" && namesFetcher.data) {
+      shopify.toast.show(namesFetcher.data.message, {
+        isError: !namesFetcher.data.ok,
+      });
+    }
+  }, [namesFetcher.state, namesFetcher.data, shopify]);
 
   const handleSave = () => {
     fetcher.submit(
@@ -213,7 +322,19 @@ function ProductRow({
     );
   };
 
-  const namesComplete = product.translatedCount >= languageCount;
+  const handleSaveNames = () => {
+    namesFetcher.submit(
+      {
+        intent: "saveNames",
+        productId: product.productId,
+        namesJson: JSON.stringify(names),
+      },
+      { method: "post" },
+    );
+  };
+
+  const languageCount = languages.length;
+  const namesComplete = product.coveredCount >= languageCount;
 
   return (
     <BlockStack gap="200">
@@ -235,7 +356,7 @@ function ProductRow({
                 </Text>
               ) : null}
               <Badge tone={namesComplete ? "success" : "warning"}>
-                {`${product.translatedCount}/${languageCount} names translated`}
+                {`${product.coveredCount}/${languageCount} names covered`}
               </Badge>
               {product.descriptionLength > 0 ? (
                 <Badge>
@@ -255,7 +376,7 @@ function ProductRow({
           disclosure={open ? "up" : "down"}
           onClick={() => setOpen((v) => !v)}
         >
-          {open ? "Hide AI context" : "Edit AI context"}
+          {open ? "Hide details" : "Edit AI context & names"}
         </Button>
       </InlineStack>
       <Collapsible
@@ -264,22 +385,64 @@ function ProductRow({
         transition={{ duration: "150ms", timingFunction: "ease" }}
       >
         <Box paddingBlockStart="100">
-          <BlockStack gap="200">
-            <TextField
-              label="AI context"
-              value={text}
-              onChange={setText}
-              multiline={8}
-              maxLength={AI_DESCRIPTION_MAX}
-              showCharacterCount
-              autoComplete="off"
-              helpText="Used as the AI copywriter's product knowledge. Leave empty to use the product's full Shopify description."
-            />
-            <InlineStack align="end">
-              <Button variant="primary" loading={saving} onClick={handleSave}>
-                Save
-              </Button>
-            </InlineStack>
+          <BlockStack gap="400">
+            <BlockStack gap="200">
+              <TextField
+                label="AI context"
+                value={text}
+                onChange={setText}
+                multiline={8}
+                maxLength={AI_DESCRIPTION_MAX}
+                showCharacterCount
+                autoComplete="off"
+                helpText="Used as the AI copywriter's product knowledge. Leave empty to use the product's full Shopify description."
+              />
+              <InlineStack align="end">
+                <Button variant="primary" loading={saving} onClick={handleSave}>
+                  Save
+                </Button>
+              </InlineStack>
+            </BlockStack>
+
+            <Divider />
+
+            <BlockStack gap="200">
+              <Text as="h3" variant="headingSm">
+                Product names by language
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Manual names always win over Translate &amp; Adapt and survive
+                every sync.
+              </Text>
+              <InlineGrid columns={{ xs: 1, sm: 2, md: 3 }} gap="200">
+                {languages.map((lang) => {
+                  const syncedTitle = product.translatedTitles[lang];
+                  const isDefault = lang === defaultLanguage;
+                  const label = `${LANGUAGE_LABELS[lang] ?? lang} (${lang}${
+                    isDefault ? ", default" : ""
+                  })`;
+                  return (
+                    <TextField
+                      key={lang}
+                      label={label}
+                      value={names[lang] ?? ""}
+                      onChange={(value) =>
+                        setNames((prev) => ({ ...prev, [lang]: value }))
+                      }
+                      placeholder={syncedTitle ?? product.title}
+                      maxLength={NAME_OVERRIDE_MAX}
+                      autoComplete="off"
+                      helpText={syncedTitle ? undefined : "(default title)"}
+                    />
+                  );
+                })}
+              </InlineGrid>
+              <InlineStack align="end">
+                <Button loading={savingNames} onClick={handleSaveNames}>
+                  Save names
+                </Button>
+              </InlineStack>
+            </BlockStack>
           </BlockStack>
         </Box>
       </Collapsible>
@@ -346,9 +509,12 @@ export default function ProductsPage() {
                 the product's full Shopify description → its short excerpt.
                 Write an AI context when the Shopify description is thin,
                 off-tone, or missing the selling points you want the copy to
-                lean on. Translated product names come from Shopify's Translate
-                &amp; Adapt app — run "Sync catalog &amp; translations" after
-                editing them there.
+                lean on. Product names shown to buyers follow their own
+                precedence: a manual name you set here → the Translate &amp;
+                Adapt translation (synced from Shopify — run "Sync catalog
+                &amp; translations" after editing there) → the base title.
+                Manual names always win over Translate &amp; Adapt and survive
+                every sync.
               </Text>
             </BlockStack>
           </Card>
@@ -422,7 +588,8 @@ export default function ProductsPage() {
                         {index > 0 ? <Divider /> : null}
                         <ProductRow
                           product={product}
-                          languageCount={data.languageCount}
+                          languages={data.languages}
+                          defaultLanguage={data.defaultLanguage}
                         />
                       </BlockStack>
                     ))}

@@ -42,6 +42,7 @@ import {
 } from "./ai.server";
 import {
   effectiveDescription,
+  effectiveProductName,
   getProductsByIds,
   type CatalogProduct,
 } from "./catalog.server";
@@ -133,24 +134,10 @@ function resolveLanguage(
   return resolveLanguageWithSource(locale, settings, marketLanguageOverride).language;
 }
 
-/** Best-effort translated title lookup from the catalog translations map. */
-function translationTitle(
-  translations: Record<string, { title?: string }> | undefined,
-  language: string,
-): string | undefined {
-  if (!translations) return undefined;
-  const direct = translations[language]?.title;
-  if (direct) return direct;
-  const lower = language.toLowerCase();
-  for (const [key, value] of Object.entries(translations)) {
-    if (key.toLowerCase() === lower && value?.title) return value.title;
-  }
-  const base = lower.split("-")[0];
-  for (const [key, value] of Object.entries(translations)) {
-    if (key.toLowerCase().split("-")[0] === base && value?.title) return value.title;
-  }
-  return undefined;
-}
+// Product NAME resolution lives in catalog.server's effectiveProductName
+// (merchant nameOverrides → Translate & Adapt title → base title, same
+// exact → case-insensitive → base-prefix language chain as before). Only the
+// DESCRIPTION lookup below stays local — descriptions have no override layer.
 
 /** Best-effort translated description lookup from the catalog translations map. */
 function translationDescription(
@@ -256,12 +243,12 @@ function buildBasket(
         ? translationDescription(cached.translations, language)
         : undefined;
     return {
-      // Exact Translate & Adapt name for the buyer's language, so prompts
-      // reference products by the names the customer actually shopped.
+      // Buyer-facing name for the buyer's language (merchant nameOverrides →
+      // Translate & Adapt → base title), so prompts reference products by the
+      // names the customer actually shopped.
       title:
-        (cached ? translationTitle(cached.translations, language) : undefined) ??
-        cached?.title ??
-        line.title ??
+        (cached ? effectiveProductName(cached, language) : undefined) ||
+        line.title ||
         "Item from this order",
       productType: cached?.productType ?? "",
       quantity: line.quantity,
@@ -282,16 +269,53 @@ function metaProduct(p: SelectedOfferProduct) {
   };
 }
 
-function toProductView(p: SelectedOfferProduct, discountPct: number): OfferProductView {
+/** Display-only FX conversion for the buyer-facing product views. */
+interface DisplayFx {
+  currency: string;
+  rate: number;
+}
+
+/**
+ * The display conversion implied by the buyer's own order, when the context
+ * carries one (presentmentRate = presentmentTotal / shopTotal). Engine math,
+ * changesets, discount pct and IssuedOffer meta prices ALL stay shop-currency
+ * — this only converts what the buyer SEES. Null when the context has no
+ * usable rate/currency pair (then views stay shop-currency, always correct).
+ */
+function displayFxFromContext(ctx: PurchaseContext): DisplayFx | null {
+  const rate = ctx.presentmentRate;
+  const currency = ctx.presentmentCurrency;
+  if (
+    typeof rate !== "number" ||
+    !Number.isFinite(rate) ||
+    rate <= 0 ||
+    typeof currency !== "string" ||
+    !currency ||
+    currency === ctx.currency
+  ) {
+    return null;
+  }
+  return { currency, rate };
+}
+
+function toProductView(
+  p: SelectedOfferProduct,
+  discountPct: number,
+  fx?: DisplayFx | null,
+): OfferProductView {
+  // Shop-currency math first (identical to the signed changeset amounts),
+  // then the optional display conversion: multiply by the rate, round to 2dp.
   const discounted = Math.round(p.price * (1 - discountPct / 100) * 100) / 100;
+  const display = (amount: number): string =>
+    (fx ? Math.round(amount * fx.rate * 100) / 100 : amount).toFixed(2);
   return {
     productId: p.productId,
     variantId: p.variantId,
     title: p.translatedTitle ?? p.title,
     image: p.image,
-    price: p.price.toFixed(2),
-    discountedPrice: discounted.toFixed(2),
-    compareAtPrice: p.compareAtPrice != null ? p.compareAtPrice.toFixed(2) : null,
+    price: display(p.price),
+    discountedPrice: display(discounted),
+    compareAtPrice: p.compareAtPrice != null ? display(p.compareAtPrice) : null,
   };
 }
 
@@ -407,15 +431,19 @@ async function buildOfferPage(args: {
     options,
   } = args;
 
-  // Attach translated titles and drop any product whose variant id cannot be
-  // converted to the numeric changeset format (it could never be signed).
+  // Attach buyer-facing names (merchant overrides → T&A → base title) and
+  // drop any product whose variant id cannot be converted to the numeric
+  // changeset format (it could never be signed).
   const products: SelectedOfferProduct[] = offer.products
-    .map((p) => ({
-      ...p,
-      translatedTitle:
-        translationTitle(catalogById.get(p.productId)?.translations, language) ??
-        p.translatedTitle,
-    }))
+    .map((p) => {
+      const cached = catalogById.get(p.productId);
+      return {
+        ...p,
+        translatedTitle:
+          (cached ? effectiveProductName(cached, language) : undefined) ||
+          p.translatedTitle,
+      };
+    })
     .filter((p) => Number.isFinite(gidToNumber(p.variantId)));
   if (products.length === 0) return null;
 
@@ -545,11 +573,15 @@ async function buildOfferPage(args: {
   });
 
   const offerId = crypto.randomUUID();
+  // Display-only conversion for the buyer-facing views. The page (with its
+  // converted prices) is persisted in the meta below, so stored-page reuse
+  // displays identically without re-deriving the rate.
+  const fx = displayFxFromContext(ctx);
   const page: OfferPage = {
     offerId,
     ruleId: offer.ruleId,
     candidateIds: offer.candidateIds,
-    products: products.map((p) => toProductView(p, discountPct)),
+    products: products.map((p) => toProductView(p, discountPct, fx)),
     discountPct,
     discountTitle,
     copy,
@@ -574,6 +606,11 @@ async function buildOfferPage(args: {
       surface: ctx.surface,
       position: offer.position,
       currency: ctx.currency,
+      // Display conversion actually APPLIED to the stored page views (null =
+      // views are shop-currency). Meta product prices above stay shop-currency
+      // — these two fields exist for reuse fidelity and diagnostics.
+      presentmentCurrency: fx?.currency ?? null,
+      presentmentRate: fx?.rate ?? null,
       displayMode: selection.displayMode,
       // Complete buyer-facing view — lets a Shop Pay re-fetch for the same
       // referenceId return the SAME pages instead of re-running the bandit.
@@ -626,6 +663,7 @@ async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferRespo
     const pages: OfferPage[] = [];
     let language = "en";
     let displayMode: DisplayMode | null = null;
+    let presentmentCurrency: string | null = null;
     for (const row of rows) {
       const meta = jparse<any>(row.offerMetaJson, null);
       if (!meta || meta.surface !== "post_purchase") continue;
@@ -643,6 +681,12 @@ async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferRespo
       if (meta.displayMode === "sequential" || meta.displayMode === "bundle") {
         displayMode = meta.displayMode;
       }
+      // Present only when a display conversion was applied to the stored page
+      // views at issue time — the reused response must be labeled with the
+      // SAME currency those stored prices are denominated in.
+      if (typeof meta.presentmentCurrency === "string" && meta.presentmentCurrency) {
+        presentmentCurrency = meta.presentmentCurrency;
+      }
     }
     if (pages.length === 0) return null;
     pages.sort((a, b) => a.position - b.position);
@@ -657,7 +701,9 @@ async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferRespo
     return {
       offers: pages,
       displayMode: displayMode ?? settings?.defaultDisplayMode ?? "sequential",
-      currency: ctx.currency,
+      // Stored views keep the prices they were issued with — label them with
+      // the stored display currency, never the (possibly different) live one.
+      currency: presentmentCurrency ?? ctx.currency,
       language,
       strings,
       ui: {
@@ -719,10 +765,14 @@ export async function assembleOfferResponse(
     selection?.displayMode ?? settings?.defaultDisplayMode ?? "sequential";
   const copyLength: CopyLength = selection?.copyLength ?? settings?.copyLength ?? "short";
 
+  // Buyer-facing display currency: when the context carries a usable
+  // presentment rate the page views are converted (see toProductView), so the
+  // response currency must be the presentment one. Shop currency otherwise.
+  const fx = displayFxFromContext(ctx);
   const response: OfferResponse = {
     offers: [],
     displayMode,
-    currency: ctx.currency,
+    currency: fx?.currency ?? ctx.currency,
     language,
     strings,
     ui: {
@@ -860,8 +910,16 @@ async function rebuildStoredThankYouOffer(
   const discountPct = Number(meta?.discountPct);
   const discountCode = typeof meta?.discountCode === "string" ? meta.discountCode : "";
   const checkoutUrl = typeof meta?.checkoutUrl === "string" ? meta.checkoutUrl : "";
+  // Display currency of the STORED view: when the offer was minted with a
+  // presentment conversion, the productView prices are already converted —
+  // the rebuilt offer must be labeled with that same currency. Shop currency
+  // (meta.currency) otherwise; rows predating either field use ctx.currency.
   const currency =
-    typeof meta?.currency === "string" && meta.currency ? meta.currency : ctx.currency;
+    typeof meta?.presentmentCurrency === "string" && meta.presentmentCurrency
+      ? meta.presentmentCurrency
+      : typeof meta?.currency === "string" && meta.currency
+        ? meta.currency
+        : ctx.currency;
 
   // Expired discount code: rows minted before `discountEndsAt` existed have
   // no expiry stored and round-trip as before; an unparseable date never
@@ -1051,15 +1109,17 @@ export async function assembleThankYouOffer(
     const catalogById = await loadCatalog(ctx, selection);
     const basket = buildBasket(ctx, catalogById, language);
 
+    const cachedOffer = catalogById.get(product.productId);
     const enriched: SelectedOfferProduct = {
       ...product,
+      // Buyer-facing name: merchant nameOverrides → T&A → base title.
       translatedTitle:
-        translationTitle(catalogById.get(product.productId)?.translations, language) ??
+        (cachedOffer ? effectiveProductName(cachedOffer, language) : undefined) ||
         product.translatedTitle,
     };
 
     // Plain product URL used when no discount code could be created.
-    const handle = catalogById.get(product.productId)?.handle ?? "";
+    const handle = cachedOffer?.handle ?? "";
     const productUrl = handle
       ? `https://${ctx.shop}/products/${handle}`
       : `https://${ctx.shop}/cart/${variantNumericId}:1`;
@@ -1132,7 +1192,10 @@ export async function assembleThankYouOffer(
     const offerId = Number.isFinite(numericRef)
       ? `typ-${numericRef}`
       : crypto.randomUUID();
-    const productView = toProductView(enriched, discountPct);
+    // Display-only conversion for the stored buyer-facing view; the discount
+    // code percentage and all meta prices stay shop-currency.
+    const fx = displayFxFromContext(ctx);
+    const productView = toProductView(enriched, discountPct, fx);
     try {
       await persistIssuedOffer({
         ctx,
@@ -1155,6 +1218,10 @@ export async function assembleThankYouOffer(
           surface: ctx.surface,
           position: 1,
           currency: ctx.currency,
+          // Display conversion actually APPLIED to the stored productView
+          // (null = view is shop-currency) — rebuilds label prices with it.
+          presentmentCurrency: fx?.currency ?? null,
+          presentmentRate: fx?.rate ?? null,
         },
       });
     } catch (error) {
@@ -1195,7 +1262,7 @@ export async function assembleThankYouOffer(
       copy,
       strings,
       language,
-      currency: ctx.currency,
+      currency: fx?.currency ?? ctx.currency,
     };
   } catch (error) {
     console.error(`[orchestrator] assembleThankYouOffer failed for ${ctx.shop}`, error);

@@ -11,6 +11,7 @@
 
 import { useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
+import { DEFAULT_UI_STRINGS_EN } from "../types";
 import type { OfferPage, OfferResponse } from "../types";
 
 export interface PostPurchasePreviewProps {
@@ -20,22 +21,10 @@ export interface PostPurchasePreviewProps {
 
 // Inline English fallbacks — same safety net the extension carries, so a
 // missing UiString row can never blank out a label in the preview either.
-const FALLBACK_STRINGS: Record<string, string> = {
-  offer_badge: "Exclusive one-time offer",
-  offer_x_of_y: "Offer {x} of {y}",
-  time_left: "Offer reserved for",
-  add_to_order: "Add to my order",
-  add_all_to_order: "Add all to my order",
-  decline: "No thanks, complete my order",
-  was: "Was",
-  now: "Now",
-  save_pct: "Save {pct}%",
-  ships_free: "Ships with your order — no extra shipping",
-  one_click_note: "One click — charged to the payment method you just used",
-  discount_applied: "{pct}% off — post-purchase exclusive",
-  why_it_works: "Why it works with your order",
-  research_shows: "What published research shows",
-};
+// Sourced from the canonical contract constant (em-dash-free) so this replica
+// can never drift from the seeded strings; the extension keeps a hand copy
+// only because it cannot import app code.
+const FALLBACK_STRINGS: Record<string, string> = DEFAULT_UI_STRINGS_EN;
 
 // Checkout-like palette (matches the tones the post-purchase UI kit renders).
 const FONT =
@@ -78,17 +67,28 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/** Currency formatting with a plain-text fallback when Intl rejects inputs. */
+/**
+ * Currency formatting with a plain-text fallback when Intl rejects inputs.
+ * Formats with the RESPONSE currency (EUR/USD/CAD/JPY…), so simulated-market
+ * previews render real symbols ($, CA$, €) exactly as Intl localizes them.
+ * The response language is tried first, then plain English — a malformed
+ * locale tag alone must not degrade prices to the bare "12.34 USD" form.
+ * Identical output to the extension's formatMoney for all valid inputs.
+ */
 function formatMoney(amount: unknown, currency: string, locale: string): string {
   const n = toAmount(amount);
-  try {
-    return new Intl.NumberFormat(locale || "en", {
-      style: "currency",
-      currency: currency || "EUR",
-    }).format(n);
-  } catch {
-    return `${n.toFixed(2)} ${currency || ""}`.trim();
+  const code = (currency || "EUR").toUpperCase();
+  for (const loc of [locale || "en", "en"]) {
+    try {
+      return new Intl.NumberFormat(loc, {
+        style: "currency",
+        currency: code,
+      }).format(n);
+    } catch {
+      // invalid locale tag or currency code — try the next candidate
+    }
   }
+  return `${n.toFixed(2)} ${currency || ""}`.trim();
 }
 
 /** Seconds → "mm:ss". */
@@ -248,6 +248,9 @@ export function PostPurchasePreview({ response, device }: PostPurchasePreviewPro
   const showComparePrice = ui.showComparePrice !== false;
   const isBundle = response.displayMode === "bundle" && products.length > 1;
 
+  // price/discountedPrice arrive already in the response DISPLAY currency
+  // (presentment-converted server-side when a market/rate applies), so the
+  // was/now/save row sums payload values as-is — no client-side conversion.
   const originalTotal = round2(
     products.reduce((sum, p) => sum + toAmount(p.price), 0),
   );

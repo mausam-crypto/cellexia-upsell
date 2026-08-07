@@ -206,6 +206,14 @@ export interface PurchaseContext {
   totalAmount: number;
   lineItems: PurchaseLineItem[];
   surface: Surface;
+  /**
+   * Buyer-facing DISPLAY currency (from the order's presentmentMoney or a
+   * simulated market in the preview). Engine math stays in shop currency;
+   * these only convert the prices shown on the page.
+   */
+  presentmentCurrency?: string | null;
+  /** presentmentTotal / shopTotal implied by the buyer's own order. */
+  presentmentRate?: number | null;
 }
 
 // ── Engine output ───────────────────────────────────────────────────────────
@@ -350,16 +358,16 @@ export const DEFAULT_UI_STRINGS_EN: Record<string, string> = {
   was: "Was",
   now: "Now",
   save_pct: "Save {pct}%",
-  ships_free: "Ships with your order — no extra shipping",
-  one_click_note: "One click — charged to the payment method you just used",
+  ships_free: "Ships with your order, no extra shipping",
+  one_click_note: "One click, charged to the payment method you just used",
   processing: "Adding to your order…",
   error_try_again: "Something went wrong. Your original order is not affected.",
-  discount_applied: "{pct}% off — post-purchase exclusive",
+  discount_applied: "{pct}% off, post-purchase exclusive",
   why_it_works: "Why it works with your order",
   research_shows: "What published research shows",
   thank_you_title: "A little something extra",
   thank_you_cta: "Claim this offer",
-  thank_you_code_note: "Code {code} — applied automatically at checkout",
+  thank_you_code_note: "Code {code}, applied automatically at checkout",
 };
 
 export const UI_STRING_KEYS = Object.keys(DEFAULT_UI_STRINGS_EN);

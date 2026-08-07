@@ -58,6 +58,10 @@ function buildPurchaseContext(
     typeof money?.currencyCode === "string" && money.currencyCode
       ? money.currencyCode
       : "EUR";
+  // Buyer-facing DISPLAY conversion implied by this order's own totals —
+  // engine math stays on the shop-currency values above; the orchestrator
+  // only uses these to convert the prices shown on the page.
+  const presentment = derivePresentment(purchase?.totalPriceSet);
 
   const rawLines: any[] = Array.isArray(purchase?.lineItems) ? purchase.lineItems : [];
   const lineItems: PurchaseLineItem[] = [];
@@ -106,7 +110,38 @@ function buildPurchaseContext(
     totalAmount,
     lineItems,
     surface: "post_purchase",
+    presentmentCurrency: presentment.currency,
+    presentmentRate: presentment.rate,
   };
+}
+
+/**
+ * Derives the buyer's display currency and the FX rate implied by the order's
+ * own totals: presentmentMoney.amount / shopMoney.amount, only when BOTH
+ * amounts parse to > 0 and the two currency codes are present and differ.
+ * Same currency (or missing/unparseable amounts) → rate null, so display
+ * falls back to shop-currency prices, which are always correct.
+ */
+function derivePresentment(totalPriceSet: any): {
+  currency: string | null;
+  rate: number | null;
+} {
+  const shopMoney = totalPriceSet?.shopMoney;
+  const presentmentMoney = totalPriceSet?.presentmentMoney;
+  const shopCurrency =
+    typeof shopMoney?.currencyCode === "string" ? shopMoney.currencyCode : "";
+  const presentmentCurrency =
+    typeof presentmentMoney?.currencyCode === "string" ? presentmentMoney.currencyCode : "";
+  if (!shopCurrency || !presentmentCurrency || shopCurrency === presentmentCurrency) {
+    return { currency: null, rate: null };
+  }
+  const shopAmount = toAmount(shopMoney?.amount);
+  const presentmentAmount = toAmount(presentmentMoney?.amount);
+  const rate =
+    shopAmount !== null && presentmentAmount !== null && shopAmount > 0 && presentmentAmount > 0
+      ? presentmentAmount / shopAmount
+      : null;
+  return { currency: presentmentCurrency, rate };
 }
 
 /** "gid://shopify/Customer/123" | 123 | "123" → "123"; empty → null. */
