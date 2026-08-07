@@ -160,6 +160,8 @@ interface PreviewResult {
   latencyMs: number;
   cached: boolean;
   fallbackUsed: boolean;
+  basketTitle: string;
+  offerTitles: string[];
 }
 
 function isPromptKey(key: string): key is PromptKey {
@@ -181,9 +183,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const shop = session.shop;
 
   await ensurePromptTemplates(shop);
-  const [rows, settings] = await Promise.all([
+  const [rows, settings, productRows] = await Promise.all([
     prisma.promptTemplate.findMany({ where: { shop } }),
     getSettings(shop),
+    // Compact list for the preview's basket/offered pickers — merchants choose
+    // realistic pairings instead of getting the first products alphabetically.
+    prisma.productCache.findMany({
+      where: { shop, status: "ACTIVE" },
+      orderBy: { title: "asc" },
+      take: 100,
+      select: { productId: true, title: true },
+    }),
   ]);
 
   const keys: PromptKey[] = ["single", "bundle", "sequential"];
@@ -204,6 +214,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     prompts,
     languages: settings.languages,
     defaultLanguage: settings.defaultLanguage,
+    products: productRows,
   });
 };
 
@@ -270,17 +281,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "preview") {
     const settings = await getSettings(shop);
     const language = String(formData.get("language") ?? settings.defaultLanguage);
+    const basketProductId = String(formData.get("basketProductId") ?? "");
+    const offerProductId = String(formData.get("offerProductId") ?? "");
 
     let products = await prisma.productCache.findMany({
       where: { shop, status: "ACTIVE" },
       orderBy: { title: "asc" },
-      take: 3,
+      take: 100,
     });
     if (products.length === 0) {
       products = await prisma.productCache.findMany({
         where: { shop },
         orderBy: { title: "asc" },
-        take: 3,
+        take: 100,
       });
     }
     if (products.length === 0) {
@@ -289,21 +302,60 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         "No products in the catalog cache yet — run a sync from the dashboard first.",
       );
     }
-
-    // A bundle preview must offer MULTIPLE products — previewing the bundle
-    // template with a single offered product forces the model to invent set
-    // members to satisfy the "one bullet per offered product" contract.
-    if (key === "bundle" && products.length < 3) {
+    if (products.length < 2) {
       return respond(
         false,
-        "The bundle preview needs at least 3 products in the catalog (1 basket + 2 offered) — run a sync from the dashboard first.",
+        "The preview needs at least 2 products in the catalog (1 basket + 1 offered) — run a sync from the dashboard first.",
       );
     }
-    const basketRows = key === "bundle" ? products.slice(0, 1) : products.slice(0, 2);
-    const offerRows =
-      key === "bundle"
-        ? products.slice(1, 3)
-        : [products.length > 2 ? products[2] : products[products.length - 1]];
+
+    // Resolve the merchant's picks; fall back to the first products of the
+    // (title-ordered) list so older clients without the pickers still work.
+    const basketRow =
+      products.find((p) => p.productId === basketProductId) ?? products[0];
+    const offerRow =
+      products.find((p) => p.productId === offerProductId) ??
+      products.find((p) => p.productId !== basketRow.productId);
+    if (!offerRow) {
+      return respond(
+        false,
+        "The preview needs at least 2 different products in the catalog — run a sync from the dashboard first.",
+      );
+    }
+    if (offerRow.productId === basketRow.productId) {
+      return respond(
+        false,
+        "Basket and offered product must be different — pick another offered product.",
+      );
+    }
+
+    const basketRows = [basketRow];
+    const offerRows = [offerRow];
+    // A bundle preview must offer MULTIPLE products — previewing the bundle
+    // template with a single offered product forces the model to invent set
+    // members to satisfy the "one bullet per offered product" contract. Add
+    // the next different product (title order, wrapping around) as the
+    // second offered item.
+    if (key === "bundle") {
+      const offerIndex = products.findIndex(
+        (p) => p.productId === offerRow.productId,
+      );
+      const secondOffer = [
+        ...products.slice(offerIndex + 1),
+        ...products.slice(0, Math.max(offerIndex, 0)),
+      ].find(
+        (p) =>
+          p.productId !== basketRow.productId &&
+          p.productId !== offerRow.productId,
+      );
+      if (!secondOffer) {
+        return respond(
+          false,
+          "The bundle preview needs at least 3 products in the catalog (1 basket + 2 offered) — run a sync from the dashboard first.",
+        );
+      }
+      offerRows.push(secondOffer);
+    }
 
     const toOfferProduct = (row: (typeof products)[number]): SelectedOfferProduct | null => {
       const variants = jparse<PreviewVariant[]>(row.variantsJson, []);
@@ -335,6 +387,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return respond(
         false,
         "The sample product has no variants — re-run the catalog sync.",
+      );
+    }
+    if (key === "bundle" && offerProducts.length < 2) {
+      return respond(
+        false,
+        "The bundle preview needs 2 offered products with variants — one of the sample products has none. Re-run the catalog sync.",
       );
     }
 
@@ -376,6 +434,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         latencyMs,
         cached: result.cached,
         fallbackUsed: result.fallbackUsed,
+        basketTitle: basketRow.title,
+        // Titles of what was actually sent to the model (post variant filter).
+        offerTitles: offerProducts.map((p) => p.title),
       });
     } catch (error) {
       console.error("[prompts] preview generation failed", error);
@@ -529,11 +590,29 @@ export default function PromptsPage() {
     data.defaultLanguage || data.languages[0] || "en",
   );
   const [previewMode, setPreviewMode] = useState<string>("single");
+  const [previewBasketId, setPreviewBasketId] = useState(
+    data.products[0]?.productId ?? "",
+  );
+  // Never default the offered picker to the basket product — with a single
+  // cached product the button is disabled with an explicit message instead of
+  // dead-ending on the same-product error.
+  const [previewOfferId, setPreviewOfferId] = useState(
+    data.products[1]?.productId ?? "",
+  );
 
   const languageOptions = data.languages.map((code) => ({
     label: LANGUAGE_LABELS[code] ?? code,
     value: code,
   }));
+
+  const productOptions = data.products.map((product) => ({
+    label: product.title,
+    value: product.productId,
+  }));
+
+  const sameProductSelected =
+    previewBasketId !== "" && previewBasketId === previewOfferId;
+  const tooFewProducts = data.products.length < 2;
 
   const handleSave = (key: string, fields: PromptFields) => {
     const fd = new FormData();
@@ -558,6 +637,8 @@ export default function PromptsPage() {
     fd.set("intent", "preview");
     fd.set("key", previewMode);
     fd.set("language", previewLanguage);
+    fd.set("basketProductId", previewBasketId);
+    fd.set("offerProductId", previewOfferId);
     submit(fd, { method: "post" });
   };
 
@@ -590,14 +671,41 @@ export default function PromptsPage() {
                   Preview
                 </Text>
                 <Text as="p" variant="bodyMd" tone="subdued">
-                  Generates live copy with the saved prompts, using the first
-                  products of your catalog cache as a sample basket. The copy
-                  cache is bypassed, so this always makes a fresh call. Save
-                  your edits above before previewing them. For a pixel-faithful
-                  preview of the full widget with layout, use Preview in the
-                  navigation.
+                  Generates live copy with the saved prompts, using the basket
+                  and offered product you pick below. The copy cache is
+                  bypassed, so this always makes a fresh call. Save your edits
+                  above before previewing them. For a pixel-faithful preview of
+                  the full widget with layout, use Preview in the navigation.
                 </Text>
                 <InlineStack gap="400" wrap blockAlign="end">
+                  <Box minWidth="220px">
+                    <Select
+                      label="Basket product"
+                      options={productOptions}
+                      value={previewBasketId}
+                      onChange={setPreviewBasketId}
+                      disabled={productOptions.length === 0}
+                    />
+                  </Box>
+                  <Box minWidth="220px">
+                    <Select
+                      label="Offered product"
+                      options={productOptions}
+                      value={previewOfferId}
+                      onChange={setPreviewOfferId}
+                      disabled={productOptions.length === 0}
+                      error={
+                        sameProductSelected
+                          ? "Must differ from the basket product"
+                          : undefined
+                      }
+                      helpText={
+                        previewMode === "bundle"
+                          ? "The bundle preview adds the next different product as a second offered item."
+                          : undefined
+                      }
+                    />
+                  </Box>
                   <Box minWidth="220px">
                     <Select
                       label="Language"
@@ -622,10 +730,18 @@ export default function PromptsPage() {
                     variant="primary"
                     onClick={handlePreview}
                     loading={submittingIntent === "preview"}
+                    disabled={sameProductSelected || tooFewProducts}
                   >
                     Generate preview
                   </Button>
                 </InlineStack>
+
+                {tooFewProducts ? (
+                  <Text as="p" variant="bodySm" tone="critical">
+                    The preview needs at least 2 cached products — run a sync
+                    first.
+                  </Text>
+                ) : null}
 
                 {preview && (
                   <>
@@ -641,6 +757,9 @@ export default function PromptsPage() {
                         </Badge>
                         {preview.cached ? <Badge tone="info">Cached</Badge> : null}
                       </InlineStack>
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        {`Basket: ${preview.basketTitle} → Offered: ${preview.offerTitles.join(" + ")}`}
+                      </Text>
                       {preview.fallbackUsed && (
                         <Banner tone="warning" title="Fallback copy was used">
                           <p>

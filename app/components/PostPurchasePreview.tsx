@@ -228,7 +228,9 @@ export function PostPurchasePreview({ response, device }: PostPurchasePreviewPro
   const ui = response.ui;
   const currency = response.currency || "EUR";
   const locale = response.language || "en";
-  const dir = locale.toLowerCase().startsWith("ar") ? "rtl" : "ltr";
+  // No dir/RTL handling on purpose: the shipped extension has none, and the
+  // replica must match it — RTL parity is deferred until the extension itself
+  // implements it.
 
   const totalPages = offers.length;
   const pageNumber = safeIndex + 1;
@@ -331,7 +333,8 @@ export function PostPurchasePreview({ response, device }: PostPurchasePreviewPro
     </p>
   ) : null;
 
-  const acceptLabel = `${t(strings, isBundle ? "add_all_to_order" : "add_to_order")} — ${formatMoney(nowTotal, currency, locale)}`;
+  // The real extension button renders only the string — no price suffix.
+  const acceptLabel = t(strings, isBundle ? "add_all_to_order" : "add_to_order");
   const actionButtons = (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       <button
@@ -378,18 +381,17 @@ export function PostPurchasePreview({ response, device }: PostPurchasePreviewPro
         style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 20 }}
       >
         <SeparatorLine />
-        {paragraphs.length > 0 ? (
-          <>
-            <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: COLOR_TEXT }}>
-              {t(strings, "why_it_works")}
-            </p>
-            {paragraphs.map((paragraph, i) => (
-              <p key={i} style={{ margin: 0, fontSize: 13, color: COLOR_TEXT }}>
-                {paragraph}
-              </p>
-            ))}
-          </>
-        ) : null}
+        {/* Heading renders unconditionally inside this section, matching the
+            extension — it gives the research block context even when there
+            are no paragraphs. */}
+        <p style={{ margin: 0, fontSize: 14, fontWeight: 600, color: COLOR_TEXT }}>
+          {t(strings, "why_it_works")}
+        </p>
+        {paragraphs.map((paragraph, i) => (
+          <p key={i} style={{ margin: 0, fontSize: 13, color: COLOR_TEXT }}>
+            {paragraph}
+          </p>
+        ))}
         {proof.length > 0 ? (
           <>
             <p
@@ -567,7 +569,6 @@ export function PostPurchasePreview({ response, device }: PostPurchasePreviewPro
 
   const card = (
     <div
-      dir={dir}
       style={{
         background: "#ffffff",
         border: `1px solid ${COLOR_BORDER}`,

@@ -614,14 +614,51 @@ export async function syncCatalog(
  * stored plain-text and capped at TRANSLATED_DESCRIPTION_MAX chars) and MERGES
  * them into each ProductCache row's translationsJson: only locales fully
  * fetched this run are overlaid, so a failed per-locale fetch never wipes
- * prior entries. Scope with opts.productIds to refresh specific products
+ * prior entries. Entries for the current default language and for locales no
+ * longer in settings.languages are pruned during the merge (case-insensitive),
+ * so the default language always resolves to the live ProductCache
+ * title/description. Scope with opts.productIds to refresh specific products
  * (webhook freshness) or omit to cover the whole catalog; opts.locales
  * defaults to every settings language beyond the default (the default
  * language is always excluded — it has no translations). Page/chunk sizes
  * stay small so each query is far under the cost cap. Best-effort per locale
  * and per row after the initial settings read.
+ *
+ * Concurrent calls for the same shop are serialized (per-shop promise chain):
+ * overlapping runs — e.g. a languages-save background run racing a
+ * dashboard-triggered catalog sync — would interleave their read-merge-write
+ * cycles on translationsJson and lose locales. Each caller still observes its
+ * own run's outcome; a failed run never poisons the chain for later callers.
  */
-export async function syncProductTranslations(
+export function syncProductTranslations(
+  graphql: AdminGraphql,
+  shop: string,
+  opts?: { productIds?: string[]; locales?: string[] },
+): Promise<void> {
+  const prev = translationSyncChains.get(shop) ?? Promise.resolve();
+  // Run strictly after the previous call for this shop, whether it fulfilled
+  // or rejected.
+  const run = prev
+    .catch(() => undefined)
+    .then(() => syncProductTranslationsInner(graphql, shop, opts));
+  // Store a rejection-swallowed tail (so an un-awaited failure never breaks
+  // the chain or surfaces as an unhandled rejection) and drop the map entry
+  // once the chain drains, so idle shops don't accumulate entries.
+  const tail: Promise<void> = run
+    .catch(() => undefined)
+    .finally(() => {
+      if (translationSyncChains.get(shop) === tail) {
+        translationSyncChains.delete(shop);
+      }
+    });
+  translationSyncChains.set(shop, tail);
+  return run;
+}
+
+/** Per-shop tail of the last queued translations sync — see the mutex above. */
+const translationSyncChains = new Map<string, Promise<void>>();
+
+async function syncProductTranslationsInner(
   graphql: AdminGraphql,
   shop: string,
   opts?: { productIds?: string[]; locales?: string[] },
@@ -723,6 +760,10 @@ export async function syncProductTranslations(
     console.error(`[catalog] failed to load rows for translations merge on ${shop}`, error);
     return;
   }
+  const defaultLocaleLc = String(settings.defaultLanguage ?? "").toLowerCase();
+  const enabledLocalesLc = new Set(
+    (settings.languages ?? []).map((l) => String(l).toLowerCase()),
+  );
   for (const row of rows) {
     const merged: Record<string, ProductTranslationEntry> = {
       ...jparse<Record<string, ProductTranslationEntry>>(row.translationsJson, {}),
@@ -732,6 +773,13 @@ export async function syncProductTranslations(
       const entry = fetched[locale];
       if (entry) merged[locale] = entry;
       else delete merged[locale];
+    }
+    // Prune stale entries: the default language must always resolve to the
+    // live ProductCache title/description (renames, primary-locale changes),
+    // and disabled languages must not linger.
+    for (const key of Object.keys(merged)) {
+      const lc = key.toLowerCase();
+      if (lc === defaultLocaleLc || !enabledLocalesLc.has(lc)) delete merged[key];
     }
     const next = jstr(merged);
     if (next === row.translationsJson) continue;
@@ -835,16 +883,20 @@ async function fetchMarkets(
 }
 
 /**
- * Syncs shop locales into settings.languages/defaultLanguage (published only,
- * original order, primary first) and Shopify Markets into MarketSetting rows.
- * Best-effort: every GraphQL call is guarded, and re-syncs never overwrite
- * admin-set overrides (enabled/discount/language/maxOffers) on existing rows.
+ * Syncs shop locales into settings — additively: published locales not yet in
+ * settings.knownShopifyLocales are appended to settings.languages (existing
+ * order kept, primary-first for new ones), so languages the merchant disabled
+ * in the app are never re-added by later syncs. defaultLanguage is kept when
+ * still enabled, else reset to the Shopify primary. Shopify Markets sync into
+ * MarketSetting rows. Best-effort: every GraphQL call is guarded, and re-syncs
+ * never overwrite admin-set overrides (enabled/discount/language/maxOffers) on
+ * existing rows.
  */
 export async function syncMarketsAndLocales(
   graphql: AdminGraphql,
   shop: string,
 ): Promise<void> {
-  // Locales → settings.languages / defaultLanguage.
+  // Locales → settings.languages / defaultLanguage / knownShopifyLocales.
   try {
     const json = await gqlJson(graphql, SHOP_LOCALES_QUERY);
     const locales: any[] = Array.isArray(json?.data?.shopLocales) ? json.data.shopLocales : [];
@@ -852,14 +904,26 @@ export async function syncMarketsAndLocales(
       (l) => l?.published === true && typeof l?.locale === "string" && l.locale.length > 0,
     );
     const primary = published.find((l) => l?.primary === true);
-    const languages: string[] = [
+    const publishedLocales: string[] = [
       ...(primary ? [String(primary.locale)] : []),
       ...published.filter((l) => l?.primary !== true).map((l) => String(l.locale)),
     ];
-    if (languages.length > 0) {
+    if (publishedLocales.length > 0) {
+      const settings = await getSettings(shop);
+      const known = new Set(settings.knownShopifyLocales ?? []);
+      const newLocales = publishedLocales.filter((l) => !known.has(l));
+      const nextLanguages = [
+        ...settings.languages,
+        ...newLocales.filter((l) => !settings.languages.includes(l)),
+      ];
       await saveSettings(shop, {
-        languages,
-        defaultLanguage: primary ? String(primary.locale) : languages[0],
+        languages: nextLanguages,
+        defaultLanguage: nextLanguages.includes(settings.defaultLanguage)
+          ? settings.defaultLanguage
+          : primary
+            ? String(primary.locale)
+            : publishedLocales[0],
+        knownShopifyLocales: publishedLocales,
       });
     }
   } catch (error) {

@@ -101,8 +101,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (intent === "sync") {
     try {
       const graphql = admin.graphql as unknown as AdminGraphql;
-      const { count } = await syncCatalog(graphql, session.shop);
+      // Markets & locales first: freshly published locales land in
+      // settings.languages before syncCatalog runs its translation pass, so
+      // the same run covers them.
       await syncMarketsAndLocales(graphql, session.shop);
+      const { count } = await syncCatalog(graphql, session.shop);
       return json({
         ok: true,
         message: `Catalog synced — ${count} products cached. Markets and locales refreshed.`,

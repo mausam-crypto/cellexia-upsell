@@ -13,7 +13,10 @@ import prisma from "../db.server";
 import { toGid } from "../lib/json";
 import { authenticate } from "../shopify.server";
 import type { AdminGraphql } from "../types";
-import { recordOrderFromWebhook } from "../services/analytics.server";
+import {
+  backfillPendingRevenue,
+  recordOrderFromWebhook,
+} from "../services/analytics.server";
 import {
   deleteProductFromWebhook,
   syncProductTranslations,
@@ -50,6 +53,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await safely(`ORDERS_CREATE (${shop})`, () =>
         recordOrderFromWebhook(shop, body),
       );
+      break;
+    }
+
+    case "ORDERS_UPDATED": {
+      // Payment-recovery reconciliation: an accepted upsell whose changeset
+      // charge FAILED was recorded with zero revenue (payment-pending marker
+      // — Shopify runs its own payment recovery on the order). When the order
+      // eventually reaches financial_status "paid", restore the withheld
+      // revenue. ORDERS_UPDATED fires on every order edit, so anything else
+      // is ignored here and backfillPendingRevenue itself exits fast when no
+      // zero-revenue accepted events match this order.
+      await safely(`ORDERS_UPDATED (${shop})`, async () => {
+        if (body.financial_status === "paid") {
+          await backfillPendingRevenue(shop, body);
+        }
+      });
       break;
     }
 

@@ -44,7 +44,12 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { jparse } from "../lib/json";
 import { getSettings } from "../services/settings.server";
-import { assembleOfferResponse } from "../services/offer-orchestrator.server";
+import {
+  assembleOfferResponse,
+  type AssembleOfferOptions,
+  type LanguageSource,
+  type PageCopyDiagnostic,
+} from "../services/offer-orchestrator.server";
 import {
   LANGUAGE_LABELS,
   type OfferResponse,
@@ -157,6 +162,15 @@ interface GenerateResult {
   regenerated: boolean;
   /** Monotonic-enough key so the client can reset the pager per generation. */
   generatedAt: number;
+  /** True per-page copy provenance from the engine (ai/cache/fallback/reused). */
+  diagnostics: PageCopyDiagnostic[];
+  /**
+   * How the orchestrator chose the response language — out-param read back
+   * from AssembleOfferOptions after the call. Null only when the engine
+   * failed before language resolution (it never throws on the public path,
+   * so the preview still renders; the chip is simply hidden).
+   */
+  languageResolution: { language: string; source: LanguageSource } | null;
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -176,10 +190,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   try {
     const settings = await getSettings(shop);
 
+    // Passed through UNCLAMPED as ctx.locale — the orchestrator's
+    // resolveLanguageWithSource genuinely decides, so the market-override and
+    // store-default chips are reachable (e.g. via the "zz" simulate option).
     const requestedLanguage = String(formData.get("language") ?? "");
-    const language = settings.languages.includes(requestedLanguage)
-      ? requestedLanguage
-      : settings.defaultLanguage;
     const countryRaw = String(formData.get("countryCode") ?? "").trim().toUpperCase();
     const countryCode = /^[A-Z]{2}$/.test(countryRaw) ? countryRaw : null;
     const regenerate = String(formData.get("regenerate") ?? "") === "1";
@@ -248,7 +262,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       referenceId,
       customerId: null, // frequency caps never apply to previews
       countryCode,
-      locale: language,
+      locale: requestedLanguage,
       currency: "EUR", // shop currency — catalog prices/tiers are EUR amounts
       totalAmount,
       lineItems,
@@ -256,7 +270,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     };
 
     const started = Date.now();
-    const response = await assembleOfferResponse(ctx);
+    // Admin preview: wait for REAL AI copy (30s) instead of the 3.5s buyer
+    // budget — long-form generation takes ~5-10s cold, so the buyer timeout
+    // would show fallback copy on almost every cold-cache preview. Buyers hit
+    // the strict budget + background cache warming instead; this tool's job
+    // is to show what warmed copy looks like. diagnostics receives the true
+    // per-page provenance (ai / cache / fallback / reused).
+    const diagnostics: PageCopyDiagnostic[] = [];
+    // Named options object (not an inline literal) so the orchestrator's
+    // languageResolution out-param can be read back after the call.
+    const options: AssembleOfferOptions = {
+      copyTimeoutMs: 30_000,
+      diagnostics,
+    };
+    const response = await assembleOfferResponse(ctx, options);
     const latencyMs = Date.now() - started;
 
     // The orchestrator does not expose which prompt template ran — re-derive
@@ -288,6 +315,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       aiEnabled: settings.aiEnabled,
       regenerated: regenerate,
       generatedAt: Date.now(),
+      diagnostics,
+      languageResolution: options.languageResolution ?? null,
     };
     return json({ ok: true as const, message: "", result });
   } catch (error) {
@@ -326,6 +355,25 @@ function countryLabel(code: string): string {
     return code;
   }
 }
+
+/** Badge presentation for each language-resolution source. */
+const LANGUAGE_SOURCE_META: Record<
+  LanguageSource,
+  { label: string; tone: "success" | "warning" | "info" }
+> = {
+  buyer_locale: { label: "Buyer locale", tone: "success" },
+  market_override: { label: "Market override", tone: "warning" },
+  store_default: { label: "Store default", tone: "info" },
+};
+
+/** Tiny-text label per copy source for the per-page provenance strip. */
+const PAGE_SOURCE_LABELS: Record<PageCopyDiagnostic["source"], string> = {
+  ai: "fresh AI",
+  cache: "cached",
+  fallback: "fallback",
+  reused: "reused",
+  no_discount_fallback: "fallback (no discount)",
+};
 
 interface BasketLine {
   productId: string;
@@ -420,17 +468,29 @@ export default function PreviewPage() {
 
   const result = actionData?.ok ? actionData.result : null;
   const errorMessage = actionData && !actionData.ok ? actionData.message : null;
-  // Best-effort inference — the engine does not report fallback per offer.
-  const aiCopyLikely = Boolean(result && result.aiKeySet && result.aiEnabled);
+  // True provenance from the engine, per page.
+  const diags = result?.diagnostics ?? [];
+  const anyFallback = diags.some((d) => d.source === "fallback");
+  const anyNoDiscountFallback = diags.some(
+    (d) => d.source === "no_discount_fallback",
+  );
+  const anyAi = diags.some((d) => d.source === "ai");
+  const anyCache = diags.some((d) => d.source === "cache");
+  const fallbackReason = diags.find((d) => d.source === "fallback")?.reason ?? null;
 
   const countryOptions = data.countries.map((code) => ({
     label: countryLabel(code),
     value: code,
   }));
-  const languageOptions = data.languages.map((code) => ({
-    label: LANGUAGE_LABELS[code] ?? code,
-    value: code,
-  }));
+  const languageOptions = [
+    ...data.languages.map((code) => ({
+      label: LANGUAGE_LABELS[code] ?? code,
+      value: code,
+    })),
+    // Deliberately NOT an enabled store language — submitting it lets the
+    // merchant watch the market-override / store-default fallback path fire.
+    { label: "Unsupported language (simulate fallback)", value: "zz" },
+  ];
 
   return (
     <Page
@@ -620,13 +680,30 @@ export default function PreviewPage() {
                 {result ? (
                   <InlineStack gap="200" blockAlign="center" wrap>
                     <Badge>{`${result.latencyMs} ms`}</Badge>
-                    {aiCopyLikely ? (
-                      <Badge tone="success">AI copy</Badge>
-                    ) : (
-                      <Badge tone="warning">Fallback copy</Badge>
-                    )}
-                    {aiCopyLikely && result.model ? (
+                    {anyAi ? <Badge tone="success">AI copy</Badge> : null}
+                    {anyCache ? <Badge tone="info">Cached AI copy</Badge> : null}
+                    {anyFallback ? <Badge tone="warning">Fallback copy</Badge> : null}
+                    {anyNoDiscountFallback ? (
+                      <Badge tone="warning">Fallback copy (0% discount)</Badge>
+                    ) : null}
+                    {(anyAi || anyCache) && result.model ? (
                       <Badge tone="info">{result.model}</Badge>
+                    ) : null}
+                    {result.languageResolution ? (
+                      <>
+                        <Badge>{`Language: ${result.languageResolution.language}`}</Badge>
+                        <Badge
+                          tone={
+                            LANGUAGE_SOURCE_META[result.languageResolution.source]
+                              .tone
+                          }
+                        >
+                          {
+                            LANGUAGE_SOURCE_META[result.languageResolution.source]
+                              .label
+                          }
+                        </Badge>
+                      </>
                     ) : null}
                     <Badge>
                       {`${result.offerCount} offer${result.offerCount === 1 ? "" : "s"}`}
@@ -635,12 +712,35 @@ export default function PreviewPage() {
                   </InlineStack>
                 ) : null}
               </InlineStack>
-              {result ? (
+              {result && anyFallback ? (
                 <Box paddingBlockStart="200">
                   <Text as="p" variant="bodySm" tone="subdued">
-                    Copy source is inferred from the AI settings — the engine
-                    falls back silently on timeouts, so a slow first run may
-                    still show fallback copy. Regenerate to retry.
+                    {fallbackReason === "no_key"
+                      ? "Fallback cause: ANTHROPIC_API_KEY is not set on the server."
+                      : fallbackReason === "ai_disabled"
+                        ? "Fallback cause: AI copy is disabled in Settings → AI."
+                        : fallbackReason === "timeout_or_error"
+                          ? "Fallback cause: the Claude API call failed or timed out (previews wait up to 30s — check the server logs for the exact error)."
+                          : "Fallback cause: internal error — check the server logs."}
+                  </Text>
+                </Box>
+              ) : null}
+              {result && anyNoDiscountFallback ? (
+                <Box paddingBlockStart="200">
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    Fallback cause: this offer carries a 0% discount, so the AI
+                    call is skipped by design — the prompts mandate mentioning
+                    the discount, which would render as “0% off”. The
+                    deterministic fallback omits discount phrasing entirely.
+                  </Text>
+                </Box>
+              ) : null}
+              {result?.languageResolution?.source === "market_override" ? (
+                <Box paddingBlockStart="200">
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    The selected country’s market has a language override
+                    configured in Settings → Markets — it applied because the
+                    selected language is not an enabled store language.
                   </Text>
                 </Box>
               ) : null}
@@ -659,11 +759,34 @@ export default function PreviewPage() {
             ) : null}
 
             {result && result.offerCount > 0 ? (
-              <PostPurchasePreview
-                key={result.generatedAt}
-                response={result.response}
-                device={device}
-              />
+              <BlockStack gap="100">
+                <PostPurchasePreview
+                  key={result.generatedAt}
+                  response={result.response}
+                  device={device}
+                />
+                {diags.length > 0 ? (
+                  // Per-page copy provenance — rendered for single-offer runs
+                  // too, so provenance is always visible. The pager itself
+                  // lives inside PostPurchasePreview (a shared component this
+                  // route must not modify), so the strip sits directly
+                  // beneath the preview frame.
+                  <InlineStack gap="300" align="center" wrap>
+                    {[...diags]
+                      .sort((a, b) => a.position - b.position)
+                      .map((d) => (
+                        <Text
+                          key={d.position}
+                          as="span"
+                          variant="bodySm"
+                          tone="subdued"
+                        >
+                          {`Page ${d.position}: ${PAGE_SOURCE_LABELS[d.source]}`}
+                        </Text>
+                      ))}
+                  </InlineStack>
+                ) : null}
+              </BlockStack>
             ) : null}
 
             {!result && !errorMessage ? (

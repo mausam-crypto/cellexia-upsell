@@ -9,6 +9,10 @@
 //   order" paragraphs + a calm closer, with zero urgency/scarcity pressure.
 // - generateCopy: sha256-keyed CopyCache, timeout race against Claude,
 //   deterministic per-language fallback, background cache warming on failure.
+// - generateBuyerCopy / completeExtendedCopy: two-stage buyer path — one fast
+//   CORE call (settings.coreCopyModel) inside the post-purchase time budget,
+//   then a background call on the template's model for paragraphs/proof; the
+//   merged result (never a core-only one) lands in CopyCache.
 //   CopyCache packs {bullets, paragraphs, closer, proof} into the existing
 //   bulletsJson column (no schema migration; legacy array rows and packed
 //   rows without `pr` still parse — missing proof degrades to []).
@@ -86,7 +90,7 @@ Non-negotiable rules:
 2. The customer's completed purchase was an excellent choice. NEVER imply it was wrong, incomplete, insufficient, or missing anything. Frame the offer as amplifying and protecting the results they already secured — never as fixing a gap.
 3. Cosmetic claims only. No medical, drug-like, or therapeutic claims: nothing that "treats", "cures", "heals", "repairs damage", "regenerates cells", or is "clinically proven". Speak only about the look and feel of skin — visible smoothness, hydration, radiance, the feeling of firmness.
 4. Premium register, zero pressure. No emojis, no ALL-CAPS words, at most one exclamation mark across all fields — zero is better. No urgency, scarcity, or countdown language of any kind: never "limited", "only today", "last chance", "while stocks last", "hurry". The page handles timing; your copy persuades with facts.
-5. Be concrete and specific — facts persuade, adjectives don't. Each product in the brief comes with a description: mine those descriptions for ingredients, actives, mechanisms, textures and usage moments, and build the argument from them, never from generic category assumptions.
+5. Be concrete and specific — facts persuade, adjectives don't. Each product in the brief comes with a description: mine those descriptions for ingredients, actives, mechanisms, textures and usage moments, and build the argument from them, never from generic category assumptions. When the offered product serves a DIFFERENT area or purpose than the basket products (e.g. a face serum offered after a body cream), present it honestly as EXTENDING the routine to that new area — never claim it enhances, boosts, or completes the basket products' own results unless a description explicitly states a direct interaction.
 6. Mention the {{discount_pct}}% discount exactly once across all fields — in the lead OR the closer, never in the paragraphs or bullets — framed as a private post-purchase courtesy that is applied automatically. Prices are in {{currency}}; never invent numbers that are not in the brief.
 7. The brief is the complete universe of products AND facts. NEVER mention, imply, or invent any product, size, format, sample, sachet, mini, gift, or set component that is not explicitly listed in the brief. Every product name in your copy must appear verbatim in the basket list or the offer list — and only offered products are being sold.
 8. Use every product name EXACTLY as written in the brief — the names are already in the customer's language; never translate, shorten, or restyle a product name.
@@ -236,6 +240,14 @@ export async function claudeComplete(args: {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not set");
 
+  // claude-sonnet-5* and claude-opus-5* run ADAPTIVE THINKING BY DEFAULT when
+  // the thinking param is omitted, and max_tokens caps thinking + output
+  // TOGETHER — long-form JSON then truncates with stop_reason "max_tokens"
+  // and parses as garbage. Disable thinking explicitly for those models only;
+  // never send a thinking param for claude-haiku-4-5 or other models.
+  const disableThinking =
+    args.model.startsWith("claude-sonnet-5") || args.model.startsWith("claude-opus-5");
+
   const response = await fetch(ANTHROPIC_API_URL, {
     method: "POST",
     headers: {
@@ -250,6 +262,7 @@ export async function claudeComplete(args: {
       max_tokens: args.maxTokens,
       system: args.system,
       messages: [{ role: "user", content: args.prompt }],
+      ...(disableThinking ? { thinking: { type: "disabled" } } : {}),
     }),
     signal: AbortSignal.timeout(args.timeoutMs),
   });
@@ -261,7 +274,18 @@ export async function claudeComplete(args: {
 
   const data = (await response.json()) as {
     content?: Array<{ type?: string; text?: string }>;
+    stop_reason?: string;
   };
+  // A truncated or refused response parses as garbage downstream — fail loudly
+  // BEFORE concatenating text blocks so callers hit their fallback paths.
+  if (data.stop_reason === "max_tokens") {
+    throw new Error(
+      "anthropic output truncated (stop_reason=max_tokens) — raise the template's max tokens",
+    );
+  }
+  if (data.stop_reason === "refusal") {
+    throw new Error("anthropic refused the request");
+  }
   const text = (data.content ?? [])
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text as string)
@@ -320,13 +344,47 @@ function buildOfferSummary(
 }
 
 /**
+ * Buyer-language Translate & Adapt description from a ProductCache row's
+ * translationsJson column — the same exact → case-insensitive → base-prefix
+ * chain the orchestrator uses for translated titles ("pt-PT" matches "pt").
+ * Never throws — unparseable JSON degrades to undefined.
+ */
+function translatedDescription(
+  translationsJson: string,
+  language: string,
+): string | undefined {
+  const translations = jparse<Record<string, { description?: string }>>(
+    translationsJson,
+    {},
+  );
+  if (!translations || typeof translations !== "object") return undefined;
+  const direct = translations[language]?.description;
+  if (direct) return direct;
+  const lower = language.toLowerCase();
+  for (const [key, value] of Object.entries(translations)) {
+    if (key.toLowerCase() === lower && value?.description) return value.description;
+  }
+  const base = lower.split("-")[0];
+  for (const [key, value] of Object.entries(translations)) {
+    if (key.toLowerCase().split("-")[0] === base && value?.description) {
+      return value.description;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Copywriting grounding for the offered products: merchant aiDescription wins,
- * then the full synced description, then the short one (effectiveDescription).
- * Never throws — a failed lookup degrades to an empty map.
+ * then — when a buyer `language` is given — the Translate & Adapt description
+ * for that language (keeps fallback copy consistent with translated product
+ * names), then the full synced description, then the short one
+ * (effectiveDescription). Never throws — a failed lookup degrades to an
+ * empty map.
  */
 async function loadOfferDescriptions(
   shop: string,
   productIds: string[],
+  language?: string,
 ): Promise<Map<string, string>> {
   if (productIds.length === 0) return new Map();
   try {
@@ -337,9 +395,18 @@ async function loadOfferDescriptions(
         aiDescription: true,
         descriptionFull: true,
         descriptionShort: true,
+        translationsJson: true,
       },
     });
-    return new Map(rows.map((row) => [row.productId, effectiveDescription(row)]));
+    return new Map(
+      rows.map((row): [string, string] => {
+        if (language && !(row.aiDescription ?? "").trim()) {
+          const translated = translatedDescription(row.translationsJson, language);
+          if (translated) return [row.productId, translated];
+        }
+        return [row.productId, effectiveDescription(row)];
+      }),
+    );
   } catch (error) {
     console.error(`[ai] product description lookup failed for ${shop}:`, error);
     return new Map();
@@ -635,11 +702,20 @@ async function safeGetUiStrings(
  * the same generation in the background (long timeout) to warm the cache for
  * the next buyer.
  */
+/** Why generateCopy returned what it returned — surfaced in admin previews. */
+export type CopyReason =
+  | "cache"
+  | "generated"
+  | "ai_disabled"
+  | "no_key"
+  | "timeout_or_error";
+
 export async function generateCopy(args: GenerateCopyArgs): Promise<{
   copy: OfferCopy;
   discountSuggestion: number | null;
   cached: boolean;
   fallbackUsed: boolean;
+  reason: CopyReason;
 }> {
   const template = await getPromptTemplate(args.shop, args.mode, args.settings);
   const cacheKey = buildCacheKey(args, template.version);
@@ -663,6 +739,7 @@ export async function generateCopy(args: GenerateCopyArgs): Promise<{
           discountSuggestion: hit.discountSuggestion ?? null,
           cached: true,
           fallbackUsed: false,
+          reason: "cache",
         };
       }
     } catch (error) {
@@ -677,6 +754,7 @@ export async function generateCopy(args: GenerateCopyArgs): Promise<{
       discountSuggestion: null,
       cached: false,
       fallbackUsed: true,
+      reason: args.settings.aiEnabled ? "no_key" : "ai_disabled",
     };
   }
 
@@ -688,6 +766,7 @@ export async function generateCopy(args: GenerateCopyArgs): Promise<{
       discountSuggestion: generated.discountSuggestion,
       cached: false,
       fallbackUsed: false,
+      reason: "generated",
     };
   } catch (error) {
     console.error(
@@ -705,22 +784,308 @@ export async function generateCopy(args: GenerateCopyArgs): Promise<{
       discountSuggestion: null,
       cached: false,
       fallbackUsed: true,
+      reason: "timeout_or_error",
     };
   }
 }
 
 /**
  * Fill args.offerDescriptions ahead of a long-form fallback so its paragraphs
- * can be grounded in real product text. No-op for short copy or when the
- * caller already supplied descriptions. Never throws.
+ * can be grounded in real product text — preferring the buyer-language
+ * Translate & Adapt description when the merchant wrote no aiDescription.
+ * No-op for short copy or when the caller already supplied descriptions.
+ * Exported so the orchestrator can ground ITS fallback paths (no-discount
+ * pages, defensive exception fallbacks) in the same product text.
+ * Never throws.
  */
-async function withOfferDescriptions(args: GenerateCopyArgs): Promise<GenerateCopyArgs> {
+export async function withOfferDescriptions(args: GenerateCopyArgs): Promise<GenerateCopyArgs> {
   if (args.copyLength !== "long" || args.offerDescriptions) return args;
   const byId = await loadOfferDescriptions(
     args.shop,
     args.offerProducts.map((p) => p.productId),
+    args.language,
   );
   return { ...args, offerDescriptions: Object.fromEntries(byId) };
+}
+
+/**
+ * Read the discount suggestion a PREVIOUS generation stored under exactly the
+ * template version + cache key that `args` resolves to — the same resolution
+ * generateCopy/generateBuyerCopy perform. This lets the orchestrator adopt an
+ * AI-suggested discount BEFORE any copy is generated for an assembly, so a
+ * suggestion takes effect via convergence on the next page build instead of
+ * mutating a page whose copy was written at a different pct. Returns null
+ * when there is no cached row or the row carries no suggestion. Never throws.
+ */
+export async function peekDiscountSuggestion(
+  args: GenerateCopyArgs,
+): Promise<number | null> {
+  try {
+    const template = await getPromptTemplate(args.shop, args.mode, args.settings);
+    const cacheKey = buildCacheKey(args, template.version);
+    const row = await prisma.copyCache.findUnique({
+      where: { shop_cacheKey: { shop: args.shop, cacheKey } },
+      select: { discountSuggestion: true },
+    });
+    return row?.discountSuggestion ?? null;
+  } catch (error) {
+    console.error(`[ai] discount suggestion peek failed for ${args.shop}:`, error);
+    return null;
+  }
+}
+
+// ── Two-stage buyer copy (fast CORE call + background extended sections) ─────
+
+/**
+ * max_tokens for the buyer-blocking CORE call. Headline + lead + bullets +
+ * closer fit comfortably; a cap this tight keeps worst-case latency bounded.
+ */
+const CORE_MAX_TOKENS = 1500;
+
+/**
+ * Stage override appended to the rendered system prompt AFTER template
+ * variable substitution — narrows the output contract to the core fields
+ * while every other rule (language, claims, discount mention) stands.
+ */
+const CORE_STAGE_OVERRIDE =
+  'FOR THIS CALL ONLY, OVERRIDE THE OUTPUT SCHEMA: respond with {"headline":string,"lead":string,"bullets":string[],"closer":string,"discount_suggestion":number|null} — do NOT write paragraphs or proof (they are generated separately). Every other rule stands.';
+
+/**
+ * Upsert a CopyCache row. `discountSuggestion === undefined` leaves an
+ * existing row's suggestion untouched (extended-stage writes have none of
+ * their own); when the row is CREATED while `discountSuggestion` is
+ * undefined, `createDiscountSuggestion` is stored instead — this is how the
+ * fast core call's suggestion survives the long-copy path, where ONLY
+ * completeExtendedCopy ever writes the row under the full cacheKey.
+ */
+async function upsertCopyCache(
+  shop: string,
+  cacheKey: string,
+  language: string,
+  copy: OfferCopy,
+  discountSuggestion: number | null | undefined,
+  createDiscountSuggestion: number | null = null,
+): Promise<void> {
+  await prisma.copyCache.upsert({
+    where: { shop_cacheKey: { shop, cacheKey } },
+    update: {
+      language,
+      headline: copy.headline,
+      body: copy.body,
+      bulletsJson: packBulletsJson(copy),
+      ...(discountSuggestion !== undefined ? { discountSuggestion } : {}),
+    },
+    create: {
+      shop,
+      cacheKey,
+      language,
+      headline: copy.headline,
+      body: copy.body,
+      bulletsJson: packBulletsJson(copy),
+      discountSuggestion:
+        discountSuggestion !== undefined ? discountSuggestion : createDiscountSuggestion,
+    },
+  });
+}
+
+/**
+ * Buyer-blocking copy generation for the post-purchase callback's hard time
+ * budget. Cache-first; on miss makes ONE fast CORE call (headline / lead /
+ * bullets / closer) on settings.coreCopyModel. For "long" copyLength the
+ * below-CTA sections (paragraphs/proof) are NOT generated here — the caller
+ * fires completeExtendedCopy in the background and the page polls for them
+ * (extendedPending: true). "short" copy is complete after the core call and
+ * is cached under the standard cacheKey. A core-only "long" result is NEVER
+ * cached under the full cacheKey — only completeExtendedCopy writes the
+ * merged copy. Timeout/error degrades to the deterministic fallback and warms
+ * the full cache in the background, exactly like generateCopy. Never throws.
+ */
+export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
+  copy: OfferCopy;
+  discountSuggestion: number | null;
+  cached: boolean;
+  fallbackUsed: boolean;
+  extendedPending: boolean;
+  reason: CopyReason;
+}> {
+  const template = await getPromptTemplate(args.shop, args.mode, args.settings);
+  const cacheKey = buildCacheKey(args, template.version);
+
+  if (!args.bypassCache) {
+    try {
+      const hit = await prisma.copyCache.findUnique({
+        where: { shop_cacheKey: { shop: args.shop, cacheKey } },
+      });
+      if (hit) {
+        const extras = unpackBulletsJson(hit.bulletsJson);
+        return {
+          copy: {
+            headline: hit.headline,
+            body: hit.body,
+            bullets: extras.bullets,
+            paragraphs: extras.paragraphs,
+            closer: extras.closer,
+            proof: extras.proof,
+          },
+          discountSuggestion: hit.discountSuggestion ?? null,
+          cached: true,
+          fallbackUsed: false,
+          extendedPending: false,
+          reason: "cache",
+        };
+      }
+    } catch (error) {
+      console.error(`[ai] copy cache lookup failed for ${args.shop}:`, error);
+    }
+  }
+
+  if (!args.settings.aiEnabled || !process.env.ANTHROPIC_API_KEY) {
+    const strings = await safeGetUiStrings(args.shop, args.language);
+    return {
+      copy: fallbackCopy(await withOfferDescriptions(args), strings),
+      discountSuggestion: null,
+      cached: false,
+      fallbackUsed: true,
+      extendedPending: false,
+      reason: args.settings.aiEnabled ? "no_key" : "ai_disabled",
+    };
+  }
+
+  const timeoutMs = args.timeoutMs ?? args.settings.aiTimeoutMs;
+  try {
+    const vars = await buildTemplateVars(args);
+    const raw = await claudeComplete({
+      model: args.settings.coreCopyModel || "claude-haiku-4-5",
+      system: renderTemplate(template.systemPrompt, vars) + "\n\n" + CORE_STAGE_OVERRIDE,
+      prompt: renderTemplate(template.userPrompt, vars),
+      maxTokens: CORE_MAX_TOKENS,
+      timeoutMs,
+    });
+    const { copy, discountSuggestion } = validateModelCopy(
+      parseModelObject(raw),
+      args.copyLength,
+    );
+    // The core stage never carries the below-CTA sections — drop anything the
+    // model wrote despite the override so the page renders a clean core.
+    const coreCopy: OfferCopy = { ...copy, paragraphs: [], proof: [] };
+
+    if (args.copyLength === "long") {
+      // NEVER cache a core-only result under the full cacheKey — the merged
+      // copy is written by completeExtendedCopy when the background call lands.
+      return {
+        copy: coreCopy,
+        discountSuggestion,
+        cached: false,
+        fallbackUsed: false,
+        extendedPending: true,
+        reason: "generated",
+      };
+    }
+
+    // "short" copy IS complete — persist it for the next buyer.
+    try {
+      await upsertCopyCache(args.shop, cacheKey, args.language, coreCopy, discountSuggestion);
+    } catch (error) {
+      console.error(`[ai] core copy cache write failed for ${args.shop}:`, error);
+    }
+    return {
+      copy: coreCopy,
+      discountSuggestion,
+      cached: false,
+      fallbackUsed: false,
+      extendedPending: false,
+      reason: "generated",
+    };
+  } catch (error) {
+    console.error(
+      `[ai] core copy generation failed for ${args.shop} (${args.mode}, ${args.language}):`,
+      error,
+    );
+    // Warm the FULL cache for the next buyer — fire and forget, generous timeout.
+    void generateAndCache(args, template, cacheKey, BACKGROUND_TIMEOUT_MS).catch(
+      (bgError) =>
+        console.error(`[ai] background cache warming failed for ${args.shop}:`, bgError),
+    );
+    const strings = await safeGetUiStrings(args.shop, args.language);
+    return {
+      copy: fallbackCopy(await withOfferDescriptions(args), strings),
+      discountSuggestion: null,
+      cached: false,
+      fallbackUsed: true,
+      extendedPending: false,
+      reason: "timeout_or_error",
+    };
+  }
+}
+
+/**
+ * Background completion of the below-CTA sections (paragraphs + proof) for a
+ * core copy that is already live on the buyer's page. Uses the prompt
+ * template's own model and maxTokens with the generous background timeout.
+ * On success writes the FULL merged copy (core + extended) to CopyCache under
+ * the standard cacheKey and returns the extended parts; on any error it logs
+ * and returns null. `coreDiscountSuggestion` is the suggestion the fast core
+ * call returned: when this write CREATES the merged row it is persisted so
+ * the next assembly's peekDiscountSuggestion can converge on it (an existing
+ * row's suggestion is left untouched). Never throws.
+ */
+export async function completeExtendedCopy(
+  args: GenerateCopyArgs,
+  core: OfferCopy,
+  coreDiscountSuggestion: number | null,
+): Promise<{ paragraphs: string[]; proof: string[]; closer: string } | null> {
+  try {
+    const template = await getPromptTemplate(args.shop, args.mode, args.settings);
+    const cacheKey = buildCacheKey(args, template.version);
+    const vars = await buildTemplateVars(args);
+    const stageOverride =
+      'The core copy for this page is already live (verbatim below). FOR THIS CALL ONLY output {"paragraphs":string[],"proof":string[]} completing it — same angle, no repetition of the lead or bullets, all standing rules apply (mechanism/proof/relevance, research guardrails, no discount mention). CORE COPY: ' +
+      JSON.stringify(core);
+    const raw = await claudeComplete({
+      model: template.model,
+      system: renderTemplate(template.systemPrompt, vars) + "\n\n" + stageOverride,
+      prompt: renderTemplate(template.userPrompt, vars),
+      maxTokens: template.maxTokens,
+      timeoutMs: BACKGROUND_TIMEOUT_MS,
+    });
+    const parsed = parseModelObject(raw);
+    const paragraphs = stringItems(parsed.paragraphs, PARAGRAPH_MAX, 3);
+    const proof = stringItems(parsed.proof, PROOF_MAX, 3);
+    if (paragraphs.length === 0) {
+      // A "merged" copy without paragraphs is a core-only result in disguise —
+      // never cache it under the full cacheKey (proof alone may be [] by rule 10).
+      console.error(
+        `[ai] extended copy returned no paragraphs for ${args.shop} (${args.mode}, ${args.language})`,
+      );
+      return null;
+    }
+    // The extended schema carries no closer — the live core's closer stands.
+    const closer = core.closer ?? "";
+    const merged: OfferCopy = { ...core, paragraphs, closer, proof };
+    try {
+      // undefined: never clobber an existing row's suggestion; on CREATE the
+      // core call's suggestion is stored so the next assembly can peek it.
+      await upsertCopyCache(
+        args.shop,
+        cacheKey,
+        args.language,
+        merged,
+        undefined,
+        coreDiscountSuggestion,
+      );
+    } catch (error) {
+      // The buyer still gets the extended parts via the poll — only future
+      // cache warmth is lost.
+      console.error(`[ai] extended copy cache write failed for ${args.shop}:`, error);
+    }
+    return { paragraphs, proof, closer };
+  } catch (error) {
+    console.error(
+      `[ai] extended copy generation failed for ${args.shop} (${args.mode}, ${args.language}):`,
+      error,
+    );
+    return null;
+  }
 }
 
 /** First ~`count` sentences of a text, word-boundary capped at `max` chars. */
@@ -748,9 +1113,10 @@ function guaranteeLine(brandContext: string): string {
  * Deterministic copy built only from translated UI strings and (translated)
  * product titles — used when AI is disabled, unavailable, or slower than the
  * timeout. For long copyLength it also grounds 1–2 paragraphs in the offered
- * products' effective descriptions (args.offerDescriptions, store language)
- * and closes with the merchant's guarantee line or the ships_free string —
- * real product/brand text only, never invented.
+ * products' descriptions (args.offerDescriptions — buyer-language Translate &
+ * Adapt text when available, unless a merchant aiDescription wins) and closes
+ * with the merchant's guarantee line or the ships_free string — real
+ * product/brand text only, never invented.
  */
 export function fallbackCopy(
   args: GenerateCopyArgs,

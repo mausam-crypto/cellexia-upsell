@@ -194,6 +194,11 @@ offer page decides where each one renders relative to the buy button:
    subheading. See [The research block](#the-research-block) for exactly what
    it may and may not say.
 
+> **Timing note:** everything above the button is always there instantly. On
+> a basket the app has never seen before, the two below-the-button sections
+> may fade in a few seconds after the page loads (they're written in the
+> background); repeat baskets show the complete page immediately.
+
 The register is classic direct-response done premium — the Schwartz /
 Bencivenga school: lead with the mechanism, be specific, prove every claim,
 and **never use urgency or hype**. The countdown is the only time element on
@@ -279,9 +284,14 @@ names exactly as given (they come from Translate & Adapt); mention the
 discount naturally; research statements stay ingredient-level, cover only
 ingredients named in the brief, and never invent citations.
 
-If the AI is unavailable or slow (over ~2.5s), buyers see clean generic
-fallback copy instead of waiting — and the real copy is generated in the
-background for the next buyer. Nothing ever blocks the checkout.
+The copy is written in two stages so nothing ever blocks the checkout:
+the headline, lead, bullets and closer — the complete short pitch — are
+generated in a fast call and shown **instantly** to every buyer. On a
+basket the app has never seen before, the deeper below-the-button section
+("Why it works with your order" and the research block) may appear a few
+seconds later, filled in as soon as it's ready; every repeat of that basket
+gets the whole page instantly from the cache. If the AI is unavailable
+entirely, buyers see clean generic fallback copy instead of waiting.
 
 ## Preview
 
@@ -340,14 +350,23 @@ Each section saves independently.
   winner can be picked, confidence threshold, auto-pick on/off), plus
   **Reset experiment stats** and **Pick winners now** buttons.
 - **Markets** — one row per Shopify Market: enable/disable offers there,
-  override the discount %, force a language, cap the number of offers.
+  override the discount %, set a language, cap the number of offers.
   **Re-sync** pulls new markets from Shopify without touching your overrides.
+  Note on the language override: the buyer's own language always wins — the
+  override only applies when the buyer's language isn't one of your enabled
+  store languages. A customer who checks out in English is never switched to
+  another language because of their shipping country.
 - **Languages** — which store languages the app serves and the default. These
   come from Shopify's published locales; all 17 Cellexia languages are
   supported.
 - **AI** — AI copy on/off, model, timeout, and the translation provider
-  (Claude or DeepL) used for the static UI strings. A banner warns if the
-  Anthropic API key is missing on the server.
+  (Claude or DeepL) used for the static UI strings. The **Core copy model**
+  is the fast model that writes the instant above-the-fold pitch (headline,
+  lead, bullets, closer) within the checkout time budget — keep it on
+  `claude-haiku-4-5` unless you have a reason not to; the deeper sections are
+  written in the background with each prompt template's own model, so they
+  can afford a bigger model. A banner warns if the Anthropic API key is
+  missing on the server.
 
 ## Translations
 

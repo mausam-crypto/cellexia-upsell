@@ -76,6 +76,13 @@ export interface AppSettings {
   brandContext: string;
   aiEnabled: boolean;
   aiModel: string;
+  /**
+   * Model for the buyer-blocking CORE copy call (headline/lead/bullets/closer).
+   * Must be fast — the post-purchase callback has a hard time budget. The
+   * extended sections (paragraphs/proof) use the prompt template's model in a
+   * background call where latency doesn't matter.
+   */
+  coreCopyModel: string;
   aiTimeoutMs: number;
   translationProvider: "claude" | "deepl";
   translationModel: string;
@@ -86,6 +93,12 @@ export interface AppSettings {
   /** Store locales (synced from Shopify, editable). */
   languages: string[];
   defaultLanguage: string;
+  /**
+   * Shopify locales already seen by the sync — new published locales are
+   * ADDED to `languages` once; locales the merchant then disables are never
+   * re-added by later syncs (curation survives).
+   */
+  knownShopifyLocales: string[];
   weights: ScoringWeights;
 }
 
@@ -115,6 +128,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     "Cellexia Labs — Precision Beauty™. Professional-grade anti-aging skincare for mature skin: serums, creams, eye serums, lip formulas, body creams and neck treatments. 60-day money-back guarantee. Customers are discerning adults who value efficacy and ingredient science.",
   aiEnabled: true,
   aiModel: "claude-haiku-4-5",
+  coreCopyModel: "claude-haiku-4-5",
   aiTimeoutMs: 3500,
   translationProvider: "claude",
   translationModel: "claude-sonnet-5",
@@ -133,6 +147,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     "ar", "pl", "pt-PT", "ja", "no", "ro", "hu", "el",
   ],
   defaultLanguage: "en",
+  knownShopifyLocales: [],
   weights: { compatibility: 0.35, repeatPurchase: 0.2, acceptance: 0.25, margin: 0.2 },
 };
 
@@ -276,6 +291,12 @@ export interface OfferPage {
   copy: OfferCopy;
   changes: OfferChange[];
   position: number;
+  /**
+   * True when the below-CTA sections (paragraphs/proof) are still being
+   * generated in the background — the extension polls /api/offer-extended
+   * and merges them in when ready. Absent/false = copy is complete.
+   */
+  extendedPending?: boolean;
 }
 
 export interface OfferResponse {

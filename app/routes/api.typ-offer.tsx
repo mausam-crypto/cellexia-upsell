@@ -7,7 +7,10 @@
 // admin API order lookup. The request body may only contribute the display
 // locale and the order id; client-supplied totals, line items, country,
 // currency and customer id are ignored so they can never influence offer
-// selection or the discount percentage.
+// selection or the discount percentage. The request is bound to the order:
+// orders created more than 60 minutes ago are refused (no code minting for
+// arbitrary historical order ids), and when both the session token and the
+// order carry a customer id they must denote the same customer.
 // Returns `{ offer: ThankYouOffer | null }`. Never 500s.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -58,8 +61,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const orderNumericId = gidToNumber(orderIdRaw);
     if (!Number.isFinite(orderNumericId)) return cors(json({ offer: null }));
 
-    // Body may only contribute the display language.
-    const locale = typeof body?.locale === "string" && body.locale ? body.locale : "en";
+    // Body may only contribute the display language. A missing locale stays
+    // empty so resolveLanguageWithSource applies the market override → store
+    // default chain instead of forcing English.
+    const locale = typeof body?.locale === "string" && body.locale ? body.locale : "";
 
     // Offline admin client — used for the order fallback fetch and for
     // discountCodeBasicCreate. Best-effort: without it the orchestrator
@@ -77,6 +82,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       (graphql ? await contextFromAdminOrder(graphql, shop, orderNumericId, locale) : null);
     if (!ctx) return cors(json({ offer: null }));
 
+    // Customer binding: when the verified session token identifies a customer
+    // AND the order has one, they must denote the same customer — a logged-in
+    // buyer must not mint codes against someone else's order. Skipped when
+    // either side is absent (guest checkout, tokens without a sub claim).
+    const tokenCustomer = numericTail(token?.sub ?? token?.input_data?.customer?.id);
+    const orderCustomer = numericTail(ctx.customerId);
+    if (tokenCustomer && orderCustomer && tokenCustomer !== orderCustomer) {
+      return cors(json({ offer: null }));
+    }
+
     const offer = await assembleThankYouOffer(ctx, graphql);
     return cors(json({ offer }));
   } catch (error) {
@@ -86,6 +101,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 // ── Server-side purchase context builders ────────────────────────────────────
+
+/** Orders older than this are refused — the thank-you page is shown right
+ *  after checkout, so anything beyond an hour is not a live thank-you visit. */
+const ORDER_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * True when the order was created within ORDER_MAX_AGE_MS. Accepts a Date or
+ * an ISO string (webhook `created_at` / admin `createdAt`); missing or
+ * unparseable values fail closed so freshness can never be skipped.
+ */
+function isRecentOrder(createdAt: unknown): boolean {
+  const t =
+    createdAt instanceof Date ? createdAt.getTime() : Date.parse(String(createdAt ?? ""));
+  return Number.isFinite(t) && Date.now() - t <= ORDER_MAX_AGE_MS;
+}
 
 /**
  * Build the context from the OrderRecord captured by the orders/create
@@ -104,6 +134,7 @@ async function contextFromOrderRecord(
     });
     const record = candidates.find((r) => gidToNumber(r.orderId) === orderNumericId);
     if (!record) return null;
+    if (!isRecentOrder(record.createdAt)) return null;
 
     const lineItems: PurchaseLineItem[] = record.lines.map((line) => ({
       productId: toGid("Product", line.productId),
@@ -134,6 +165,7 @@ const ORDER_LOOKUP_QUERY = `#graphql
   query cellexiaThankYouOrder($id: ID!) {
     order(id: $id) {
       id
+      createdAt
       customer {
         id
       }
@@ -192,15 +224,19 @@ async function contextFromAdminOrder(
     const body: any = await response.json();
     const order = body?.data?.order;
     if (!order) return null;
+    if (!isRecentOrder(order?.createdAt ?? order?.created_at)) return null;
 
-    const money = order?.totalPriceSet?.presentmentMoney ?? order?.totalPriceSet?.shopMoney;
+    // Shop money preferred (mirrors api.offer.tsx: rule min/max totals,
+    // discount tiers and catalog prices are shop-currency, so threshold math
+    // in presentment currency would be wrong); presentment only as fallback.
+    const money = order?.totalPriceSet?.shopMoney ?? order?.totalPriceSet?.presentmentMoney;
     const nodes: any[] = Array.isArray(order?.lineItems?.nodes) ? order.lineItems.nodes : [];
     const lineItems: PurchaseLineItem[] = [];
     for (const node of nodes) {
       const productId = node?.product?.id;
       if (typeof productId !== "string" || !productId) continue;
       const unitMoney =
-        node?.originalUnitPriceSet?.presentmentMoney ?? node?.originalUnitPriceSet?.shopMoney;
+        node?.originalUnitPriceSet?.shopMoney ?? node?.originalUnitPriceSet?.presentmentMoney;
       lineItems.push({
         productId,
         variantId:
@@ -236,6 +272,15 @@ async function contextFromAdminOrder(
 }
 
 // ── Parsing helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Trailing digits of an id ("gid://shopify/Customer/777" | 777 | "777" →
+ * "777"); absent or non-numeric → null so comparisons can be skipped.
+ */
+function numericTail(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  return String(value).match(/(\d+)$/)?.[1] ?? null;
+}
 
 /** "gid://shopify/Customer/123" | 123 | "123" → "123"; empty → null. */
 function normalizeId(value: unknown): string | null {

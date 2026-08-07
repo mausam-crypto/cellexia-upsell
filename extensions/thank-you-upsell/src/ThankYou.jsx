@@ -84,11 +84,18 @@ function ThankYouUpsell() {
 
     (async () => {
       try {
-        const token = await api?.sessionToken?.get?.();
-        if (!token) throw new Error("no session token");
-
         const body = buildOfferRequestBody(api);
         sentOrderIdRef.current = body.orderId || null;
+
+        // The server refuses requests without an order id — skip the round
+        // trip entirely and collapse to the hidden state right away.
+        if (!body.orderId) {
+          if (!cancelled) setStatus("empty");
+          return;
+        }
+
+        const token = await api?.sessionToken?.get?.();
+        if (!token) throw new Error("no session token");
 
         let signal;
         try {
@@ -321,9 +328,11 @@ function LoadingCard() {
 }
 
 /**
- * Build the POST body for /api/typ-offer from whatever the thank-you API
- * exposes. Every field is optional and read defensively — missing pieces are
- * simply omitted and the backend fills the gaps.
+ * Build the POST body for /api/typ-offer. The server constructs the purchase
+ * context exclusively from server-side data and ignores every body field
+ * except the order id and the display locale, so those are the only fields
+ * sent. Both are read defensively — missing pieces are simply omitted (the
+ * caller skips the fetch entirely when orderId is absent).
  */
 function buildOfferRequestBody(api) {
   const body = {};
@@ -336,51 +345,10 @@ function buildOfferRequestBody(api) {
   }
 
   try {
-    const lines = api?.lines?.current;
-    if (Array.isArray(lines) && lines.length > 0) {
-      const lineItems = lines
-        .map((line) => ({
-          productId: line?.merchandise?.product?.id ?? null,
-          variantId: line?.merchandise?.id ?? null,
-          quantity: Number(line?.quantity ?? 1) || 1,
-        }))
-        .filter((line) => line.productId || line.variantId);
-      if (lineItems.length > 0) body.lineItems = lineItems;
-    }
-  } catch {
-    // omit lineItems
-  }
-
-  try {
-    const total = api?.cost?.totalAmount?.current;
-    if (total) {
-      const amount = Number(total.amount);
-      if (Number.isFinite(amount)) body.totalAmount = amount;
-      if (total.currencyCode) body.currency = String(total.currencyCode);
-    }
-  } catch {
-    // omit totals
-  }
-
-  try {
     const language = api?.localization?.language?.current?.isoCode;
     if (language) body.locale = String(language);
   } catch {
     // omit locale
-  }
-
-  try {
-    const country = api?.localization?.country?.current?.isoCode;
-    if (country) body.countryCode = String(country);
-  } catch {
-    // omit countryCode
-  }
-
-  try {
-    const customerId = api?.buyerIdentity?.customer?.current?.id;
-    if (customerId) body.customerId = String(customerId);
-  } catch {
-    // omit customerId
   }
 
   return body;

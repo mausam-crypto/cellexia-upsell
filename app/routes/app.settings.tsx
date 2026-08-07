@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import {
@@ -28,11 +28,15 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { jparse } from "../lib/json";
 import { getSettings, saveSettings } from "../services/settings.server";
+import { ensureUiStrings } from "../services/ai.server";
 import {
   autoPickWinners,
   resetExperimentStats,
 } from "../services/recommendation.server";
-import { syncMarketsAndLocales } from "../services/catalog.server";
+import {
+  syncMarketsAndLocales,
+  syncProductTranslations,
+} from "../services/catalog.server";
 import {
   CELLEXIA_LANGUAGES,
   DEFAULT_SETTINGS,
@@ -94,13 +98,21 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const [settings, marketRows] = await Promise.all([
+  const [settings, marketRows, shopRow] = await Promise.all([
     getSettings(shop),
     prisma.marketSetting.findMany({ where: { shop }, orderBy: { name: "asc" } }),
+    prisma.shop.findUnique({ where: { shop } }),
   ]);
 
   return json({
     settings,
+    // Bumps on every settings write — the client re-syncs the just-saved
+    // section's state from the loader when it changes, so server-side
+    // normalization (e.g. the discount min/max swap) becomes visible instead
+    // of silently diverging. Shop.updatedAt also bumps on unrelated writes
+    // (catalog syncs), so the client pairs a stamp change with the save
+    // intent that caused it and ignores the rest.
+    settingsStamp: shopRow?.updatedAt.toISOString() ?? "",
     markets: marketRows.map((m) => ({
       marketHandle: m.marketHandle,
       name: m.name,
@@ -294,6 +306,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       let defaultLanguage = fstr(fd, "defaultLanguage", "en");
       if (!languages.includes(defaultLanguage)) defaultLanguage = languages[0];
       await saveSettings(shop, { languages, defaultLanguage });
+      // Fire-and-forget warm-up for languages that were just enabled: seed and
+      // translate the buyer-facing UI strings, and pull Translate & Adapt
+      // product names for the new locales. Neither may block or fail the save
+      // — buyers would only see per-key EN fallbacks until they complete.
+      const newlyAddedLanguages = languages.filter(
+        (l) => !current.languages.includes(l),
+      );
+      if (newlyAddedLanguages.length > 0) {
+        void ensureUiStrings(shop, newlyAddedLanguages).catch((error) =>
+          console.error(
+            `[settings] ensureUiStrings after languages save failed for ${shop}`,
+            error,
+          ),
+        );
+        if (admin?.graphql) {
+          void syncProductTranslations(
+            admin.graphql as unknown as AdminGraphql,
+            shop,
+            { locales: newlyAddedLanguages },
+          ).catch((error) =>
+            console.error(
+              `[settings] product translations after languages save failed for ${shop}`,
+              error,
+            ),
+          );
+        }
+      }
       return respond(true, "Languages saved.");
     }
 
@@ -302,6 +341,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await saveSettings(shop, {
         aiEnabled: fbool(fd, "aiEnabled"),
         aiModel: fstr(fd, "aiModel", "claude-haiku-4-5"),
+        coreCopyModel: fstr(fd, "coreCopyModel", "claude-haiku-4-5"),
         aiTimeoutMs: fint(fd, "aiTimeoutMs", 2500, 500, 30000),
         translationProvider: provider === "deepl" ? "deepl" : "claude",
         translationModel: fstr(fd, "translationModel", "claude-sonnet-5"),
@@ -370,6 +410,7 @@ interface MarketRowState {
 interface AiState {
   aiEnabled: boolean;
   aiModel: string;
+  coreCopyModel: string;
   aiTimeoutMs: string;
   translationProvider: string;
   translationModel: string;
@@ -392,6 +433,20 @@ function aiModelOptions(current: string) {
   const options = [
     { label: "claude-haiku-4-5 (fast)", value: "claude-haiku-4-5" },
     { label: "claude-sonnet-5 (best)", value: "claude-sonnet-5" },
+  ];
+  if (!options.some((o) => o.value === current) && current) {
+    options.push({ label: current, value: current });
+  }
+  return options;
+}
+
+function coreCopyModelOptions(current: string) {
+  const options = [
+    {
+      label: "claude-haiku-4-5 (recommended — fast)",
+      value: "claude-haiku-4-5",
+    },
+    { label: "claude-sonnet-5", value: "claude-sonnet-5" },
   ];
   if (!options.some((o) => o.value === current) && current) {
     options.push({ label: current, value: current });
@@ -436,7 +491,7 @@ export default function SettingsPage() {
   };
 
   // General
-  const [general, setGeneral] = useState<GeneralState>({
+  const toGeneralState = (): GeneralState => ({
     enabled: s.enabled,
     thankYouEnabled: s.thankYouEnabled,
     singleProductOrderOffers: String(s.singleProductOrderOffers),
@@ -449,11 +504,12 @@ export default function SettingsPage() {
     countdownEnabled: s.countdown.enabled,
     countdownMinutes: String(s.countdown.minutes),
   });
+  const [general, setGeneral] = useState<GeneralState>(toGeneralState);
   const setG = (patch: Partial<GeneralState>) =>
     setGeneral((prev) => ({ ...prev, ...patch }));
 
   // Discount
-  const [discount, setDiscount] = useState<DiscountState>({
+  const toDiscountState = (): DiscountState => ({
     mode: s.discount.mode,
     value: String(s.discount.value),
     min: String(s.discount.min),
@@ -463,6 +519,7 @@ export default function SettingsPage() {
       pct: String(t.pct),
     })),
   });
+  const [discount, setDiscount] = useState<DiscountState>(toDiscountState);
   const setD = (patch: Partial<DiscountState>) =>
     setDiscount((prev) => ({ ...prev, ...patch }));
   const updateTier = (
@@ -485,16 +542,17 @@ export default function SettingsPage() {
     }));
 
   // Frequency & hygiene
-  const [hygiene, setHygiene] = useState<HygieneState>({
+  const toHygieneState = (): HygieneState => ({
     frequencyCapDays: String(s.frequencyCapDays),
     suppressionDays: String(s.suppressionDays),
     minInventory: String(s.minInventory),
   });
+  const [hygiene, setHygiene] = useState<HygieneState>(toHygieneState);
   const setH = (patch: Partial<HygieneState>) =>
     setHygiene((prev) => ({ ...prev, ...patch }));
 
   // Optimization
-  const [optimization, setOptimization] = useState<OptimizationState>({
+  const toOptimizationState = (): OptimizationState => ({
     optimizeMetric: s.optimizeMetric,
     rotationEnabled: s.rotation.enabled,
     explorationPct: String(s.rotation.explorationPct),
@@ -506,6 +564,8 @@ export default function SettingsPage() {
     wAcceptance: String(s.weights.acceptance),
     wMargin: String(s.weights.margin),
   });
+  const [optimization, setOptimization] =
+    useState<OptimizationState>(toOptimizationState);
   const setO = (patch: Partial<OptimizationState>) =>
     setOptimization((prev) => ({ ...prev, ...patch }));
 
@@ -556,15 +616,81 @@ export default function SettingsPage() {
   };
 
   // AI
-  const [ai, setAi] = useState<AiState>({
+  const toAiState = (): AiState => ({
     aiEnabled: s.aiEnabled,
     aiModel: s.aiModel,
+    coreCopyModel: s.coreCopyModel,
     aiTimeoutMs: String(s.aiTimeoutMs),
     translationProvider: s.translationProvider,
     translationModel: s.translationModel,
   });
+  const [ai, setAi] = useState<AiState>(toAiState);
   const setA = (patch: Partial<AiState>) =>
     setAi((prev) => ({ ...prev, ...patch }));
+
+  // Rehydrate ONLY the just-saved section when its save round-trips (the
+  // stamp bumps on each settings write): the server normalizes some values —
+  // e.g. swaps a reversed discount min/max — and the form must show what was
+  // actually stored instead of silently diverging from it. The action echoes
+  // the saved section's intent, so a stamp change is paired with at most one
+  // fresh save: stamp bumps with no fresh intent behind them (Shop.updatedAt
+  // also bumps on background catalog syncs) rehydrate nothing, so unsaved
+  // typing in other sections is never wiped.
+  const lastStampRef = useRef(data.settingsStamp);
+  const consumedSaveRef = useRef<typeof actionData>(undefined);
+  useEffect(() => {
+    const stampChanged = data.settingsStamp !== lastStampRef.current;
+    lastStampRef.current = data.settingsStamp;
+    // Wait for the stamp to move: actionData lands before the revalidated
+    // loader data does, and rehydrating then would restore stale values.
+    if (!stampChanged) return;
+    // Stamp moved without a fresh save behind it (background sync) — ignore.
+    if (!actionData || consumedSaveRef.current === actionData) return;
+    consumedSaveRef.current = actionData;
+    switch (actionData.intent) {
+      case "general":
+        setGeneral(toGeneralState());
+        break;
+      case "discount":
+        setDiscount(toDiscountState());
+        break;
+      case "hygiene":
+        setHygiene(toHygieneState());
+        break;
+      case "optimization":
+        setOptimization(toOptimizationState());
+        break;
+      case "languages":
+        setSelectedLanguages(s.languages);
+        setDefaultLanguage(s.defaultLanguage);
+        break;
+      case "ai":
+        setAi(toAiState());
+        break;
+      default:
+        // Non-section intents (reset-stats, pick-winners, resync-markets,
+        // markets — the latter re-synced by its own effect below).
+        break;
+    }
+    // The builders read the freshest loader data; the refs pair each stamp
+    // bump with at most one save's intent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data.settingsStamp, actionData]);
+
+  // A "markets" save writes MarketSetting rows (not the Shop row), so the
+  // stamp doesn't bump — re-sync marketRows from the revalidated loader data
+  // once the post-action revalidation settles, keyed on the echoed intent.
+  const consumedMarketsSaveRef = useRef<typeof actionData>(undefined);
+  useEffect(() => {
+    if (navigation.state !== "idle") return; // revalidated data not in yet
+    if (!actionData || actionData.intent !== "markets" || !actionData.ok) {
+      return;
+    }
+    if (consumedMarketsSaveRef.current === actionData) return;
+    consumedMarketsSaveRef.current = actionData;
+    setMarketRows(data.markets.map(toMarketRow));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navigation.state, actionData]);
 
   // Union of enabled languages and every stored override, so a stale override
   // (language later disabled) still displays as itself instead of "Store default".
@@ -1274,6 +1400,15 @@ export default function SettingsPage() {
                     onChange={(v) => setA({ aiModel: v })}
                   />
                 </Box>
+                <Box minWidth="220px">
+                  <Select
+                    label="Core copy model"
+                    options={coreCopyModelOptions(ai.coreCopyModel)}
+                    value={ai.coreCopyModel}
+                    onChange={(v) => setA({ coreCopyModel: v })}
+                    helpText="Generates the above-the-fold copy within the checkout time budget; detailed sections are generated in the background with the template's model."
+                  />
+                </Box>
                 <Box minWidth="160px">
                   <TextField
                     label="Timeout"
@@ -1319,6 +1454,7 @@ export default function SettingsPage() {
                     saveSection("ai", {
                       aiEnabled: String(ai.aiEnabled),
                       aiModel: ai.aiModel,
+                      coreCopyModel: ai.coreCopyModel,
                       aiTimeoutMs: ai.aiTimeoutMs,
                       translationProvider: ai.translationProvider,
                       translationModel: ai.translationModel,

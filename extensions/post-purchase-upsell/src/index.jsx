@@ -58,6 +58,14 @@ const FALLBACK_STRINGS = {
   research_shows: "What published research shows",
 };
 
+/**
+ * Extended-copy poll gaps (ms between attempts). Attempts land at roughly
+ * 1.2s, 3s, 6s, 11s, 19s and 29s after the pending page becomes active —
+ * max 6 per offer, covering the typical 5-10s generation window and most
+ * of the worst case.
+ */
+const EXTENDED_POLL_GAPS_MS = [1200, 1800, 3000, 5000, 8000, 10000];
+
 // ── Small helpers ────────────────────────────────────────────────────────────
 
 /** Localized string lookup with English fallback and {var} interpolation. */
@@ -249,6 +257,10 @@ export function App() {
   processingRef.current = processing || justAccepted;
   const impressionsSentRef = useRef({});
   const advanceTimerRef = useRef(null);
+  // Late-arriving long-form copy (offerId → {paragraphs, proof, closer}).
+  const [extendedByOfferId, setExtendedByOfferId] = useState({});
+  const extendedTriesRef = useRef({});
+  const extendedTimerRef = useRef(null);
 
   /** done() exactly once, and never let it throw into the render tree. */
   function safeDone() {
@@ -363,6 +375,107 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentOfferId]);
 
+  // Extended-copy polling: a page may arrive with extendedPending while its
+  // below-CTA sections (paragraphs/proof) are still generating server-side.
+  // Poll /api/offer-extended for the ACTIVE page only — attempts at ~1.2s,
+  // 3s, 6s, 11s, 19s and 29s, max 6 per offerId — and merge the result into
+  // extendedByOfferId so the "Why it works" section appears when ready.
+  // Strictly best-effort: failures leave the section hidden and never touch
+  // accept/decline/countdown/analytics behaviour.
+  useEffect(() => {
+    let cancelled = false;
+    try {
+      if (!currentOfferId || !offer || offer.extendedPending !== true) {
+        return undefined;
+      }
+      if (extendedByOfferId[currentOfferId]) return undefined; // already merged
+      const inline = offer.copy || {};
+      const hasBelowCta =
+        (Array.isArray(inline.paragraphs) &&
+          inline.paragraphs.some(
+            (p) => typeof p === "string" && p.trim().length > 0,
+          )) ||
+        (Array.isArray(inline.proof) && inline.proof.length > 0);
+      if (hasBelowCta) return undefined; // server already sent the content
+
+      const offerId = currentOfferId;
+
+      function scheduleNext() {
+        try {
+          const used = extendedTriesRef.current[offerId] || 0;
+          if (cancelled || used >= EXTENDED_POLL_GAPS_MS.length) return;
+          extendedTimerRef.current = setTimeout(
+            attempt,
+            EXTENDED_POLL_GAPS_MS[used],
+          );
+        } catch (error) {
+          /* best-effort */
+        }
+      }
+
+      function attempt() {
+        extendedTimerRef.current = null;
+        const used = extendedTriesRef.current[offerId] || 0;
+        if (cancelled || used >= EXTENDED_POLL_GAPS_MS.length) return;
+        extendedTriesRef.current[offerId] = used + 1;
+        (async () => {
+          let ready = false;
+          try {
+            const response = await fetch(`${APP_URL}/api/offer-extended`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({ referenceId, offerId }),
+            });
+            if (response.ok) {
+              const data = await response.json();
+              if (!cancelled && data && data.ready === true) {
+                ready = true;
+                // Fields may sit at the top level or under a nested object.
+                const src =
+                  (data.extended && typeof data.extended === "object"
+                    ? data.extended
+                    : null) ||
+                  (data.copy && typeof data.copy === "object"
+                    ? data.copy
+                    : null) ||
+                  data;
+                setExtendedByOfferId((prev) => ({
+                  ...prev,
+                  [offerId]: {
+                    paragraphs: Array.isArray(src.paragraphs)
+                      ? src.paragraphs
+                      : [],
+                    proof: Array.isArray(src.proof) ? src.proof : [],
+                    closer:
+                      typeof src.closer === "string" ? src.closer : null,
+                  },
+                }));
+              }
+            }
+          } catch (error) {
+            /* best-effort — retry on the schedule until tries run out */
+          }
+          if (!cancelled && !ready) scheduleNext();
+        })();
+      }
+
+      scheduleNext();
+    } catch (error) {
+      /* best-effort — polling must never break the page */
+    }
+    return () => {
+      cancelled = true;
+      if (extendedTimerRef.current) {
+        clearTimeout(extendedTimerRef.current);
+        extendedTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentOfferId]);
+
   // Clear the brief-success timer if the extension unmounts mid-transition.
   useEffect(
     () => () => {
@@ -377,13 +490,21 @@ export function App() {
       clearTimeout(advanceTimerRef.current);
       advanceTimerRef.current = null;
     }
-    setProcessing(false);
-    setJustAccepted(false);
-    setErrorText(null);
+    // Terminal condition FIRST: when the countdown expired or this was the
+    // last page there is no incoming page to prepare — call safeDone() and
+    // leave processing/justAccepted/calculatedTotal untouched so the success
+    // state is not wiped (flashing back to an actionable-looking page) while
+    // Shopify dismisses the page.
     if (expiredRef.current || safeIndex + 1 >= offers.length) {
       safeDone();
       return;
     }
+    setProcessing(false);
+    setJustAccepted(false);
+    setErrorText(null);
+    // Clear in the same batch as the page change so the incoming product
+    // never renders the previous page's calculated total for one frame.
+    setCalculatedTotal(null);
     setPageIndex(safeIndex + 1);
   }
 
@@ -413,8 +534,9 @@ export function App() {
         );
       }
       const result = await applyChangeset(signed.token);
-      const status = result && result.status ? String(result.status) : "";
-      if (status.toLowerCase() === "unprocessed") {
+      const status =
+        result && result.status ? String(result.status).toLowerCase() : "";
+      if (status === "unprocessed") {
         const detail =
           result && Array.isArray(result.errors) && result.errors.length > 0
             ? result.errors
@@ -424,16 +546,28 @@ export function App() {
             : "Changeset was not processed";
         throw new Error(detail || "Changeset was not processed");
       }
-      const revenue = round2(
-        offer.products.reduce((sum, p) => sum + toAmount(p.discountedPrice), 0),
-      );
-      sendEvent(token, {
+      // "partially_processed": the order WAS edited but the charge failed —
+      // Shopify runs its own payment recovery with the buyer, so the flow
+      // still advances as a success. Report zero revenue (with a marker) so
+      // analytics and the bandit never count unpaid revenue.
+      const partiallyProcessed = status === "partially_processed";
+      const revenue = partiallyProcessed
+        ? 0
+        : round2(
+            offer.products.reduce(
+              (sum, p) => sum + toAmount(p.discountedPrice),
+              0,
+            ),
+          );
+      const acceptedEvent = {
         referenceId,
         offerId: offer.offerId,
         eventType: "accepted",
         revenue,
         currency,
-      });
+      };
+      if (partiallyProcessed) acceptedEvent.message = "partially_processed";
+      sendEvent(token, acceptedEvent);
       setJustAccepted(true);
       // Brief success beat so the buyer sees the confirmation, then move on.
       advanceTimerRef.current = setTimeout(() => {
@@ -494,13 +628,28 @@ export function App() {
   const copy = offer.copy || { headline: "", body: "", bullets: [] };
   const bullets = Array.isArray(copy.bullets) ? copy.bullets.filter(Boolean) : [];
   // Long-form copy (optional): deep-dive paragraphs + one-line closer.
-  const paragraphs = Array.isArray(copy.paragraphs)
-    ? copy.paragraphs.filter((p) => typeof p === "string" && p.trim().length > 0)
+  // When the server deferred it (extendedPending), the polled result stored
+  // in extendedByOfferId fills the gap; inline copy always wins when present.
+  const extended =
+    (currentOfferId && extendedByOfferId[currentOfferId]) || null;
+  const paragraphsSrc =
+    Array.isArray(copy.paragraphs) &&
+    copy.paragraphs.some((p) => typeof p === "string" && p.trim().length > 0)
+      ? copy.paragraphs
+      : (extended && extended.paragraphs) || [];
+  const paragraphs = Array.isArray(paragraphsSrc)
+    ? paragraphsSrc.filter(
+        (p) => typeof p === "string" && p.trim().length > 0,
+      )
     : [];
   // Research statements (optional): rendered under the paragraphs with their
   // own sub-heading. Coerce finite numbers, drop anything else non-string.
-  const proof = Array.isArray(copy.proof)
-    ? copy.proof
+  const proofSrc =
+    Array.isArray(copy.proof) && copy.proof.length > 0
+      ? copy.proof
+      : (extended && extended.proof) || [];
+  const proof = Array.isArray(proofSrc)
+    ? proofSrc
         .map((item) =>
           typeof item === "string"
             ? item
@@ -510,9 +659,15 @@ export function App() {
         )
         .filter((item) => item.trim().length > 0)
     : [];
-  const closer =
+  const closerSrc =
     typeof copy.closer === "string" && copy.closer.trim().length > 0
       ? copy.closer
+      : extended
+        ? extended.closer
+        : null;
+  const closer =
+    typeof closerSrc === "string" && closerSrc.trim().length > 0
+      ? closerSrc
       : null;
   const discountPct = Math.round(toAmount(offer.discountPct));
   const showComparePrice = ui.showComparePrice !== false;

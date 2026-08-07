@@ -30,9 +30,13 @@ import {
 import { getSettings } from "./settings.server";
 import { selectOffers } from "./recommendation.server";
 import {
+  completeExtendedCopy,
   fallbackCopy,
+  generateBuyerCopy,
   generateCopy,
   getUiStrings,
+  peekDiscountSuggestion,
+  withOfferDescriptions,
   type GenerateCopyArgs,
   type PromptKey,
 } from "./ai.server";
@@ -44,6 +48,26 @@ import {
 
 /** Issued offers can be signed for up to 2 hours after they were assembled. */
 const OFFER_TTL_MS = 2 * 60 * 60 * 1000;
+
+/** Where each page's copy actually came from — surfaced in admin previews. */
+export interface PageCopyDiagnostic {
+  position: number;
+  source: "ai" | "cache" | "fallback" | "reused" | "no_discount_fallback";
+  reason?: string;
+}
+
+/**
+ * Caller options for assembleOfferResponse. The buyer path passes nothing
+ * (strict aiTimeoutMs budget — ShouldRender must answer fast); admin previews
+ * pass a generous copyTimeoutMs so they always show REAL AI copy, plus a
+ * diagnostics array to receive per-page copy provenance.
+ */
+export interface AssembleOfferOptions {
+  copyTimeoutMs?: number;
+  diagnostics?: PageCopyDiagnostic[];
+  /** Out-param: how the response language was chosen (admin preview trace). */
+  languageResolution?: { language: string; source: LanguageSource };
+}
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 
@@ -68,31 +92,45 @@ function randomCode(length: number): string {
   return out;
 }
 
+export type LanguageSource = "buyer_locale" | "market_override" | "store_default";
+
 /**
- * Language resolution chain: market override → exact match of the buyer
- * locale against the store languages → case-insensitive match → base-prefix
- * match ("pt-PT" matches "pt", "fr-CA" matches "fr") → store default.
+ * Language resolution: the buyer's OWN checkout locale wins whenever it maps
+ * to an enabled store language (exact → case-insensitive → base-prefix,
+ * "pt-PT" matches "pt"). A market languageOverride applies only when the
+ * buyer locale is missing or not an enabled language — a buyer who checked
+ * out in English must never be flipped to another language by their shipping
+ * country (that produced "German product names in an English preview").
+ * Falls back to the store default.
  */
+function resolveLanguageWithSource(
+  locale: string | null | undefined,
+  settings: AppSettings,
+  marketLanguageOverride: string | null | undefined,
+): { language: string; source: LanguageSource } {
+  const languages = Array.isArray(settings.languages) ? settings.languages : [];
+  const loc = String(locale ?? "").trim();
+  if (loc.length > 0) {
+    const exact = languages.find((l) => l === loc);
+    if (exact) return { language: exact, source: "buyer_locale" };
+    const ci = languages.find((l) => l.toLowerCase() === loc.toLowerCase());
+    if (ci) return { language: ci, source: "buyer_locale" };
+    const base = loc.split("-")[0].toLowerCase();
+    const prefix = languages.find((l) => l.toLowerCase().split("-")[0] === base);
+    if (prefix) return { language: prefix, source: "buyer_locale" };
+  }
+  if (marketLanguageOverride && marketLanguageOverride.trim().length > 0) {
+    return { language: marketLanguageOverride.trim(), source: "market_override" };
+  }
+  return { language: settings.defaultLanguage || "en", source: "store_default" };
+}
+
 function resolveLanguage(
   locale: string | null | undefined,
   settings: AppSettings,
   marketLanguageOverride: string | null | undefined,
 ): string {
-  if (marketLanguageOverride && marketLanguageOverride.trim().length > 0) {
-    return marketLanguageOverride.trim();
-  }
-  const languages = Array.isArray(settings.languages) ? settings.languages : [];
-  const loc = String(locale ?? "").trim();
-  if (loc.length > 0) {
-    const exact = languages.find((l) => l === loc);
-    if (exact) return exact;
-    const ci = languages.find((l) => l.toLowerCase() === loc.toLowerCase());
-    if (ci) return ci;
-    const base = loc.split("-")[0].toLowerCase();
-    const prefix = languages.find((l) => l.toLowerCase().split("-")[0] === base);
-    if (prefix) return prefix;
-  }
-  return settings.defaultLanguage || "en";
+  return resolveLanguageWithSource(locale, settings, marketLanguageOverride).language;
 }
 
 /** Best-effort translated title lookup from the catalog translations map. */
@@ -145,6 +183,21 @@ async function safeGetUiStrings(
   } catch (error) {
     console.error(`[orchestrator] getUiStrings failed for ${shop}/${language}`, error);
     return { ...DEFAULT_UI_STRINGS_EN };
+  }
+}
+
+/**
+ * Ground a deterministic-fallback's args in real product text (fills
+ * offerDescriptions via ai.server's withOfferDescriptions, a no-op for short
+ * copy). Guarded: a lookup failure degrades to the ungrounded args instead
+ * of throwing — fallback paths run on the public never-throw contract.
+ */
+async function groundedCopyArgs(copyArgs: GenerateCopyArgs): Promise<GenerateCopyArgs> {
+  try {
+    return await withOfferDescriptions(copyArgs);
+  } catch (error) {
+    console.error(`[orchestrator] fallback grounding failed for ${copyArgs.shop}`, error);
+    return copyArgs;
   }
 }
 
@@ -260,6 +313,71 @@ async function persistIssuedOffer(args: {
   });
 }
 
+/**
+ * Background stage for pages issued with extendedPending: generate the
+ * below-CTA sections (paragraphs/proof) via completeExtendedCopy, then PATCH
+ * the stored IssuedOffer meta so /api/offer-extended (and stored-page reuse
+ * for the same referenceId) serve the completed copy. Every step is guarded —
+ * this must never affect the request path; a failure simply leaves the page
+ * permanently on its (complete-in-itself) core copy.
+ */
+async function patchExtendedCopy(args: {
+  shop: string;
+  referenceId: string;
+  offerId: string;
+  copyArgs: GenerateCopyArgs;
+  coreCopy: OfferCopy;
+  /** The fast core call's suggestion — persisted when the merged CopyCache
+   *  row is created, so the NEXT assembly's peek can converge on it. */
+  coreDiscountSuggestion: number | null;
+}): Promise<void> {
+  try {
+    const extended = await completeExtendedCopy(
+      args.copyArgs,
+      args.coreCopy,
+      args.coreDiscountSuggestion,
+    );
+    if (!extended) return;
+    // Read-modify-write inside ONE transaction so a concurrent writer (e.g. a
+    // GDPR scrub nulling customerId) is never resurrected or clobbered: the
+    // merge starts from the FRESH meta and touches ONLY the extended keys.
+    await prisma.$transaction(async (tx) => {
+      const row = await tx.issuedOffer.findUnique({
+        where: {
+          referenceId_offerId: { referenceId: args.referenceId, offerId: args.offerId },
+        },
+      });
+      if (!row || row.shop !== args.shop) return;
+      const meta = jparse<any>(row.offerMetaJson, null);
+      if (!meta || typeof meta !== "object") return;
+      const page = meta.page;
+      if (!page || typeof page !== "object" || !page.copy || typeof page.copy !== "object") {
+        return;
+      }
+      page.copy.paragraphs = extended.paragraphs;
+      page.copy.proof = extended.proof;
+      // The buyer already saw the core closer — only fill it in when the core
+      // stage produced none and the extended stage did.
+      const coreCloser =
+        typeof page.copy.closer === "string" ? page.copy.closer.trim() : "";
+      if (!coreCloser && extended.closer) page.copy.closer = extended.closer;
+      page.extendedPending = false;
+      meta.extendedReady = true;
+      await tx.issuedOffer.update({
+        where: {
+          referenceId_offerId: { referenceId: args.referenceId, offerId: args.offerId },
+        },
+        data: { offerMetaJson: jstr(meta) },
+      });
+    });
+  } catch (error) {
+    console.error(
+      `[orchestrator] extended copy patch failed for ${args.shop} ${args.referenceId}/${args.offerId}`,
+      error,
+    );
+  }
+}
+
 // ── Post-purchase offer assembly ─────────────────────────────────────────────
 
 async function buildOfferPage(args: {
@@ -273,6 +391,7 @@ async function buildOfferPage(args: {
   basket: { title: string; productType: string; quantity: number; description: string }[];
   catalogById: Map<string, CatalogProduct>;
   marketHandle: string | null;
+  options?: AssembleOfferOptions;
 }): Promise<OfferPage | null> {
   const {
     ctx,
@@ -285,6 +404,7 @@ async function buildOfferPage(args: {
     basket,
     catalogById,
     marketHandle,
+    options,
   } = args;
 
   // Attach translated titles and drop any product whose variant id cannot be
@@ -318,35 +438,89 @@ async function buildOfferPage(args: {
     discountPct: offer.discountPct,
     currency: ctx.currency,
     copyLength: selection.copyLength,
+    ...(options?.copyTimeoutMs ? { timeoutMs: options.copyTimeoutMs } : {}),
   };
 
   let copy: OfferCopy;
   let discountSuggestion: number | null = null;
-  if (Math.round(offer.discountPct) <= 0) {
+  let extendedPending = false;
+  // The working discount for EVERYTHING on this page — prompt, prices,
+  // changes, title. INVARIANT: this pct always equals the pct the copy was
+  // generated with; copy and charge can never disagree.
+  let discountPct = offer.discountPct;
+
+  if (Math.round(discountPct) <= 0) {
     // Legal config (fixed value 0): the AI prompts mandate mentioning the
     // discount, which would surface as "0% off" copy — use the deterministic
     // fallback (which omits discount phrasing entirely) and skip the AI call.
-    copy = fallbackCopy(copyArgs, strings);
+    copy = fallbackCopy(await groundedCopyArgs(copyArgs), strings);
+    options?.diagnostics?.push({ position: offer.position, source: "no_discount_fallback" });
   } else {
-    try {
-      const generated = await generateCopy(copyArgs);
-      copy = generated.copy;
-      discountSuggestion = generated.discountSuggestion;
-    } catch (error) {
-      console.error(`[orchestrator] generateCopy failed for ${ctx.shop}`, error);
-      copy = fallbackCopy(copyArgs, strings);
+    // AI-mode discount convergence: a suggestion stored by a PREVIOUS
+    // generation (peeked at the baseline pct's cache key) switches the
+    // working pct BEFORE any copy is produced, so the prompt, the cache key,
+    // the views, the changes and the title all speak the same number. The
+    // switched pct cache-misses at its new key and the copy regenerates AT
+    // that pct (then caches, converging every later assembly). Suggestions
+    // returned by the calls below are only PERSISTED (short copy via the
+    // generateBuyerCopy cache write, long copy via completeExtendedCopy's
+    // create) — never applied to a page whose copy said a different pct.
+    if (settings.discount.mode === "ai") {
+      const peeked = await peekDiscountSuggestion(copyArgs);
+      if (peeked != null) {
+        const clamped = clampDiscount(peeked, settings);
+        if (clamped !== discountPct) {
+          discountPct = clamped;
+          copyArgs.discountPct = clamped;
+        }
+      }
     }
-  }
 
-  // AI-adjusted discount: clamp Claude's suggestion into [min,max] and
-  // recompute prices (views/changes below are derived from the final pct).
-  let discountPct = offer.discountPct;
-  if (
-    settings.discount.mode === "ai" &&
-    discountSuggestion != null &&
-    Number.isFinite(discountSuggestion)
-  ) {
-    discountPct = clampDiscount(discountSuggestion, settings);
+    if (options?.copyTimeoutMs) {
+      // Admin preview (generous copyTimeoutMs): one-shot generation so the
+      // preview always shows the REAL, complete AI copy — no background stage.
+      try {
+        const generated = await generateCopy(copyArgs);
+        copy = generated.copy;
+        discountSuggestion = generated.discountSuggestion;
+        options?.diagnostics?.push({
+          position: offer.position,
+          source: generated.cached ? "cache" : generated.fallbackUsed ? "fallback" : "ai",
+          reason: generated.reason,
+        });
+      } catch (error) {
+        console.error(`[orchestrator] generateCopy failed for ${ctx.shop}`, error);
+        copy = fallbackCopy(await groundedCopyArgs(copyArgs), strings);
+        options?.diagnostics?.push({
+          position: offer.position,
+          source: "fallback",
+          reason: "exception",
+        });
+      }
+    } else {
+      // Buyer path (hard ShouldRender time budget): fast CORE copy now; for
+      // long copyLength the below-CTA sections (paragraphs/proof) complete in
+      // the background and the extension polls /api/offer-extended for them.
+      try {
+        const generated = await generateBuyerCopy(copyArgs);
+        copy = generated.copy;
+        discountSuggestion = generated.discountSuggestion;
+        extendedPending = generated.extendedPending;
+        options?.diagnostics?.push({
+          position: offer.position,
+          source: generated.cached ? "cache" : generated.fallbackUsed ? "fallback" : "ai",
+          reason: generated.reason,
+        });
+      } catch (error) {
+        console.error(`[orchestrator] generateBuyerCopy failed for ${ctx.shop}`, error);
+        copy = fallbackCopy(await groundedCopyArgs(copyArgs), strings);
+        options?.diagnostics?.push({
+          position: offer.position,
+          source: "fallback",
+          reason: "exception",
+        });
+      }
+    }
   }
 
   // Neutral (empty) title when there is no discount — never "0% off".
@@ -381,6 +555,8 @@ async function buildOfferPage(args: {
     copy,
     changes,
     position: offer.position,
+    // Only set when true — absent/false means the copy is complete.
+    ...(extendedPending ? { extendedPending: true } : {}),
   };
   await persistIssuedOffer({
     ctx,
@@ -404,6 +580,25 @@ async function buildOfferPage(args: {
       page,
     },
   });
+
+  if (extendedPending) {
+    // Only AFTER the row exists: complete the extended sections in the
+    // background and patch the stored meta. Fire-and-forget — the buyer-
+    // blocking request path must never wait on (or fail because of) this.
+    void patchExtendedCopy({
+      shop: ctx.shop,
+      referenceId: ctx.referenceId,
+      offerId,
+      copyArgs,
+      coreCopy: copy,
+      coreDiscountSuggestion: discountSuggestion,
+    }).catch((error) =>
+      console.error(
+        `[orchestrator] extended copy background task failed for ${ctx.shop}`,
+        error,
+      ),
+    );
+  }
 
   return page;
 }
@@ -478,11 +673,19 @@ async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferRespo
   }
 }
 
-export async function assembleOfferResponse(ctx: PurchaseContext): Promise<OfferResponse> {
+export async function assembleOfferResponse(
+  ctx: PurchaseContext,
+  options?: AssembleOfferOptions,
+): Promise<OfferResponse> {
   // Idempotency first: a re-fetch for a referenceId we already issued offers
   // for returns the stored pages — no new selection, no new rows.
   const stored = await findStoredOfferResponse(ctx);
-  if (stored) return stored;
+  if (stored) {
+    for (const page of stored.offers) {
+      options?.diagnostics?.push({ position: page.position, source: "reused" });
+    }
+    return stored;
+  }
 
   let settings: AppSettings | null = null;
   let selection: SelectionResult | null = null;
@@ -494,7 +697,13 @@ export async function assembleOfferResponse(ctx: PurchaseContext): Promise<Offer
     settings = await getSettings(ctx.shop);
     const market = await findMarketForCountry(ctx.shop, ctx.countryCode);
     marketHandle = market?.marketHandle ?? null;
-    language = resolveLanguage(ctx.locale, settings, market?.languageOverride ?? null);
+    const resolved = resolveLanguageWithSource(
+      ctx.locale,
+      settings,
+      market?.languageOverride ?? null,
+    );
+    language = resolved.language;
+    if (options) options.languageResolution = resolved;
     strings = await safeGetUiStrings(ctx.shop, language);
     try {
       selection = await selectOffers(ctx, settings);
@@ -543,6 +752,7 @@ export async function assembleOfferResponse(ctx: PurchaseContext): Promise<Offer
         basket,
         catalogById,
         marketHandle,
+        options,
       });
       if (page) response.offers.push(page);
     } catch (error) {
@@ -572,6 +782,9 @@ const DISCOUNT_CODE_BASIC_CREATE = `#graphql
   }
 `;
 
+/** How long a thank-you discount code stays redeemable after minting. */
+const THANK_YOU_CODE_TTL_MS = 48 * 60 * 60 * 1000;
+
 /** Create a one-time discount code for the thank-you offer. Best-effort. */
 async function createThankYouDiscount(
   graphql: AdminGraphql,
@@ -579,16 +792,16 @@ async function createThankYouDiscount(
   code: string,
   discountPct: number,
   productId: string,
+  endsAt: string,
 ): Promise<boolean> {
   try {
-    const now = new Date();
     const response = await graphql(DISCOUNT_CODE_BASIC_CREATE, {
       variables: {
         basicCodeDiscount: {
           title: `Cellexia thank-you offer ${code}`,
           code,
-          startsAt: now.toISOString(),
-          endsAt: new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString(),
+          startsAt: new Date().toISOString(),
+          endsAt,
           usageLimit: 1,
           appliesOncePerCustomer: true,
           customerSelection: { all: true },
@@ -617,13 +830,18 @@ const THANK_YOU_HOURLY_CAP = 20;
 /**
  * Rebuild a previously issued thank-you offer from its stored meta so a page
  * refresh (or a replayed request) returns the SAME offer instead of minting a
- * fresh discount code. Returns null when the stored meta predates the
- * `productView`/`copy`/`checkoutUrl` fields needed for reconstruction.
+ * fresh discount code. When the stored code's `discountEndsAt` has passed,
+ * the rebuilt offer degrades exactly like a failed mint — full price, no
+ * code, plain product URL, deterministic pct-0 copy — never a promise of a
+ * discount the buyer can no longer redeem. Returns null when the stored meta
+ * predates the `productView`/`copy`/`checkoutUrl` fields needed for
+ * reconstruction.
  */
 async function rebuildStoredThankYouOffer(
   ctx: PurchaseContext,
   row: { offerId: string; referenceId: string },
   meta: any,
+  settings: AppSettings,
 ): Promise<ThankYouOffer | null> {
   const view = meta?.productView;
   const copy = meta?.copy;
@@ -640,6 +858,60 @@ async function rebuildStoredThankYouOffer(
   const language = typeof meta?.language === "string" && meta.language ? meta.language : "en";
   const strings = await safeGetUiStrings(ctx.shop, language);
   const discountPct = Number(meta?.discountPct);
+  const discountCode = typeof meta?.discountCode === "string" ? meta.discountCode : "";
+  const checkoutUrl = typeof meta?.checkoutUrl === "string" ? meta.checkoutUrl : "";
+  const currency =
+    typeof meta?.currency === "string" && meta.currency ? meta.currency : ctx.currency;
+
+  // Expired discount code: rows minted before `discountEndsAt` existed have
+  // no expiry stored and round-trip as before; an unparseable date never
+  // triggers the degrade (NaN comparisons are false).
+  const endsAtMs =
+    discountCode && typeof meta?.discountEndsAt === "string"
+      ? Date.parse(meta.discountEndsAt)
+      : Number.NaN;
+  if (Number.isFinite(endsAtMs) && endsAtMs <= Date.now()) {
+    const priceNum = Number(view.price);
+    const fullPriceProduct: SelectedOfferProduct = {
+      productId: typeof view.productId === "string" ? view.productId : "",
+      variantId: typeof view.variantId === "string" ? view.variantId : "",
+      title: typeof view.title === "string" ? view.title : "",
+      image: typeof view.image === "string" ? view.image : null,
+      price: Number.isFinite(priceNum) ? priceNum : 0,
+      compareAtPrice: null,
+      unitCost: null,
+      productType: "",
+      tags: [],
+    };
+    const copyArgs: GenerateCopyArgs = {
+      shop: ctx.shop,
+      settings,
+      mode: "single",
+      position: 1,
+      totalOffers: 1,
+      language,
+      basket: [],
+      offerProducts: [fullPriceProduct],
+      discountPct: 0,
+      currency,
+      copyLength: "short",
+    };
+    return {
+      offerId: row.offerId,
+      referenceId: row.referenceId,
+      product: { ...(view as OfferProductView), discountedPrice: view.price },
+      discountPct: 0,
+      discountCode: "",
+      // Strip the ?discount=CODE query — the plain product/cart URL remains.
+      checkoutUrl: checkoutUrl.split("?")[0],
+      // discountPct is 0 here — deterministic fallback copy cannot promise a
+      // discount the way the stored AI copy does.
+      copy: fallbackCopy(copyArgs, strings),
+      strings,
+      language,
+      currency,
+    };
+  }
   // Optional copy fields round-trip verbatim: a rebuilt offer must render
   // exactly like the original, so stored paragraphs/closer are never stripped.
   const rebuiltCopy: OfferCopy = {
@@ -662,12 +934,12 @@ async function rebuildStoredThankYouOffer(
     referenceId: row.referenceId,
     product: view as OfferProductView,
     discountPct: Number.isFinite(discountPct) ? discountPct : 0,
-    discountCode: typeof meta?.discountCode === "string" ? meta.discountCode : "",
-    checkoutUrl: typeof meta?.checkoutUrl === "string" ? meta.checkoutUrl : "",
+    discountCode,
+    checkoutUrl,
     copy: rebuiltCopy,
     strings,
     language,
-    currency: typeof meta?.currency === "string" && meta.currency ? meta.currency : ctx.currency,
+    currency,
   };
 }
 
@@ -708,7 +980,7 @@ export async function assembleThankYouOffer(
         }
         const slotMeta = jparse<any>(slotRow.offerMetaJson, null);
         const rebuilt = slotMeta
-          ? await rebuildStoredThankYouOffer(ctx, slotRow, slotMeta)
+          ? await rebuildStoredThankYouOffer(ctx, slotRow, slotMeta, settings)
           : null;
         if (!rebuilt) {
           console.warn(
@@ -738,7 +1010,7 @@ export async function assembleThankYouOffer(
         if (gidToNumber(row.referenceId) !== numericRef) continue;
         const meta = jparse<any>(row.offerMetaJson, null);
         if (!meta || meta.surface !== "thank_you") continue;
-        const rebuilt = await rebuildStoredThankYouOffer(ctx, row, meta);
+        const rebuilt = await rebuildStoredThankYouOffer(ctx, row, meta, settings);
         if (!rebuilt) {
           console.warn(
             `[orchestrator] existing thank-you offer ${row.offerId} for ${ctx.shop} cannot be rebuilt — refusing to mint another code`,
@@ -797,17 +1069,24 @@ export async function assembleThankYouOffer(
     let discountPct = offer.discountPct;
     let discountCode = "";
     let checkoutUrl = productUrl;
+    // ISO expiry of the minted code — persisted in the meta so a slot reuse
+    // after the code lapses degrades to full price instead of promising a
+    // discount the buyer can no longer redeem.
+    let discountEndsAt: string | null = null;
     if (graphql && discountPct > 0) {
       const code = `THANKYOU-${randomCode(6)}`;
+      const endsAt = new Date(Date.now() + THANK_YOU_CODE_TTL_MS).toISOString();
       const created = await createThankYouDiscount(
         graphql,
         ctx.shop,
         code,
         discountPct,
         product.productId,
+        endsAt,
       );
       if (created) {
         discountCode = code;
+        discountEndsAt = endsAt;
         checkoutUrl = `https://${ctx.shop}/cart/${variantNumericId}:1?discount=${encodeURIComponent(code)}`;
       }
     }
@@ -865,6 +1144,7 @@ export async function assembleThankYouOffer(
           products: [metaProduct(enriched)],
           discountPct,
           discountCode,
+          discountEndsAt,
           checkoutUrl,
           productView,
           copy,
@@ -889,7 +1169,7 @@ export async function assembleThankYouOffer(
         if (winner && winner.shop === ctx.shop) {
           const winnerMeta = jparse<any>(winner.offerMetaJson, null);
           if (winnerMeta) {
-            const rebuilt = await rebuildStoredThankYouOffer(ctx, winner, winnerMeta);
+            const rebuilt = await rebuildStoredThankYouOffer(ctx, winner, winnerMeta, settings);
             if (rebuilt) {
               if (discountCode) {
                 console.warn(

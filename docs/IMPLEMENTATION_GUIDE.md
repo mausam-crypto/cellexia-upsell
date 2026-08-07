@@ -31,6 +31,7 @@ read [MERCHANT_GUIDE.md](MERCHANT_GUIDE.md).
 19. [GDPR / privacy notes](#19-gdpr--privacy-notes)
 20. [Known dependency advisories](#20-known-dependency-advisories)
 21. [The offer copy JSON contract (prompt editing)](#21-the-offer-copy-json-contract-prompt-editing)
+22. [The two-stage copy pipeline & Anthropic API notes](#22-the-two-stage-copy-pipeline--anthropic-api-notes)
 
 ---
 
@@ -80,15 +81,20 @@ What's already configured in `shopify.app.toml` (do not remove):
 - `embedded = true` — the admin UI runs embedded in the Shopify admin.
 - `[access_scopes] scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,write_discounts"`
 - `[webhooks] api_version = "2026-01"` with subscriptions for
-  `app/uninstalled`, `app/scopes_update`, `orders/create`, `products/create`,
-  `products/update`, `products/delete`, and the three GDPR compliance topics —
+  `app/uninstalled`, `app/scopes_update`, `orders/create`, `orders/updated`
+  (payment-recovery revenue backfill: an accepted upsell whose one-click
+  charge initially failed is recorded with zero revenue; when Shopify's
+  payment recovery later collects and the order turns `paid`, the withheld
+  revenue is restored), `products/create`, `products/update`,
+  `products/delete`, and the three GDPR compliance topics —
   all delivered to `/webhooks` (handled by `app/routes/webhooks.tsx`).
 - `include_config_on_deploy = true` — `shopify app deploy` pushes this config
   (scopes, webhook subscriptions) to Shopify, so webhooks need no manual
   registration.
 
 `shopify.web.toml` tells the CLI how to run the web process:
-`predev = "npx prisma generate && npx prisma db push"` (so the SQLite schema is
+`predev = "npm run ensure-env && npx prisma generate && npx prisma db push"`
+(so a missing `.env` is created from `.env.example` and the SQLite schema is
 always up to date before dev starts) and `dev = "npx remix vite:dev"`.
 
 ## 4. Environment variables (.env)
@@ -117,9 +123,15 @@ cp .env.example .env
 
 ```bash
 npm install        # also runs `prisma generate` via postinstall
-npm run setup      # prisma generate && prisma db push  → creates dev.sqlite
+npm run setup      # ensure-env && prisma generate && prisma db push  → creates dev.sqlite
 npm run dev        # shopify app dev
 ```
+
+Both `npm run setup` and the `predev` hook that runs before `npm run dev`
+start with `npm run ensure-env`: if no `.env` exists yet, one is created
+automatically from `.env.example` (you still have to fill in
+`ANTHROPIC_API_KEY`, see §4 — the copy just stops the Prisma
+`DATABASE_URL`-missing crash on a fresh clone).
 
 `npm run dev` starts the Remix server behind a Shopify-managed tunnel, watches
 both extensions, and prints a preview URL. Keep it running for the next steps.
@@ -160,6 +172,14 @@ everything (all products, full descriptions, and every language's translated
 names). Day-to-day product edits take care of themselves; run a full Sync
 after bulk imports or bulk translation work in Translate & Adapt.
 
+Locale syncing is **additive with curation**: each sync adds a published
+Shopify locale to Settings → Languages only the *first* time it sees it
+(seen locales are tracked in `settings.knownShopifyLocales`). If you then
+remove a language in Settings → Languages, later syncs will **not** re-add
+it — merchant curation survives re-syncs. Publishing a brand-new locale in
+Shopify → Settings → Languages makes it appear in the app after the next
+sync (bootstrap or dashboard **Sync**).
+
 ## 7. Enable the post-purchase page
 
 Shopify only renders ONE app on the post-purchase page, and the merchant must
@@ -195,8 +215,11 @@ const APP_URL = "https://REPLACE-WITH-YOUR-APP-URL.example.com";
   fails, the try/catch returns `{ render: false }`, and buyers silently never
   see offers.
 
-The extension calls three endpoints on that host, all implemented in this
+The extension calls four endpoints on that host, all implemented in this
 repo: `POST /api/offer` (`app/routes/api.offer.tsx`),
+`POST /api/offer-extended` (`app/routes/api.offer-extended.tsx` — polled for
+the below-CTA sections when a page ships with `extendedPending`, see
+[§22](#22-the-two-stage-copy-pipeline--anthropic-api-notes)),
 `POST /api/sign-changeset` (`app/routes/api.sign-changeset.tsx`) and
 `POST /api/events` (`app/routes/api.events.tsx`). All are authenticated with
 the JWT Shopify hands the extension (`inputData.token`) — see
@@ -223,6 +246,13 @@ The block calls `POST /api/typ-offer` (`app/routes/api.typ-offer.tsx`) with the
 buyer session token; the server responds with a single offer plus a one-time
 48-hour discount code and a prefilled cart permalink. It renders for **all**
 payment methods, which is exactly why it exists (see §16).
+
+The order id the block sends is only a lookup key — it is verified
+server-side by an **ownership + recency guard**: the order must exist for
+*this* shop (the webhook-captured `OrderRecord`, or one admin API lookup as
+fallback) **and** must have been placed recently. Old or foreign order ids
+get `{ offer: null }`, so a captured session token or replayed request
+cannot mint discount codes against stale orders long after checkout.
 
 ## 10. Test with Shopify's test credit card
 
@@ -560,6 +590,7 @@ Work through this on a dev store before go-live:
 |---|---|
 | `npm run setup` or `npm run dev` fails with `Validation Error Count: 1 [Context: getConfig]` / `Environment variable not found: DATABASE_URL` | No `.env` file yet. Since v1.4 the setup scripts create one automatically from `.env.example`; on older copies run `cp .env.example .env` first. |
 | `shopify app dev` exits complaining about the client ID / can't find the app | `shopify.app.toml` still has the placeholder `client_id`. Run `shopify app config link` (§3) after creating the app in the Partner Dashboard — the CLI fills it in. |
+| Advanced Preview (or a buyer page) shows fallback copy with a valid API key | Much rarer since the two-stage pipeline ([§22](#22-the-two-stage-copy-pipeline--anthropic-api-notes)): the blocking call now generates only the above-the-fold core copy with the fast `coreCopyModel` (≈2s), so even the FIRST buyer of a basket normally gets real AI copy — only the below-CTA sections arrive a few seconds later via `/api/offer-extended`, and repeat baskets get everything instantly from `CopyCache`. Persistent fallback therefore signals a real problem: check server logs for `[ai]` errors — `anthropic output truncated (stop_reason=max_tokens)` means the template's max tokens is too low; `anthropic refused the request` means the request was declined. The admin Preview waits up to 30s and reports the true cause (v1.4.2+); "timeout_or_error" there with a valid key means a real API error — check server logs. |
 | Extension bundling fails resolving `react-reconciler` | Run `npm install` from the repo root (workspaces install it); the dependency is pinned in `extensions/thank-you-upsell/package.json` — do not remove it. |
 
 
@@ -618,6 +649,10 @@ Check in this order — the first four cover ~90% of cases:
 - `Settings → General → thank-you offers` disabled (`settings.thankYouEnabled`).
 - Network access not approved for production (§15) — works on dev stores,
   silently fails live.
+- The order is old — `/api/typ-offer` has an ownership + recency guard: it
+  only serves offers for orders that belong to the shop **and** were placed
+  recently. Revisiting an old thank-you / order-status page yields no offer
+  by design.
 - The block renders `null` on any missing data by design; check the browser
   console on the thank-you page and server logs for `[typ-offer]`.
 - Discount code creation requires the `write_discounts` scope — if the scope
@@ -628,7 +663,19 @@ Check in this order — the first four cover ~90% of cases:
 
 - The buyer's checkout `locale` is matched against Settings → Languages; add
   the locale (or its base language) there and make sure it's published in
-  Shopify → Settings → Languages.
+  Shopify → Settings → Languages. Note that the locale sync is curated: a
+  language you previously **removed** from Settings → Languages is never
+  re-added by a sync (`settings.knownShopifyLocales` remembers it was seen) —
+  re-add it manually in Settings if you want it back.
+- **Language precedence (changed):** the buyer's own checkout locale now
+  BEATS a market language override. A Settings → Markets language override
+  only applies when the buyer's locale is missing or doesn't map to any
+  enabled store language (exact → case-insensitive → base-language match,
+  e.g. `pt-PT` matches `pt`); otherwise the store default language is used.
+  A buyer who checks out in English is never flipped to another language by
+  their shipping country. If a market's buyers see the "wrong" language,
+  check which locale their storefront actually serves before touching the
+  override.
 - UI strings (buttons/labels) come from the Translations page — run
   "Auto-translate missing".
 - AI copy falls back to English-ish templates when `ANTHROPIC_API_KEY` is
@@ -721,7 +768,7 @@ preserve is (authoritative type: `OfferCopy` in `app/types.ts`):
 | `closer` | One-line premium reassurance | Directly **above the buttons** |
 | `paragraphs` | 2–3 short paragraphs — mechanism / proof / relevance-to-order | **Below the CTA**, under the "Why it works with your order" heading (the translatable `why_it_works` UI string) |
 | `proof` | 2–3 one-line **research statements** — established published findings about ingredients named in the brief; ingredient-level only, never product-level, no invented citations | Under the paragraphs, beneath the "What published research shows" subheading (the translatable `research_shows` UI string) |
-| `discount_suggestion` | number or `null` | Not rendered — only honored when Settings → Discount mode is *AI-adjusted*, then clamped to the [min, max] band |
+| `discount_suggestion` | number or `null` | Not rendered — only honored when Settings → Discount mode is *AI-adjusted*, then clamped to the [min, max] band. **Convergence guarantee:** a suggestion is never applied to the very offer it was generated for (that copy already names its discount); it is stored with the cached copy and picked up — via a cache peek, before copy generation — on the *next* assembly of the same basket/offer/language signature, so the discount a buyer is charged always equals the one their copy mentions |
 
 Rules that keep the pipeline healthy:
 
@@ -739,3 +786,57 @@ Rules that keep the pipeline healthy:
   are validated/truncated, and every failure path degrades to deterministic
   fallback copy. A broken prompt never breaks checkout — it just wastes the
   AI call, so use the Prompts page's **Preview** after any edit.
+
+## 22. The two-stage copy pipeline & Anthropic API notes
+
+### Two stages: blocking core, background extension
+
+Long copy is too much for the post-purchase time budget to generate in one
+blocking call, so the pipeline is split in two:
+
+1. **Core (blocking, ≈2s).** The buyer-facing request generates only the
+   above-the-fold copy — headline, lead, bullets, closer — with the fast model
+   configured in Settings → AI → **Core copy model**
+   (`settings.coreCopyModel`, default `claude-haiku-4-5`). This fits inside
+   the checkout time budget, so even the first-ever buyer of a basket gets
+   real AI copy instead of the deterministic fallback.
+2. **Extended (background).** The below-CTA sections — the "Why it works with
+   your order" `paragraphs` and the `proof` research block — are generated in
+   a background call with the **prompt template's own model** (latency doesn't
+   matter there). The offer page is delivered with `extendedPending: true`
+   (`OfferPage` in `app/types.ts`), and the post-purchase extension polls
+   `POST /api/offer-extended` (same JWT auth as `/api/offer`, keyed by the
+   issued offer's `referenceId` + `offerId`) and merges the sections in when
+   they are ready — the buyer sees them appear a few seconds later, below the
+   CTA, without any layout shift above the fold.
+
+The completed **full** result (core + extended) is written to `CopyCache`, so
+every repeat of the same basket/offer/language combination is served complete
+and instantly — no second stage, no polling. First-ever baskets are the only
+ones that see the staged fill-in.
+
+### Thinking-disabled + stop_reason (the silent-fallback root cause)
+
+Two Anthropic API behaviors used to cause silent fallback copy and are now
+handled explicitly in `claudeComplete`:
+
+- **`claude-sonnet-5` and `claude-opus-5` run adaptive thinking BY DEFAULT
+  when the `thinking` parameter is omitted, and `max_tokens` caps thinking +
+  output TOGETHER.** With a tight `max_tokens`, the model spent the budget
+  thinking, the long-form JSON was truncated with `stop_reason:
+  "max_tokens"`, failed to parse, and the pipeline silently served fallback
+  copy — this was the root cause of the "fallback copy with a valid API key"
+  reports. The app now sends `thinking: {"type": "disabled"}` for models
+  whose id starts with `claude-sonnet-5` or `claude-opus-5`, and sends **no**
+  `thinking` parameter for `claude-haiku-4-5` or any other model (older
+  models reject the field).
+- **`stop_reason` is checked on every response.** `"max_tokens"` throws
+  `anthropic output truncated (stop_reason=max_tokens) — raise the template's
+  max tokens`, and `"refusal"` throws `anthropic refused the request` — so a
+  truncated or refused generation now surfaces as an explicit logged error
+  (and a fallback the buyer never notices) instead of a silently garbled
+  parse.
+
+Also unchanged but worth restating: **no sampling parameters** —
+`temperature`, `top_p` and `top_k` are never sent (newer Claude models reject
+them with a 400); style is steered entirely through the prompts.

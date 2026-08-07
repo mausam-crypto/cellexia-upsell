@@ -1,9 +1,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/offer — called by the post-purchase extension's ShouldRender (and
 // again by Render in the Shop Pay re-fetch case) with the checkout JWT as
-// `Authorization: Bearer <token>`. Builds a PurchaseContext from the token's
-// input_data (the body may only supply referenceId as a fallback) and returns
-// the assembled OfferResponse. Never 500s — internal errors → `{ offers: [] }`.
+// `Authorization: Bearer <token>`. Builds a PurchaseContext EXCLUSIVELY from
+// the token's input_data — the request body is never read — and returns the
+// assembled OfferResponse. Never 500s — internal errors → `{ offers: [] }`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
@@ -25,20 +25,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const inputData: any = token?.input_data ?? {};
     const purchase: any = inputData?.initialPurchase ?? {};
 
-    let body: any = {};
-    try {
-      body = await request.json();
-    } catch {
-      body = {};
-    }
-    if (!body || typeof body !== "object") body = {};
-
     const shop: string =
       typeof inputData?.shop?.domain === "string" && inputData.shop.domain
         ? inputData.shop.domain
         : new URL(typeof token?.dest === "string" ? token.dest : "https://x").hostname;
 
-    const ctx = buildPurchaseContext(shop, inputData, purchase, body);
+    const ctx = buildPurchaseContext(shop, inputData, purchase);
     const response = await assembleOfferResponse(ctx);
     return cors(json(response));
   } catch (error) {
@@ -53,10 +45,9 @@ function buildPurchaseContext(
   shop: string,
   inputData: any,
   purchase: any,
-  body: any,
 ): PurchaseContext {
-  // Everything except referenceId comes exclusively from the verified token's
-  // input_data — the request body is untrusted. Shop money preferred (rule
+  // Everything comes exclusively from the verified token's input_data — the
+  // request body is untrusted and never read. Shop money preferred (rule
   // min/max totals, discount tiers and catalog prices are shop-currency, so
   // threshold math in presentment currency would be wrong); presentment only
   // when shopMoney is absent.
@@ -87,9 +78,15 @@ function buildPurchaseContext(
       title: typeof line?.product?.title === "string" ? line.product.title : undefined,
     });
   }
-  const referenceId = String(
-    purchase?.referenceId ?? body?.referenceId ?? crypto.randomUUID(),
-  );
+  // referenceId comes EXCLUSIVELY from the verified token's initialPurchase —
+  // a session token without one (e.g. a thank-you token) must never mint
+  // IssuedOffers under an attacker-chosen id from the request body.
+  const referenceId =
+    purchase?.referenceId !== null &&
+    purchase?.referenceId !== undefined &&
+    purchase?.referenceId !== ""
+      ? String(purchase.referenceId)
+      : crypto.randomUUID();
 
   return {
     shop,
@@ -101,8 +98,10 @@ function buildPurchaseContext(
       typeof purchase?.destinationCountryCode === "string" && purchase.destinationCountryCode
         ? purchase.destinationCountryCode
         : null,
+    // Missing locale stays empty so resolveLanguageWithSource applies the
+    // market override → store default chain instead of forcing English.
     locale:
-      typeof inputData?.locale === "string" && inputData.locale ? inputData.locale : "en",
+      typeof inputData?.locale === "string" && inputData.locale ? inputData.locale : "",
     currency,
     totalAmount,
     lineItems,

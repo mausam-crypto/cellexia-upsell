@@ -11,6 +11,7 @@ embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
+include_config_on_deploy = true
 
 [access_scopes]
 scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,write_discounts"
@@ -30,7 +31,7 @@ topics = ["app/uninstalled", "app/scopes_update"]
 uri = "/webhooks"
 
 [[webhooks.subscriptions]]
-topics = ["orders/create", "products/create", "products/update", "products/delete"]
+topics = ["orders/create", "orders/updated", "products/create", "products/update", "products/delete"]
 uri = "/webhooks"
 
 [[webhooks.subscriptions]]

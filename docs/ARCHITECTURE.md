@@ -71,6 +71,7 @@ app/
                                    (+ CopyCache), fallbackCopy, UI-string
                                    seeding/lookup/translation, DeepL client
     analytics.server.ts            recordExtensionEvent, recordOrderFromWebhook,
+                                   backfillPendingRevenue (payment recovery),
                                    dashboard stats, time series, breakdowns,
                                    experiment posteriors, CLV cohorts, toCsv
     offer-orchestrator.server.ts   assembleOfferResponse / assembleThankYouOffer
@@ -90,14 +91,23 @@ app/
     app.settings.tsx               Settings sections
     app.translations.tsx           UI-string editor + auto-translate
     api.offer.tsx                  POST: offers for a post-purchase checkout
+    api.offer-extended.tsx         POST: below-CTA copy sections (paragraphs/
+                                   proof) for a page that was delivered with
+                                   extendedPending — polled by the extension
     api.sign-changeset.tsx         POST: JWT for applyChangeset (server-side
                                    validated against IssuedOffer)
     api.events.tsx                 POST: impression/accepted/declined/error
     api.typ-offer.tsx              POST: thank-you offer + discount code
     webhooks.tsx                   All webhook topics incl. GDPR
     auth.$.tsx, _index.tsx         OAuth + login redirect
+    auth.login.tsx                 Shop-domain login form (Polaris-free — it
+                                   renders outside the embedded admin, before
+                                   any session exists)
   components/
     MiniChart.tsx                  Dependency-free SVG sparkline/area chart
+    PostPurchasePreview.tsx        Buyer-faithful replica of the post-purchase
+                                   page for the admin Preview (inert buttons,
+                                   no analytics; mirrors the extension layout)
 extensions/
   post-purchase-upsell/
     shopify.extension.toml         type = "checkout_post_purchase"
@@ -113,7 +123,8 @@ extensions/
     locales/en.default.json        extension name + static fallbacks
 prisma/schema.prisma               Schema (SQLite dev / Postgres prod)
 shopify.app.toml                   Scopes, webhooks (api 2026-01), URLs
-shopify.web.toml                   CLI: predev prisma, dev remix vite:dev
+shopify.web.toml                   CLI: predev ensure-env + prisma, dev remix
+                                   vite:dev
 .env.example                       Documented env vars
 ```
 
@@ -141,11 +152,19 @@ Checkout::PostPurchase::ShouldRender            extensions/post-purchase-upsell/
                                           │    frequency cap → market → suppression
                                           │    → rule match (bandit) | auto-pilot
                                           │    → discount → display mode
-                                          ├─ language resolution (market override →
-                                          │    locale match → default)
+                                          ├─ language resolution (buyer locale →
+                                          │    market override → store default)
                                           ├─ ai.getUiStrings(shop, language)
-                                          ├─ ai.generateCopy(...)  [CopyCache | Claude
-                                          │    | fallback + background warm]
+                                          ├─ ai.generateCopy(...)  two-stage:
+                                          │    CopyCache hit → full copy instantly
+                                          │    miss → blocking CORE call
+                                          │      (settings.coreCopyModel, ≈2s):
+                                          │      headline/lead/bullets/closer;
+                                          │      paragraphs/proof generated in the
+                                          │      background with the template's
+                                          │      model → page flagged
+                                          │      extendedPending
+                                          │    error/timeout → fallback copy
                                           └─ persist IssuedOffer (changesJson,
                                                offerMetaJson, expiresAt = now+2h)
                                                         │
@@ -156,6 +175,10 @@ Checkout::PostPurchase::ShouldRender            extensions/post-purchase-upsell/
 Render app (per offer page)
   mount → calculateChangeset({changes})   (accurate presentment totals)
         → POST /api/events {impression}
+        → if extendedPending: poll POST /api/offer-extended
+            {referenceId, offerId}  ──▶  api.offer-extended.tsx
+            until paragraphs/proof are ready, then merge them in
+            below the CTA (above-the-fold layout never shifts)
   accept → POST /api/sign-changeset {referenceId, offerId}
               └▶ api.sign-changeset.tsx: load *non-expired* IssuedOffer,
                  jwt.sign({iss: API_KEY, jti, sub: referenceId,
@@ -185,7 +208,12 @@ extensions/thank-you-upsell/src/ThankYou.jsx
 app/routes/api.typ-offer.tsx
   authenticate.public.checkout → shop from sessionToken.dest
   settings.thankYouEnabled? ── no ──▶ { offer: null }
-  ctx (surface "thank_you", referenceId "typ:<orderId|uuid>")
+  ownership + recency guard: the body's orderId is only a lookup key —
+    the purchase context is rebuilt from SERVER data (the OrderRecord captured
+    by orders/create, or ONE admin API order lookup), so the order must exist
+    for THIS shop and be recently placed; stale or foreign order ids
+    ──▶ { offer: null }
+  ctx (surface "thank_you", referenceId "typ:<orderId>")
   assembleThankYouOffer
     ├─ selectOffers (max 1 offer on this surface)
     ├─ generateCopy
@@ -210,6 +238,15 @@ Shopify ──▶ POST /webhooks (app/routes/webhooks.tsx)
                           match accepted OfferEvents by order/reference id →
                           hadUpsellOffer / acceptedUpsell / line.isUpsell,
                           backfill OfferEvent.orderId
+  orders/updated       → analytics.backfillPendingRevenue, only when
+                          financial_status = "paid" (payment-recovery revenue
+                          backfill): an accepted upsell whose one-click charge
+                          FAILED was recorded with zero revenue; once Shopify's
+                          payment recovery collects, the withheld revenue/GP is
+                          restored on those events (from the IssuedOffer meta,
+                          else the order's own line prices) and mirrored into
+                          the OfferCandidate revenue counters. Fires on every
+                          order edit → exits fast when nothing matches
   products/create|update → catalog.upsertProductFromWebhook (ProductCache,
                           incl. refreshing that product's Translate & Adapt
                           translated names; a full sync refreshes everything)
@@ -239,6 +276,13 @@ OAuth afterAuth (app/shopify.server.ts)
        └─ syncCatalog                     paginated Admin GraphQL → ProductCache
                                           (+ per-locale title translations)
 ```
+
+Locale syncing is additive with curation: a published Shopify locale is added
+to `settings.languages` only the **first** time a sync sees it — every locale
+ever seen is recorded in `settings.knownShopifyLocales` — so a language the
+merchant deliberately removes in Settings → Languages is never re-added by a
+later sync. Newly published locales still appear automatically on the next
+sync (and `defaultLanguage` keeps following the store's primary locale).
 
 ## 4. Database (prisma/schema.prisma)
 
@@ -313,15 +357,41 @@ the Beta posteriors (2000 draws) and flags a winner at
   is its *effective description* — `ProductCache.aiDescription`
   (merchant-written AI context, Products tab) when non-empty, otherwise
   `ProductCache.descriptionFull` (the synced full Shopify description).
-- Cache miss → `claudeComplete` (plain `fetch` to
-  `api.anthropic.com/v1/messages`, no SDK, `AbortSignal.timeout`), racing the
-  configured `aiTimeoutMs` (default 2500 ms). No sampling parameters
+- Cache miss → the generation runs in **two stages**:
+  1. **Core (blocking, ≈2s).** A fast call with `settings.coreCopyModel`
+     (Settings → AI → Core copy model, default `claude-haiku-4-5`) generates
+     only the above-the-fold fields — headline, lead, bullets, closer —
+     racing the configured `aiTimeoutMs` (default 3500 ms). This is the only
+     AI latency the buyer path ever pays, so even the first buyer of a basket
+     gets real AI copy.
+  2. **Extended (background).** The below-CTA sections — `paragraphs` and the
+     `proof` research block — are generated with the **prompt template's own
+     model** in a background call with no buyer-facing deadline. The offer
+     page ships with `extendedPending: true` (`OfferPage` in `app/types.ts`)
+     and the extension polls `POST /api/offer-extended` (same JWT auth,
+     keyed by the issued offer's `referenceId` + `offerId`) until the
+     sections land, then merges them in below the CTA. The completed full
+     result is written to `CopyCache`, so repeat baskets are instant **and
+     complete** from the first render — only first-ever baskets see the
+     staged fill-in.
+- `claudeComplete` is a plain `fetch` to `api.anthropic.com/v1/messages` (no
+  SDK, `AbortSignal.timeout`). No sampling parameters
   (`temperature`/`top_p`/`top_k`) are ever sent — newer Claude models reject
-  them — so style is steered entirely through the prompts. The response must
-  be minified JSON (`headline`, `body` = the lead, `bullets[3..4]`, plus
-  `paragraphs[2..3]`, `proof[2..3]` (ingredient-level research statements) and
-  `closer` for long copy, `discount_suggestion` — see
-  IMPLEMENTATION_GUIDE §21 for the full contract); parsing is defensive
+  them — so style is steered entirely through the prompts. For models whose
+  id starts with `claude-sonnet-5` or `claude-opus-5` the request carries
+  `thinking: {"type": "disabled"}`: those models run adaptive thinking by
+  default when the parameter is omitted, and `max_tokens` caps thinking and
+  output **together**, so long-form JSON used to be truncated mid-object
+  (`stop_reason: "max_tokens"`) and silently degraded to fallback copy. No
+  `thinking` parameter is sent for `claude-haiku-4-5` or any other model.
+  Every response's `stop_reason` is checked — `"max_tokens"` throws
+  `anthropic output truncated (stop_reason=max_tokens) — raise the template's
+  max tokens` and `"refusal"` throws `anthropic refused the request` — so
+  truncation surfaces as an explicit logged error instead of a garbled parse.
+  The response must be minified JSON (`headline`, `body` = the lead,
+  `bullets[3..4]`, plus `paragraphs[2..3]`, `proof[2..3]` (ingredient-level
+  research statements) and `closer` for long copy, `discount_suggestion` —
+  see IMPLEMENTATION_GUIDE §21 for the full contract); parsing is defensive
   (strips code fences, seeks the first `{`), fields are validated/truncated,
   then cached.
 - Timeout/error → deterministic `fallbackCopy` built from UI strings and
@@ -330,6 +400,14 @@ the Beta posteriors (2000 draws) and flags a winner at
   next buyer. The buyer-facing path never waits on the AI and never throws.
 - `discount_suggestion` is only honored when `settings.discount.mode === "ai"`,
   and is clamped to the configured [min, max] band by the orchestrator.
+  **Convergence invariant:** the percentage an offer is issued with always
+  equals the percentage its copy was generated with — the copy may name the
+  discount, so the two must never diverge. A suggestion returned by the
+  current generation is therefore never applied to its own page; it is
+  persisted with the cached copy, and the *next* assembly of the same
+  basket/offer/language signature peeks the `CopyCache` row before generating
+  copy, clamps the stored suggestion, and derives copy, prices, changeset and
+  discount title from that single final percentage.
 - Translation of static UI strings goes through Claude or DeepL
   (`translationProvider`); the Claude path likewise sends no temperature
   parameter. DeepL keys ending `:fx` are routed to the free-tier host.
@@ -420,6 +498,27 @@ translated names; a full catalog sync refreshes every product. The admin's
 Products tab surfaces per-product translated-name coverage so missing locales
 are visible before buyers see a default-language name.
 
+### 6.3 Language resolution precedence
+
+`resolveLanguageWithSource` (`offer-orchestrator.server.ts`) picks the
+response language for every offer, in this order:
+
+1. **Buyer locale.** The buyer's own checkout locale wins whenever it maps to
+   an enabled store language — matched exact → case-insensitive →
+   base-language prefix (`pt-PT` matches `pt`).
+2. **Market language override** (Settings → Markets) — applies **only** when
+   the buyer locale is missing or doesn't map to any enabled language. This
+   is deliberate: a buyer who checked out in English must never be flipped to
+   another language by their shipping country (the old override-first order
+   produced "German product names in an English preview").
+3. **Store default language** (Settings → Languages).
+
+The function returns `{ language, source }` where `source` is
+`"buyer_locale" | "market_override" | "store_default"`, and
+`assembleOfferResponse` reports it through the
+`AssembleOfferOptions.languageResolution` out-param so the admin Preview can
+show *why* a language was chosen, not just which one.
+
 ## 7. The two extensions
 
 | | post-purchase-upsell | thank-you-upsell |
@@ -463,7 +562,13 @@ are visible before buyers see a default-language name.
   stored `IssuedOffer` meta (client-reported revenue is logged for debugging
   and otherwise ignored), and replays are rejected via the `EventDedup`
   unique claim taken in the same transaction as the event rows.
-- **Thank-you offers are idempotent per order.** The offer id is
+- **Thank-you offers are idempotent per order and gated on order ownership
+  + recency.** `/api/typ-offer` treats the client-sent order id purely as a
+  lookup key: the purchase context is rebuilt from server-side data (the
+  `OrderRecord` captured by `orders/create`, or one admin API order lookup),
+  so the order must exist for the authenticated shop **and** be recently
+  placed — stale or foreign order ids return `{ offer: null }`, so a replayed
+  session token cannot mint codes against old orders. The offer id is
   deterministic (`typ-<order id>`), so combined with `IssuedOffer`'s unique
   `(referenceId, offerId)` a refreshed or replayed `/api/typ-offer` request
   returns the already-issued offer instead of minting another discount code;
@@ -488,8 +593,11 @@ are visible before buyers see a default-language name.
 - **Hot path budget**: `/api/offer` does a handful of indexed reads
   (`Shop`, `CustomerState`, `MarketSetting`, `OfferRule`+slots+candidates or
   `ProductCache` scan, `OrderRecord/OrderLine` for suppression/affinity) plus
-  one `IssuedOffer` write. The AI call is capped at `aiTimeoutMs` (2.5 s
-  default) and falls back instantly — worst-case latency is bounded.
+  one `IssuedOffer` write. The only blocking AI work is the core-copy call
+  (fast `coreCopyModel`, ≈2 s in practice), capped at `aiTimeoutMs` (3.5 s
+  default) with an instant fallback — worst-case latency is bounded. The
+  extended sections are generated off the hot path and fetched by the
+  extension via `/api/offer-extended`.
 - **Co-purchase affinity** scans are capped at the most recent 5000 orders by
   design; at higher volumes, precompute an affinity table on a schedule
   instead.

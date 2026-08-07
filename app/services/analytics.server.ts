@@ -333,6 +333,20 @@ export async function recordExtensionEvent(
       );
     }
 
+    // Payment-pending marker: applyChangeset returned "partially_processed"
+    // (order edited, charge FAILED — Shopify runs its own payment recovery).
+    // The extension flags this via `message`; the flag can only ZERO revenue,
+    // never set it, so unlike raw client revenue it is safe to honor. The
+    // accept itself still counts (real conversion signal); only the money is
+    // withheld until proven.
+    const paymentPending =
+      eventType === "accepted" && payload.message === "partially_processed";
+    if (paymentPending) {
+      console.warn(
+        `[analytics] accepted with pending payment for ${shop} ref=${referenceId} — recording zero revenue`,
+      );
+    }
+
     // One row per offered product for impressions/accepts (so per-product
     // acceptance ratios and dimension breakdowns stay consistent, with exact
     // per-product revenue/GP attribution on accepts); a single row otherwise.
@@ -344,8 +358,10 @@ export async function recordExtensionEvent(
             candidateId: candidateIds[i] ?? candidateIds[0] ?? null,
             productId: p.productId,
             variantId: p.variantId,
-            revenue: eventType === "accepted" ? round2(p.discountedPrice) : 0,
-            grossProfit: eventType === "accepted" ? round2(p.grossProfit) : 0,
+            revenue:
+              eventType === "accepted" && !paymentPending ? round2(p.discountedPrice) : 0,
+            grossProfit:
+              eventType === "accepted" && !paymentPending ? round2(p.grossProfit) : 0,
           }))
         : [
             {
@@ -408,6 +424,7 @@ export async function recordExtensionEvent(
       } else if (eventType === "accepted") {
         const totalRevenue = products.reduce((sum, p) => sum + p.discountedPrice, 0);
         const shareAt = (i: number): number => {
+          if (paymentPending) return 0; // charge failed — accept counts, money doesn't
           const share = products[i]?.discountedPrice ?? totalRevenue / candidateIds.length;
           return Number.isFinite(share) ? share : 0;
         };
@@ -641,6 +658,201 @@ export async function recordOrderFromWebhook(shop: string, payload: any): Promis
     }
   } catch (error) {
     console.error(`[analytics] recordOrderFromWebhook failed for ${shop}`, error);
+  }
+}
+
+// ── Payment-recovery revenue backfill (orders/updated webhook) ───────────────
+
+/**
+ * Revenue-only bandit counter restore for backfillPendingRevenue. The accept
+ * itself was already counted when the buyer accepted (the payment-pending
+ * marker only withholds the money), so ONLY `revenue` is incremented — never
+ * `accepts`. Direct increment when the candidate id still exists; when a rule
+ * re-save recreated the candidate rows (stale id), fall back to the rule's
+ * CURRENT candidate whose variantId numeric part matches, preferring the slot
+ * at the expected position — the same matching the stale-candidate helper
+ * uses. Never throws.
+ */
+async function bumpCandidateRevenueOnly(
+  shop: string,
+  ruleId: string | null | undefined,
+  candidateId: string | null | undefined,
+  variantId: string | null | undefined,
+  slotPosition: number,
+  delta: number,
+): Promise<void> {
+  if (!Number.isFinite(delta) || delta <= 0) return;
+  try {
+    if (candidateId) {
+      const updated = await prisma.offerCandidate.updateMany({
+        where: { id: candidateId },
+        data: { revenue: { increment: round2(delta) } },
+      });
+      if (updated.count > 0) return;
+    }
+    if (!ruleId || !variantId) return;
+    const variantNum = gidToNumber(variantId);
+    if (!Number.isFinite(variantNum)) return;
+    const slots = await prisma.offerSlot.findMany({
+      where: { ruleId, rule: { shop } },
+      orderBy: { position: "asc" },
+      select: {
+        position: true,
+        candidates: { select: { id: true, variantId: true } },
+      },
+    });
+    if (slots.length === 0) return;
+    const positioned = slots.find((s) => s.position === slotPosition)?.candidates ?? [];
+    const match =
+      positioned.find((c) => gidToNumber(c.variantId) === variantNum) ??
+      slots.flatMap((s) => s.candidates).find((c) => gidToNumber(c.variantId) === variantNum);
+    if (!match) return;
+    await prisma.offerCandidate.updateMany({
+      where: { id: match.id },
+      data: { revenue: { increment: round2(delta) } },
+    });
+  } catch (error) {
+    console.warn(`[analytics] candidate revenue backfill failed for ${shop}`, error);
+  }
+}
+
+/**
+ * Payment-recovery reconciliation, driven by the orders/updated webhook when
+ * `financial_status` reaches "paid". An accepted post-purchase upsell whose
+ * changeset charge FAILED ("partially_processed") was recorded with zero
+ * revenue — the accept counted, the money was withheld (see the
+ * payment-pending marker in recordExtensionEvent). Shopify runs its own
+ * payment recovery on such orders; once the order is actually paid, this
+ * restores the withheld revenue/grossProfit on those zero-revenue accepted
+ * OfferEvent rows and mirrors the same delta into the matching
+ * OfferCandidate.revenue counters.
+ *
+ * Values are restored from the IssuedOffer meta products (exact
+ * discounted-price / gross-profit recomputation) when the row still exists;
+ * when it was already pruned, from the order's own line_items price for the
+ * line whose variant_id numeric tail matches the event's variantId (gross
+ * profit then falls back to the default unit-cost ratio).
+ *
+ * ORDERS_UPDATED fires on every order edit, so the common path must be cheap:
+ * one indexed query, exiting immediately when no zero-revenue accepted rows
+ * match this order. Idempotent — restored rows no longer match the
+ * zero-revenue filter, so redeliveries are no-ops. Never throws.
+ */
+export async function backfillPendingRevenue(shop: string, payload: any): Promise<void> {
+  try {
+    // Order id numeric tail: REST `id` preferred, admin_graphql_api_id gid
+    // fallback ("gid://shopify/Order/123" → 123).
+    const restNum = gidToNumber(String(payload?.id ?? ""));
+    const gidNum = gidToNumber(String(payload?.admin_graphql_api_id ?? ""));
+    const orderNum = Number.isFinite(restNum) ? restNum : gidNum;
+    if (!Number.isFinite(orderNum)) return;
+    const orderKey = String(orderNum);
+
+    // Fast exit: match accepted zero-revenue events by orderId or by the
+    // numeric part of referenceId (post-purchase referenceIds are the numeric
+    // order id). endsWith narrows the scan; exact numeric match below.
+    const candidates = await prisma.offerEvent.findMany({
+      where: {
+        shop,
+        eventType: "accepted",
+        revenue: 0,
+        OR: [{ orderId: { endsWith: orderKey } }, { referenceId: { endsWith: orderKey } }],
+      },
+      select: {
+        id: true,
+        referenceId: true,
+        orderId: true,
+        position: true,
+        ruleId: true,
+        candidateId: true,
+        variantId: true,
+      },
+    });
+    const rows = candidates.filter(
+      (e) =>
+        (e.orderId !== null && gidToNumber(e.orderId) === orderNum) ||
+        gidToNumber(e.referenceId) === orderNum,
+    );
+    if (rows.length === 0) return;
+
+    // Primary value source: the IssuedOffer meta products for each event's
+    // page — the same numbers recordExtensionEvent would have written had the
+    // charge succeeded. Keyed by (referenceId, page position).
+    const refIds = [...new Set(rows.map((e) => e.referenceId))];
+    const issuedRows = await prisma.issuedOffer.findMany({
+      where: { shop, referenceId: { in: refIds } },
+      select: { referenceId: true, offerMetaJson: true },
+    });
+    const metaByPage = new Map<string, MetaProduct[]>();
+    for (const issued of issuedRows) {
+      const meta = jparse<IssuedOfferMeta>(issued.offerMetaJson, {});
+      const discountPct = asFiniteNumber(meta.discountPct, 0);
+      const products = parseMetaProducts(meta, discountPct);
+      if (products.length === 0) continue;
+      const position = Math.max(1, Math.floor(asFiniteNumber(meta.position, 1)));
+      metaByPage.set(`${issued.referenceId}|${position}`, products);
+    }
+
+    // Fallback value source: the order's own line prices by variant numeric
+    // tail (used when the IssuedOffer row was already pruned).
+    const linePriceByVariant = new Map<number, number>();
+    const rawLines: any[] = Array.isArray(payload?.line_items) ? payload.line_items : [];
+    for (const li of rawLines) {
+      const variantNum = gidToNumber(String(li?.variant_id ?? ""));
+      if (!Number.isFinite(variantNum) || linePriceByVariant.has(variantNum)) continue;
+      const price = asFiniteNumber(li?.price, Number.NaN);
+      if (Number.isFinite(price) && price > 0) linePriceByVariant.set(variantNum, price);
+    }
+
+    let backfilled = 0;
+    let totalRevenue = 0;
+    for (const event of rows) {
+      const variantNum = event.variantId ? gidToNumber(event.variantId) : Number.NaN;
+      let revenue: number | null = null;
+      let grossProfit = 0;
+
+      const products = metaByPage.get(`${event.referenceId}|${event.position ?? 1}`);
+      const metaMatch =
+        products && Number.isFinite(variantNum)
+          ? products.find(
+              (p) => p.variantId !== null && gidToNumber(p.variantId) === variantNum,
+            )
+          : undefined;
+      if (metaMatch) {
+        revenue = round2(metaMatch.discountedPrice);
+        grossProfit = round2(metaMatch.grossProfit);
+      } else if (Number.isFinite(variantNum)) {
+        const linePrice = linePriceByVariant.get(variantNum);
+        if (linePrice !== undefined) {
+          revenue = round2(linePrice);
+          grossProfit = round2(linePrice * (1 - DEFAULT_UNIT_COST_RATIO));
+        }
+      }
+      if (revenue === null || revenue <= 0) continue;
+
+      await prisma.offerEvent.update({
+        where: { id: event.id },
+        data: { revenue, grossProfit },
+      });
+      await bumpCandidateRevenueOnly(
+        shop,
+        event.ruleId,
+        event.candidateId,
+        event.variantId,
+        event.position ?? 1,
+        revenue,
+      );
+      backfilled += 1;
+      totalRevenue += revenue;
+    }
+
+    if (backfilled > 0) {
+      console.log(
+        `[analytics] payment recovery for ${shop} order ${orderKey}: backfilled ${backfilled} accepted event(s), ${round2(totalRevenue)} revenue restored`,
+      );
+    }
+  } catch (error) {
+    console.error(`[analytics] backfillPendingRevenue failed for ${shop}`, error);
   }
 }
 
@@ -922,11 +1134,16 @@ export async function getExperimentResults(shop: string): Promise<ExperimentRow[
     },
   });
 
+  // Only ENABLED candidates count as an experiment — disabled ones never
+  // rotate (selectOffers skips them and autoPickWinners ignores them), so the
+  // admin table must mirror live behavior: a slot is contested only when ≥2
+  // candidates are enabled, and posteriors are computed over those alone.
   const productIds = new Set<string>();
   for (const rule of rules) {
     for (const slot of rule.slots) {
-      if (slot.candidates.length < 2) continue;
-      for (const c of slot.candidates) productIds.add(c.productId);
+      const enabled = slot.candidates.filter((c) => c.enabled);
+      if (enabled.length < 2) continue;
+      for (const c of enabled) productIds.add(c.productId);
     }
   }
   const titles = new Map<string, string>();
@@ -941,15 +1158,16 @@ export async function getExperimentResults(shop: string): Promise<ExperimentRow[
   const rows: ExperimentRow[] = [];
   for (const rule of rules) {
     for (const slot of rule.slots) {
-      if (slot.candidates.length < 2) continue;
+      const enabled = slot.candidates.filter((c) => c.enabled);
+      if (enabled.length < 2) continue;
 
       // Monte-Carlo P(best): Beta(accepts+1, impressions−accepts+1) posterior
       // per candidate, 2000 joint draws, count wins.
-      const params = slot.candidates.map((c) => ({
+      const params = enabled.map((c) => ({
         a: c.accepts + 1,
         b: Math.max(0, c.impressions - c.accepts) + 1,
       }));
-      const wins = new Array<number>(slot.candidates.length).fill(0);
+      const wins = new Array<number>(enabled.length).fill(0);
       for (let draw = 0; draw < MONTE_CARLO_DRAWS; draw++) {
         let bestIdx = 0;
         let bestVal = -Infinity;
@@ -963,7 +1181,7 @@ export async function getExperimentResults(shop: string): Promise<ExperimentRow[
         wins[bestIdx] += 1;
       }
 
-      const slotRows = slot.candidates.map((c, i) => ({
+      const slotRows = enabled.map((c, i) => ({
         ruleId: rule.id,
         ruleName: rule.name,
         slotPosition: slot.position,

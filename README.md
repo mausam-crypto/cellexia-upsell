@@ -97,22 +97,27 @@ app/
     app.analytics.tsx             Admin: analytics & CSV export
     app.offers._index.tsx         Admin: offer rules list
     app.offers.$id.tsx            Admin: rule editor
+    app.preview.tsx               Admin: offer preview sandbox (production pipeline, no analytics)
+    app.products.tsx              Admin: AI-context editor + translated-name coverage
     app.prompts.tsx               Admin: AI prompt templates + preview
     app.settings.tsx              Admin: settings (discount, markets, languages, AI, ...)
     app.translations.tsx          Admin: buyer-facing UI strings per language
     api.offer.tsx                 Public: post-purchase offer endpoint (JWT-verified)
+    api.offer-extended.tsx        Public: below-CTA copy sections, polled while extendedPending
     api.sign-changeset.tsx        Public: signs changesets from server-side IssuedOffer rows
     api.events.tsx                Public: impression/accept/decline/error events
     api.typ-offer.tsx             Public: thank-you-page offer (discount-code based)
+    auth.login.tsx                Shop-domain login form into the OAuth flow
     webhooks.tsx                  Webhooks: orders, products, app lifecycle, GDPR
   components/
     MiniChart.tsx                 Dependency-free SVG line/area chart
+    PostPurchasePreview.tsx       Buyer-faithful replica of the offer page (admin Preview)
 extensions/
   post-purchase-upsell/           Checkout::PostPurchase extension (React 17)
   thank-you-upsell/               purchase.thank-you.block.render UI extension (React 18)
 prisma/schema.prisma              Database schema (SQLite dev / Postgres prod)
 shopify.app.toml                  App config: scopes, webhooks, URLs
-shopify.web.toml                  CLI web process config (predev runs prisma)
+shopify.web.toml                  CLI web process config (predev runs ensure-env + prisma)
 .env.example                      All environment variables, documented
 ```
 
