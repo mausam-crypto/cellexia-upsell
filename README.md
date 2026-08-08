@@ -27,6 +27,10 @@ methods Shopify excludes from the post-purchase page.
 - **A/B rotation with Thompson sampling** and automatic winner picking.
 - **Per-market overrides** (enable/disable, discount, language, max offers) and
   per-language buyer-facing strings for all 17 store locales.
+- **Real per-country prices** — offer pages display Shopify's contextual
+  pricing for the buyer's country (market price adjustments and price lists
+  included, in the market's currency), DB-cached with a 6h TTL, falling back
+  to an FX-rate conversion of the base price when unavailable.
 - **Full analytics** — funnel, per-offer performance, country/language/surface
   breakdowns, experiment results, and 60/90-day **CLV cohorts** comparing
   customers who accepted, declined, or never saw an offer.
@@ -91,6 +95,7 @@ app/
     recommendation.server.ts      Offer selection engine (rules, bandit, auto-pilot, discounts)
     ai.server.ts                  Claude copywriting, prompt templates, UI-string translation
     analytics.server.ts           Event recording, dashboards, experiments, CLV cohorts
+    market-pricing.server.ts      Real per-country prices (Shopify contextualPricing, cached)
     offer-orchestrator.server.ts  Assembles the full offer response for the extensions
   routes/
     app._index.tsx                Admin: dashboard

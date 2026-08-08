@@ -43,9 +43,15 @@ import {
 import {
   effectiveDescription,
   effectiveProductName,
+  effectiveTranslatedDescription,
   getProductsByIds,
   type CatalogProduct,
 } from "./catalog.server";
+import {
+  getContextualPrices,
+  resolveUniformPricing,
+  type ContextualVariantPrice,
+} from "./market-pricing.server";
 
 /** Issued offers can be signed for up to 2 hours after they were assembled. */
 const OFFER_TTL_MS = 2 * 60 * 60 * 1000;
@@ -68,6 +74,38 @@ export interface AssembleOfferOptions {
   diagnostics?: PageCopyDiagnostic[];
   /** Out-param: how the response language was chosen (admin preview trace). */
   languageResolution?: { language: string; source: LanguageSource };
+  /**
+   * Out-param: how the displayed prices were produced. "contextual" = real
+   * per-country prices from Shopify contextualPricing; "fx" = base prices
+   * converted with the presentment rate; "shop" = plain shop-currency prices.
+   */
+  pricingSource?: "contextual" | "fx" | "shop";
+}
+
+/** Uniform contextual pricing applied to one response's product views. */
+interface ContextualPricingResult {
+  byVariant: Map<string, ContextualVariantPrice>;
+  currency: string;
+}
+
+/**
+ * Real per-country display pricing for every offered variant, all-or-nothing:
+ * either ALL variants have a contextual price in one shared currency (then it
+ * is used for the buyer-facing views) or null (then the FX-rate conversion —
+ * or plain shop currency — applies as before). Never throws.
+ */
+async function resolveContextualPricing(
+  ctx: PurchaseContext,
+  variantIds: string[],
+): Promise<ContextualPricingResult | null> {
+  if (!ctx.countryCode || variantIds.length === 0) return null;
+  try {
+    const prices = await getContextualPrices(ctx.shop, variantIds, ctx.countryCode);
+    return resolveUniformPricing(prices, variantIds);
+  } catch (error) {
+    console.error(`[orchestrator] contextual pricing failed for ${ctx.shop}`, error);
+    return null;
+  }
 }
 
 // ── Small helpers ────────────────────────────────────────────────────────────
@@ -144,20 +182,9 @@ function translationDescription(
   translations: Record<string, { title?: string; description?: string }> | undefined,
   language: string,
 ): string | undefined {
-  if (!translations) return undefined;
-  const direct = translations[language]?.description;
-  if (direct) return direct;
-  const lower = language.toLowerCase();
-  for (const [key, value] of Object.entries(translations)) {
-    if (key.toLowerCase() === lower && value?.description) return value.description;
-  }
-  const base = lower.split("-")[0];
-  for (const [key, value] of Object.entries(translations)) {
-    if (key.toLowerCase().split("-")[0] === base && value?.description) {
-      return value.description;
-    }
-  }
-  return undefined;
+  // Delegates to the catalog's single language-chain implementation so this
+  // path can never drift from previews and prompt grounding again.
+  return effectiveTranslatedDescription(translations, language);
 }
 
 async function safeGetUiStrings(
@@ -302,7 +329,27 @@ function toProductView(
   p: SelectedOfferProduct,
   discountPct: number,
   fx?: DisplayFx | null,
+  ctxPrice?: ContextualVariantPrice | null,
 ): OfferProductView {
+  // Real per-country price wins outright: the amounts ARE what the buyer's
+  // checkout charges (market adjustments / price lists included), so no rate
+  // math applies. compareAt comes only from the same context — mixing a
+  // converted base compareAt with a contextual price could contradict it.
+  if (ctxPrice && ctxPrice.price !== null && ctxPrice.price > 0) {
+    const discounted = Math.round(ctxPrice.price * (1 - discountPct / 100) * 100) / 100;
+    return {
+      productId: p.productId,
+      variantId: p.variantId,
+      title: p.translatedTitle ?? p.title,
+      image: p.image,
+      price: ctxPrice.price.toFixed(2),
+      discountedPrice: discounted.toFixed(2),
+      compareAtPrice:
+        ctxPrice.compareAtPrice !== null && ctxPrice.compareAtPrice > ctxPrice.price
+          ? ctxPrice.compareAtPrice.toFixed(2)
+          : null,
+    };
+  }
   // Shop-currency math first (identical to the signed changeset amounts),
   // then the optional display conversion: multiply by the rate, round to 2dp.
   const discounted = Math.round(p.price * (1 - discountPct / 100) * 100) / 100;
@@ -354,12 +401,15 @@ async function patchExtendedCopy(args: {
   /** The fast core call's suggestion — persisted when the merged CopyCache
    *  row is created, so the NEXT assembly's peek can converge on it. */
   coreDiscountSuggestion: number | null;
+  /** The core call's cache key — pins the merged write to the same row. */
+  coreCacheKey?: string;
 }): Promise<void> {
   try {
     const extended = await completeExtendedCopy(
       args.copyArgs,
       args.coreCopy,
       args.coreDiscountSuggestion,
+      args.coreCacheKey,
     );
     if (!extended) return;
     // Read-modify-write inside ONE transaction so a concurrent writer (e.g. a
@@ -415,6 +465,8 @@ async function buildOfferPage(args: {
   basket: { title: string; productType: string; quantity: number; description: string }[];
   catalogById: Map<string, CatalogProduct>;
   marketHandle: string | null;
+  /** Resolved after the copy call — overlaps the Shopify pricing round-trip. */
+  ctxPricingPromise: Promise<ContextualPricingResult | null>;
   options?: AssembleOfferOptions;
 }): Promise<OfferPage | null> {
   const {
@@ -428,6 +480,7 @@ async function buildOfferPage(args: {
     basket,
     catalogById,
     marketHandle,
+    ctxPricingPromise,
     options,
   } = args;
 
@@ -472,6 +525,7 @@ async function buildOfferPage(args: {
   let copy: OfferCopy;
   let discountSuggestion: number | null = null;
   let extendedPending = false;
+  let coreCacheKey: string | undefined;
   // The working discount for EVERYTHING on this page — prompt, prices,
   // changes, title. INVARIANT: this pct always equals the pct the copy was
   // generated with; copy and charge can never disagree.
@@ -534,6 +588,7 @@ async function buildOfferPage(args: {
         copy = generated.copy;
         discountSuggestion = generated.discountSuggestion;
         extendedPending = generated.extendedPending;
+        coreCacheKey = generated.cacheKey;
         options?.diagnostics?.push({
           position: offer.position,
           source: generated.cached ? "cache" : generated.fallbackUsed ? "fallback" : "ai",
@@ -573,15 +628,20 @@ async function buildOfferPage(args: {
   });
 
   const offerId = crypto.randomUUID();
-  // Display-only conversion for the buyer-facing views. The page (with its
-  // converted prices) is persisted in the meta below, so stored-page reuse
-  // displays identically without re-deriving the rate.
-  const fx = displayFxFromContext(ctx);
+  // Buyer-facing display prices, best first: real per-country contextual
+  // prices when uniformly available, else the FX-rate conversion. The page
+  // (with its final prices) is persisted in the meta below, so stored-page
+  // reuse displays identically without re-deriving anything. Awaited here —
+  // after the copy call above — so the pricing round-trip cost overlapped it.
+  const ctxPricing = await ctxPricingPromise;
+  const fx = ctxPricing ? null : displayFxFromContext(ctx);
   const page: OfferPage = {
     offerId,
     ruleId: offer.ruleId,
     candidateIds: offer.candidateIds,
-    products: products.map((p) => toProductView(p, discountPct, fx)),
+    products: products.map((p) =>
+      toProductView(p, discountPct, fx, ctxPricing?.byVariant.get(p.variantId) ?? null),
+    ),
     discountPct,
     discountTitle,
     copy,
@@ -606,11 +666,13 @@ async function buildOfferPage(args: {
       surface: ctx.surface,
       position: offer.position,
       currency: ctx.currency,
-      // Display conversion actually APPLIED to the stored page views (null =
+      // Display currency actually APPLIED to the stored page views (null =
       // views are shop-currency). Meta product prices above stay shop-currency
-      // — these two fields exist for reuse fidelity and diagnostics.
-      presentmentCurrency: fx?.currency ?? null,
+      // — these fields exist for reuse fidelity and diagnostics. Contextual
+      // prices carry no rate (they are Shopify's own per-country amounts).
+      presentmentCurrency: ctxPricing?.currency ?? fx?.currency ?? null,
       presentmentRate: fx?.rate ?? null,
+      pricingSource: ctxPricing ? "contextual" : fx ? "fx" : "shop",
       displayMode: selection.displayMode,
       // Complete buyer-facing view — lets a Shop Pay re-fetch for the same
       // referenceId return the SAME pages instead of re-running the bandit.
@@ -629,6 +691,7 @@ async function buildOfferPage(args: {
       copyArgs,
       coreCopy: copy,
       coreDiscountSuggestion: discountSuggestion,
+      coreCacheKey,
     }).catch((error) =>
       console.error(
         `[orchestrator] extended copy background task failed for ${ctx.shop}`,
@@ -765,14 +828,24 @@ export async function assembleOfferResponse(
     selection?.displayMode ?? settings?.defaultDisplayMode ?? "sequential";
   const copyLength: CopyLength = selection?.copyLength ?? settings?.copyLength ?? "short";
 
-  // Buyer-facing display currency: when the context carries a usable
-  // presentment rate the page views are converted (see toProductView), so the
-  // response currency must be the presentment one. Shop currency otherwise.
-  const fx = displayFxFromContext(ctx);
+  // Buyer-facing display pricing, best first: real per-country prices from
+  // Shopify contextualPricing (market price adjustments and price lists
+  // included) for ALL offered variants, else the FX-rate conversion implied
+  // by the order (see toProductView), else plain shop currency. Only variants
+  // that survive buildOfferPage's signability filter participate in the
+  // all-or-nothing check — an unsignable product never blocks real pricing.
+  // Kicked off NOW and awaited inside buildOfferPage AFTER the (much slower)
+  // copy call, so the Shopify round-trip overlaps copy generation and the
+  // buyer path's ShouldRender budget pays ~nothing for it.
+  const offeredVariantIds = (selection?.offers ?? [])
+    .flatMap((o) => o.products.map((p) => p.variantId))
+    .filter((v) => Number.isFinite(gidToNumber(v)));
+  const ctxPricingPromise = resolveContextualPricing(ctx, offeredVariantIds);
   const response: OfferResponse = {
     offers: [],
     displayMode,
-    currency: fx?.currency ?? ctx.currency,
+    // Provisional — finalized below once the pricing promise resolves.
+    currency: ctx.currency,
     language,
     strings,
     ui: {
@@ -783,7 +856,11 @@ export async function assembleOfferResponse(
     },
   };
 
-  if (!settings || !selection || selection.offers.length === 0) return response;
+  if (!settings || !selection || selection.offers.length === 0) {
+    const fx = displayFxFromContext(ctx);
+    response.currency = fx?.currency ?? ctx.currency;
+    return response;
+  }
 
   const catalogById = await loadCatalog(ctx, selection);
   const basket = buildBasket(ctx, catalogById, language);
@@ -802,6 +879,7 @@ export async function assembleOfferResponse(
         basket,
         catalogById,
         marketHandle,
+        ctxPricingPromise,
         options,
       });
       if (page) response.offers.push(page);
@@ -812,6 +890,13 @@ export async function assembleOfferResponse(
       );
     }
   }
+
+  // Already resolved — the page loop above awaited it (or the selection was
+  // empty and it resolved to null without any Shopify call).
+  const ctxPricing = await ctxPricingPromise;
+  const fx = ctxPricing ? null : displayFxFromContext(ctx);
+  if (options) options.pricingSource = ctxPricing ? "contextual" : fx ? "fx" : "shop";
+  response.currency = ctxPricing?.currency ?? fx?.currency ?? ctx.currency;
 
   return response;
 }
@@ -1192,10 +1277,17 @@ export async function assembleThankYouOffer(
     const offerId = Number.isFinite(numericRef)
       ? `typ-${numericRef}`
       : crypto.randomUUID();
-    // Display-only conversion for the stored buyer-facing view; the discount
+    // Buyer-facing display price for the stored view, best first: the real
+    // per-country contextual price, else the FX-rate conversion. The discount
     // code percentage and all meta prices stay shop-currency.
-    const fx = displayFxFromContext(ctx);
-    const productView = toProductView(enriched, discountPct, fx);
+    const ctxPricing = await resolveContextualPricing(ctx, [enriched.variantId]);
+    const fx = ctxPricing ? null : displayFxFromContext(ctx);
+    const productView = toProductView(
+      enriched,
+      discountPct,
+      fx,
+      ctxPricing?.byVariant.get(enriched.variantId) ?? null,
+    );
     try {
       await persistIssuedOffer({
         ctx,
@@ -1218,10 +1310,11 @@ export async function assembleThankYouOffer(
           surface: ctx.surface,
           position: 1,
           currency: ctx.currency,
-          // Display conversion actually APPLIED to the stored productView
+          // Display currency actually APPLIED to the stored productView
           // (null = view is shop-currency) — rebuilds label prices with it.
-          presentmentCurrency: fx?.currency ?? null,
+          presentmentCurrency: ctxPricing?.currency ?? fx?.currency ?? null,
           presentmentRate: fx?.rate ?? null,
+          pricingSource: ctxPricing ? "contextual" : fx ? "fx" : "shop",
         },
       });
     } catch (error) {
@@ -1262,7 +1355,7 @@ export async function assembleThankYouOffer(
       copy,
       strings,
       language,
-      currency: fx?.currency ?? ctx.currency,
+      currency: ctxPricing?.currency ?? fx?.currency ?? ctx.currency,
     };
   } catch (error) {
     console.error(`[orchestrator] assembleThankYouOffer failed for ${ctx.shop}`, error);

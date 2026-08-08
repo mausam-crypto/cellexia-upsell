@@ -34,6 +34,10 @@ import {
   type PromptKey,
 } from "../services/ai.server";
 import {
+  effectiveProductName,
+  effectiveTranslatedDescription,
+} from "../services/catalog.server";
+import {
   LANGUAGE_LABELS,
   type OfferCopy,
   type SelectedOfferProduct,
@@ -357,6 +361,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       offerRows.push(secondOffer);
     }
 
+    // Buyer-facing name for the preview language, same precedence the live
+    // engine uses (manual override → Translate & Adapt → base title) — the
+    // merchant checks their name fixes HERE, so the preview must resolve
+    // names exactly like production.
+    const previewName = (row: (typeof products)[number]): string =>
+      effectiveProductName(
+        {
+          title: row.title,
+          nameOverrides: jparse<Record<string, string>>(row.nameOverridesJson, {}),
+          translations: jparse<Record<string, { title?: string }>>(
+            row.translationsJson,
+            {},
+          ),
+        },
+        language,
+      );
+
     const toOfferProduct = (row: (typeof products)[number]): SelectedOfferProduct | null => {
       const variants = jparse<PreviewVariant[]>(row.variantsJson, []);
       const variant =
@@ -368,6 +389,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         productId: row.productId,
         variantId: variant.id,
         title: row.title,
+        translatedTitle: previewName(row),
         image: variant.imageUrl ?? row.imageUrl,
         price: variant.price,
         compareAtPrice: variant.compareAtPrice,
@@ -412,12 +434,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         totalOffers: key === "sequential" ? 3 : 1,
         language,
         basket: basketRows.map((p) => ({
-          title: p.title,
+          title: previewName(p),
           productType: p.productType,
           quantity: 1,
-          // Same precedence the live engine uses: merchant-written AI context
-          // (Products tab) → full Shopify description → short excerpt.
-          description: p.aiDescription || p.descriptionFull || p.descriptionShort,
+          // Same precedence the live engine uses (buildBasket): merchant AI
+          // context → the T&A description for the PREVIEW language → full
+          // Shopify description → short excerpt. Diverging here grounds the
+          // preview in the primary-locale text and reproduces the
+          // wrong-language-name bug in the merchant's own verification tool.
+          description:
+            p.aiDescription ||
+            effectiveTranslatedDescription(
+              jparse<Record<string, { description?: string }>>(
+                p.translationsJson,
+                {},
+              ),
+              language,
+            ) ||
+            p.descriptionFull ||
+            p.descriptionShort,
         })),
         offerProducts,
         discountPct,

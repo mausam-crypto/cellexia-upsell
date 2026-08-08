@@ -152,6 +152,16 @@ eye serum as the finishing step of a retinol routine"). Plain factual
 sentences work best; the AI turns them into copy. Start with the products you
 offer most.
 
+**Languages and descriptions.** Buyers are grounded in the description for
+*their* language: your AI context (if written) always wins, then the
+Translate & Adapt description for the buyer's language, then the synced
+Shopify description. Product names are never taken from description text —
+only from the name fields — so a German description can no longer push the
+German product name into English copy. Keeping Translate & Adapt
+*descriptions* filled in for your main markets gives each language natively
+grounded copy; where one is missing, the AI still writes in the buyer's
+language from the default description.
+
 **Product names by language.** Product names in buyer-facing copy are never
 written or translated by the AI — it always uses the name it is given,
 verbatim. Which name that is follows a strict precedence, per language:
@@ -170,6 +180,15 @@ synced Translate & Adapt name, or the base title (marked with a subdued
 back down the list. Use manual names where a Translate & Adapt translation is
 missing or off, or when you want a different name in upsell offers than on
 the storefront.
+
+**When a name fix takes effect.** Immediately, for every newly generated
+offer: changing a name (or a product's AI context) automatically invalidates
+the copy the app had cached with the old name, so the next order — and the
+next Preview run — regenerates the copy with the corrected name. No "Reset
+prompts" needed. The one exception is an offer page that was *already issued*
+to a specific order (including a test order you re-open): issued pages are
+frozen for consistency, so re-test with a fresh order rather than refreshing
+an old one.
 
 **Name coverage badge.** Each product shows `x/y names covered`: a language
 counts as covered when it has a manual name **or** a synced Translate & Adapt
@@ -332,7 +351,7 @@ placing a test order or touching a real checkout. You compose a situation:
   they would for a real order shipping there. When the country belongs to a
   market that sells in a different currency than the shop, the preview shows
   prices in that market's currency using its **preview FX rate**
-  (the Markets page). The rate affects the preview only — live buyers get
+  (Settings → Markets). The rate affects the preview only — live buyers get
   Shopify's own conversion, read from their own order.
 - **Language** — the buyer's storefront language.
 - **Device** — phone or desktop framing, since the offer page lays out

@@ -411,9 +411,34 @@ export async function translateTexts(settings: AppSettings, texts: string[], tar
   (`app/types.ts`) is itself em-dash-free (commas instead). Admin-facing
   text is out of scope.
 - `generateCopy`: cacheKey = sha256 of
-  `JSON.stringify([mode, sortedOfferVariantIds, sortedBasketTitles(first 6),
+  `JSON.stringify([mode, sortedOfferSig, descSig, sortedBasketTitles(first 6),
   language, copyLength, String(roundedDiscountPct), String(promptVersion)])`
-  (JSON keeps components unambiguously delimited). Check `CopyCache` first.
+  (JSON keeps components unambiguously delimited). The key is
+  **grounding-aware** (async — `await buildCacheKey(...)`): `offerSig` pairs
+  each variantId with the buyer-facing name the prompt will use
+  (`translatedTitle || title`, i.e. manual override → T&A → base title);
+  `descSig` is a per-product sha256 (first 16 hex chars) of the offered
+  products' grounding text from the **language-aware**
+  `loadOfferDescriptions(shop, ids, language)` — the same call, with the
+  same argument, that `buildTemplateVars` uses to build the prompt (AI
+  context > T&A description for the buyer's language > full > short). The
+  prompt is language-aware BY REQUIREMENT: feeding the primary-locale
+  description to a foreign-language buyer makes the model echo the
+  wrong-language product name embedded in it (production bug: German name
+  inside English copy despite a correct manual name). Key and prompt MUST
+  always call loadOfferDescriptions identically — if they diverge, edits on
+  one side stop invalidating while the other side invalidates for nothing;
+  `basketSig` pairs every basket line's title with a sha256(16) of its
+  grounding description (basket lines DO carry per-language T&A text —
+  hashed because the prompt consumes it). Fixing a name or editing grounding
+  text therefore regenerates copy on the next assembly; unchanged catalogs
+  still hit. `generateBuyerCopy` returns its `cacheKey` and callers pass it
+  to `completeExtendedCopy` (pinned key), so the background merged write
+  lands on the same row even if a grounding edit shifts the key mid-window.
+  Rows orphaned by a grounding change are pruned by dashboard housekeeping
+  (CopyCache `createdAt` older than 45 days, **except** rows holding a
+  `discountSuggestion` — the baseline-pct row keeps AI discount convergence
+  alive via peek and must never age out). Check `CopyCache` first.
   On miss: if `!settings.aiEnabled || !process.env.ANTHROPIC_API_KEY` →
   fallback (reason `ai_disabled`/`no_key`). Else race Claude with timeout
   (`args.timeoutMs ?? settings.aiTimeoutMs`); validate; store in cache. On

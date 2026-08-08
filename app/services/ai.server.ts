@@ -9,6 +9,10 @@
 //   order" paragraphs + a calm closer, with zero urgency/scarcity pressure.
 // - generateCopy: sha256-keyed CopyCache, timeout race against Claude,
 //   deterministic per-language fallback, background cache warming on failure.
+//   The cache key is GROUNDING-AWARE: it includes the buyer-facing product
+//   names (manual override → T&A → base title) and a signature of the
+//   grounding descriptions, so fixing a name or editing AI context
+//   regenerates copy on the next assembly instead of serving stale cache.
 // - generateBuyerCopy / completeExtendedCopy: two-stage buyer path — one fast
 //   CORE call (settings.coreCopyModel) inside the post-purchase time budget,
 //   then a background call on the template's model for paragraphs/proof; the
@@ -43,7 +47,11 @@ import {
   type SelectedOfferProduct,
 } from "../types";
 import { jparse, jstr } from "../lib/json";
-import { effectiveDescription } from "./catalog.server";
+import {
+  effectiveDescription,
+  effectiveTranslatedDescription,
+  languagesMatch,
+} from "./catalog.server";
 import { getSettings } from "./settings.server";
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -111,7 +119,7 @@ Non-negotiable rules:
 5. Be concrete and specific — facts persuade, adjectives don't. Each product in the brief comes with a description: mine those descriptions for ingredients, actives, mechanisms, textures and usage moments, and build the argument from them, never from generic category assumptions. When the offered product serves a DIFFERENT area or purpose than the basket products (e.g. a face serum offered after a body cream), present it honestly as EXTENDING the routine to that new area — never claim it enhances, boosts, or completes the basket products' own results unless a description explicitly states a direct interaction.
 6. Mention the {{discount_pct}}% discount exactly once across all fields — in the lead OR the closer, never in the paragraphs or bullets — framed as a private post-purchase courtesy that is applied automatically. Prices are in {{currency}}; never invent numbers that are not in the brief.
 7. The brief is the complete universe of products AND facts. NEVER mention, imply, or invent any product, size, format, sample, sachet, mini, gift, or set component that is not explicitly listed in the brief. Every product name in your copy must appear verbatim in the basket list or the offer list — and only offered products are being sold.
-8. Use every product name EXACTLY as written in the brief — the names are already in the customer's language; never translate, shorten, or restyle a product name.
+8. Use every product name EXACTLY as written at the START of its brief line — those name fields are already in the customer's language; never translate, shorten, or restyle a product name. Descriptions are grounding material only: they may be written in another language and may refer to a product under a different or translated name — NEVER take a product name from inside a description text.
 9. Fact discipline: every claim must trace to something stated in the brief — the product descriptions, the prices, or the brand context. No invented studies, statistics, awards, reviews, or ingredient percentages. If the brief lacks the proof for a claim, write the weaker statement that is true instead.
 10. Research proof — the "proof" field ONLY. This is the single, narrow exception to rule 9's ban on studies, and every condition below is mandatory: (a) each statement is about exactly ONE ingredient, and that ingredient must appear BY NAME in the brief's product descriptions (e.g. retinol, vitamin C / ascorbic acid, peptides, hyaluronic acid, niacinamide, caffeine) — if the descriptions name no recognizable cosmetic ingredient, return "proof": []. (b) State only findings that are broadly established and replicated across the published literature — the kind summarized in dermatology reviews — never one study's isolated result. (c) NEVER invent or name specific journals, universities, authors, years, sample sizes, or precise percentages unless they are genuinely canonical; prefer formulations like "In published clinical studies, topical retinol has been shown to visibly reduce the appearance of fine lines over 8–12 weeks". (d) Each finding describes the INGREDIENT, never this product — "studies on niacinamide", never "studies on this cream". (e) Rule 3 applies in full: appearance, look and feel only, no medical claims. (f) Proof statements never mention the discount.
 11. Never use em dashes (—) or en dashes (–) anywhere in your output, in any language. Use a comma, colon, or period instead.
@@ -194,6 +202,65 @@ export async function ensurePromptTemplates(shop: string): Promise<void> {
   }
 }
 
+/**
+ * Surgical, edit-preserving upgrades to stored prompt templates: when a rule
+ * sentence is improved in SYSTEM_CORE, existing shops' templates still carry
+ * the old sentence (templates are seeded once and never overwritten). Each
+ * entry replaces the OLD sentence verbatim wherever it still appears — a
+ * merchant's other edits are untouched, and a template where the merchant
+ * rewrote the sentence itself is left alone. Applying an upgrade bumps the
+ * template version, which also invalidates cached copy (promptVersion is in
+ * the cache key), so the improved rule takes effect on the next generation.
+ */
+const PROMPT_RULE_UPGRADES: Array<{ from: string; to: string }> = [
+  {
+    // Rule 8 sharpening: descriptions may be in another language and contain
+    // the product's name in that language — the model must never take a name
+    // from description text (observed: German name echoed into English copy).
+    from: "8. Use every product name EXACTLY as written in the brief — the names are already in the customer's language; never translate, shorten, or restyle a product name.",
+    to: "8. Use every product name EXACTLY as written at the START of its brief line — those name fields are already in the customer's language; never translate, shorten, or restyle a product name. Descriptions are grounding material only: they may be written in another language and may refer to a product under a different or translated name — NEVER take a product name from inside a description text.",
+  },
+];
+
+/**
+ * Self-heal stored prompt templates (fire-and-forget from the dashboard
+ * loader, like ensureUiStringsFresh). Never throws.
+ */
+export async function ensurePromptRulesFresh(shop: string): Promise<void> {
+  try {
+    const rows = await prisma.promptTemplate.findMany({ where: { shop } });
+    for (const row of rows) {
+      let systemPrompt = row.systemPrompt;
+      let userPrompt = row.userPrompt;
+      for (const { from, to } of PROMPT_RULE_UPGRADES) {
+        systemPrompt = systemPrompt.split(from).join(to);
+        userPrompt = userPrompt.split(from).join(to);
+      }
+      if (systemPrompt === row.systemPrompt && userPrompt === row.userPrompt) {
+        continue;
+      }
+      // Optimistic write: only apply the patch if the template still holds
+      // the exact text we read. A merchant Save/Reset landing in between
+      // makes the where-clause miss (0 rows) — their edit wins, and the next
+      // dashboard load re-patches if the old sentence is still present. This
+      // also collapses concurrent dashboard loads to a single version bump.
+      const { count } = await prisma.promptTemplate.updateMany({
+        where: {
+          id: row.id,
+          systemPrompt: row.systemPrompt,
+          userPrompt: row.userPrompt,
+        },
+        data: { systemPrompt, userPrompt, version: { increment: 1 } },
+      });
+      if (count > 0) {
+        console.log(`[ai] prompt rules self-healed for ${shop}/${row.key}`);
+      }
+    }
+  } catch (error) {
+    console.error(`[ai] ensurePromptRulesFresh failed for ${shop}:`, error);
+  }
+}
+
 interface ResolvedPromptTemplate {
   systemPrompt: string;
   userPrompt: string;
@@ -235,7 +302,13 @@ async function getPromptTemplate(
     // together, so a tight cap truncates mid-object. 4000 is headroom, not
     // spend — short outputs cost the same.
     maxTokens: 4000,
-    version: 1,
+    // 0 is unreachable for real templates (versions start at 1 and only
+    // increment). Falling back to 1 here would recompute the version-1-era
+    // cache keys during a DB blip and serve exactly the stale rows a later
+    // version bump (merchant save, reset, or rule self-heal) was issued to
+    // retire. Version 0 keys are their own consistent "defaults era":
+    // worst case is a spurious regeneration, never resurrected copy.
+    version: 0,
   };
 }
 
@@ -377,19 +450,9 @@ function translatedDescription(
     {},
   );
   if (!translations || typeof translations !== "object") return undefined;
-  const direct = translations[language]?.description;
-  if (direct) return direct;
-  const lower = language.toLowerCase();
-  for (const [key, value] of Object.entries(translations)) {
-    if (key.toLowerCase() === lower && value?.description) return value.description;
-  }
-  const base = lower.split("-")[0];
-  for (const [key, value] of Object.entries(translations)) {
-    if (key.toLowerCase().split("-")[0] === base && value?.description) {
-      return value.description;
-    }
-  }
-  return undefined;
+  // Single source of truth for the language chain — drifting local copies of
+  // this lookup are what let the preview and live paths ground differently.
+  return effectiveTranslatedDescription(translations, language);
 }
 
 /**
@@ -433,10 +496,15 @@ async function loadOfferDescriptions(
 }
 
 async function buildTemplateVars(args: GenerateCopyArgs): Promise<Record<string, string>> {
-  const descriptions = await loadOfferDescriptions(
-    args.shop,
-    args.offerProducts.map((p) => p.productId),
-  );
+  // LANGUAGE-AWARE, exactly like the basket side (buildBasket): merchant AI
+  // context > the T&A description for the buyer's language > synced full >
+  // short. Feeding the primary-locale description to a foreign-language buyer
+  // grounds the model in wrong-language text — and when that text contains
+  // the product's name in the store's primary language, the model echoes THAT
+  // name into the copy, overriding the correct name field of the brief line
+  // (observed in production: German name inside English copy). Shared with
+  // buildCacheKey via the request-scoped memo — one read, one view.
+  const descriptions = await groundingDescriptions(args);
   // Feed everything the merchant stored; halve the per-product cap only if
   // the combined summaries blow the total safety budget.
   let cap = PROMPT_DESCRIPTION_MAX;
@@ -618,26 +686,100 @@ export interface GenerateCopyArgs {
    * fallback paragraphs; generateCopy fills it internally when absent.
    */
   offerDescriptions?: Record<string, string>;
+  /**
+   * INTERNAL request-scoped memo — never set by callers. The grounding
+   * descriptions are read ONCE per args object and shared by buildCacheKey
+   * and buildTemplateVars: if the two performed separate reads, a transient
+   * DB failure (or a merchant edit) landing between them would cache copy
+   * generated from one grounding under a key that hashes another — a blip
+   * would permanently poison the row for every healthy future request.
+   */
+  groundingMemo?: Promise<Map<string, string>>;
 }
 
-function buildCacheKey(args: GenerateCopyArgs, promptVersion: number): string {
-  const offerIds = args.offerProducts.map((p) => p.variantId).sort();
-  // GenerateCopyArgs carries basket titles (no product ids) — the sorted titles
-  // are the basket signature. Capped at 6 to keep the key stable for big carts.
+/** The one grounding read per generation request (see groundingMemo). */
+function groundingDescriptions(args: GenerateCopyArgs): Promise<Map<string, string>> {
+  if (!args.groundingMemo) {
+    args.groundingMemo = loadOfferDescriptions(
+      args.shop,
+      args.offerProducts.map((p) => p.productId),
+      args.language,
+    );
+  }
+  return args.groundingMemo;
+}
+
+async function buildCacheKey(
+  args: GenerateCopyArgs,
+  promptVersion: number,
+): Promise<string> {
+  // variantId alone is NOT enough: the buyer-facing name (manual override or
+  // Translate & Adapt) and the grounding description both feed the prompt, so
+  // a merchant fixing either must invalidate the cached copy — otherwise the
+  // old name keeps serving from cache forever. Pair each id with the exact
+  // name the prompt will use.
+  const offerSig = args.offerProducts
+    .map((p) =>
+      JSON.stringify([p.variantId, p.translatedTitle || p.title, p.price]),
+    )
+    .sort();
+  // Signature of the grounding text. CRITICAL: this is the SAME memoized
+  // read buildTemplateVars uses for the prompt (language-aware: merchant AI
+  // context > T&A description for the buyer's language > synced full >
+  // short) — one read per request, so key and prompt can never see
+  // different grounding, even across a mid-request merchant edit or a
+  // transient DB failure. On a blip the shared read yields an empty Map
+  // (loadOfferDescriptions never throws): the copy generates ungrounded AND
+  // its key hashes the same empty grounding — an orphan row no healthy
+  // request ever reads, never a poisoned one. Buyer path stays never-throw.
+  const descriptions = await groundingDescriptions(args);
+  const descSig = [...descriptions.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([id, text]) =>
+      createHash("sha256").update(JSON.stringify([id, text])).digest("hex").slice(0, 16),
+    );
+  // Basket lines carry the exact titles AND grounding descriptions the prompt
+  // uses (buildBasketSummary injects both) — hash both, for every line, so a
+  // basket-side name or description fix also regenerates copy. Descriptions
+  // are hashed short to keep the key material bounded.
   const basketSig = args.basket
-    .map((line) => line.title)
-    .sort()
-    .slice(0, 6);
+    .map((line) =>
+      JSON.stringify([
+        line.title,
+        createHash("sha256")
+          .update(line.description ?? "")
+          .digest("hex")
+          .slice(0, 16),
+      ]),
+    )
+    .sort();
+  // Everything else the rendered prompt consumes must be in the key too:
+  // position/totalOffers (the sequential template mandates a DIFFERENT angle
+  // per position — sharing rows across positions serves page-2-angled copy
+  // on page 1), the display currency, prices (in offerSig above), and the
+  // brand context/tone from settings (edited in the admin; feeds every
+  // system prompt).
+  const brandSig = createHash("sha256")
+    .update(
+      JSON.stringify([args.settings.brandContext ?? "", args.settings.tone ?? ""]),
+    )
+    .digest("hex")
+    .slice(0, 16);
   // JSON.stringify keeps every component unambiguously delimited — titles or
   // ids containing "," / "|" can no longer collide with a different basket.
   const material = JSON.stringify([
     args.mode,
-    offerIds,
+    offerSig,
+    descSig,
     basketSig,
     args.language,
     args.copyLength,
     String(Math.round(args.discountPct)),
     String(promptVersion),
+    String(args.position),
+    String(args.totalOffers),
+    args.currency,
+    brandSig,
   ]);
   return createHash("sha256").update(material).digest("hex");
 }
@@ -763,7 +905,7 @@ export async function generateCopy(args: GenerateCopyArgs): Promise<{
   reason: CopyReason;
 }> {
   const template = await getPromptTemplate(args.shop, args.mode, args.settings);
-  const cacheKey = buildCacheKey(args, template.version);
+  const cacheKey = await buildCacheKey(args, template.version);
 
   if (!args.bypassCache) {
     try {
@@ -845,12 +987,63 @@ export async function generateCopy(args: GenerateCopyArgs): Promise<{
  */
 export async function withOfferDescriptions(args: GenerateCopyArgs): Promise<GenerateCopyArgs> {
   if (args.copyLength !== "long" || args.offerDescriptions) return args;
-  const byId = await loadOfferDescriptions(
+  // The deterministic fallback QUOTES this text verbatim on the buyer's page
+  // — no model rewrites or translates it, and no prompt rule protects it. So
+  // only text known to be in the buyer's language may be embedded: the T&A
+  // description for that language, or any grounding text when the buyer
+  // reads the store's default language. Anything else is omitted — a shorter
+  // fallback beats wrong-language paragraphs (production symptom: German
+  // paragraphs, German product name, on an English page).
+  const byId = await loadVerbatimSafeDescriptions(
     args.shop,
     args.offerProducts.map((p) => p.productId),
     args.language,
+    args.settings.defaultLanguage,
   );
   return { ...args, offerDescriptions: Object.fromEntries(byId) };
+}
+
+/**
+ * Descriptions safe to render VERBATIM to a buyer reading `language` (see
+ * withOfferDescriptions). Same never-throw contract as loadOfferDescriptions:
+ * a lookup failure degrades to an empty map (the fallback simply loses its
+ * grounded paragraphs).
+ */
+async function loadVerbatimSafeDescriptions(
+  shop: string,
+  productIds: string[],
+  language: string,
+  defaultLanguage: string,
+): Promise<Map<string, string>> {
+  if (productIds.length === 0) return new Map();
+  try {
+    const rows = await prisma.productCache.findMany({
+      where: { shop, productId: { in: productIds } },
+      select: {
+        productId: true,
+        aiDescription: true,
+        descriptionFull: true,
+        descriptionShort: true,
+        translationsJson: true,
+      },
+    });
+    const out = new Map<string, string>();
+    for (const row of rows) {
+      const translated = translatedDescription(row.translationsJson, language);
+      if (translated) {
+        out.set(row.productId, translated);
+        continue;
+      }
+      if (languagesMatch(language, defaultLanguage)) {
+        const text = effectiveDescription(row);
+        if (text) out.set(row.productId, text);
+      }
+    }
+    return out;
+  } catch (error) {
+    console.error(`[ai] verbatim-safe description load failed for ${shop}:`, error);
+    return new Map();
+  }
 }
 
 /**
@@ -867,7 +1060,7 @@ export async function peekDiscountSuggestion(
 ): Promise<number | null> {
   try {
     const template = await getPromptTemplate(args.shop, args.mode, args.settings);
-    const cacheKey = buildCacheKey(args, template.version);
+    const cacheKey = await buildCacheKey(args, template.version);
     const row = await prisma.copyCache.findUnique({
       where: { shop_cacheKey: { shop: args.shop, cacheKey } },
       select: { discountSuggestion: true },
@@ -952,9 +1145,13 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
   fallbackUsed: boolean;
   extendedPending: boolean;
   reason: CopyReason;
+  /** The grounding-aware key this result was computed under. Callers MUST
+   *  pass it to completeExtendedCopy so the background merge lands on the
+   *  same row even if a grounding edit shifts the key in the meantime. */
+  cacheKey: string;
 }> {
   const template = await getPromptTemplate(args.shop, args.mode, args.settings);
-  const cacheKey = buildCacheKey(args, template.version);
+  const cacheKey = await buildCacheKey(args, template.version);
 
   if (!args.bypassCache) {
     try {
@@ -977,6 +1174,7 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
           fallbackUsed: false,
           extendedPending: false,
           reason: "cache",
+      cacheKey,
         };
       }
     } catch (error) {
@@ -993,6 +1191,7 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
       fallbackUsed: true,
       extendedPending: false,
       reason: args.settings.aiEnabled ? "no_key" : "ai_disabled",
+      cacheKey,
     };
   }
 
@@ -1024,6 +1223,7 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
         fallbackUsed: false,
         extendedPending: true,
         reason: "generated",
+      cacheKey,
       };
     }
 
@@ -1040,6 +1240,7 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
       fallbackUsed: false,
       extendedPending: false,
       reason: "generated",
+      cacheKey,
     };
   } catch (error) {
     console.error(
@@ -1059,6 +1260,7 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
       fallbackUsed: true,
       extendedPending: false,
       reason: "timeout_or_error",
+      cacheKey,
     };
   }
 }
@@ -1078,10 +1280,16 @@ export async function completeExtendedCopy(
   args: GenerateCopyArgs,
   core: OfferCopy,
   coreDiscountSuggestion: number | null,
+  /** Key the core call was computed under. Passing it pins the merged write
+   *  to the SAME row as the core's assembly even when a grounding edit (or a
+   *  transient ProductCache read failure) would shift a re-derived key in
+   *  the background window — re-deriving here could otherwise write a
+   *  mixed-grounding row under a key fresh assemblies treat as current. */
+  pinnedCacheKey?: string,
 ): Promise<{ paragraphs: string[]; proof: string[]; closer: string } | null> {
   try {
     const template = await getPromptTemplate(args.shop, args.mode, args.settings);
-    const cacheKey = buildCacheKey(args, template.version);
+    const cacheKey = pinnedCacheKey ?? (await buildCacheKey(args, template.version));
     const vars = await buildTemplateVars(args);
     const stageOverride =
       'The core copy for this page is already live (verbatim below). FOR THIS CALL ONLY output {"paragraphs":string[],"proof":string[]} completing it — same angle, no repetition of the lead or bullets, all standing rules apply (mechanism/proof/relevance, research guardrails, no discount mention). CORE COPY: ' +

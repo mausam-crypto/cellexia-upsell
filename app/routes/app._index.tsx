@@ -30,7 +30,7 @@ import {
   getTimeSeries,
 } from "../services/analytics.server";
 import { autoPickWinners } from "../services/recommendation.server";
-import { ensureUiStringsFresh } from "../services/ai.server";
+import { ensurePromptRulesFresh, ensureUiStringsFresh } from "../services/ai.server";
 import { syncCatalog, syncMarketsAndLocales } from "../services/catalog.server";
 import type { AdminGraphql } from "../types";
 import { MiniChart } from "../components/MiniChart";
@@ -58,19 +58,39 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     void ensureUiStringsFresh(shop).catch((error: unknown) => {
       console.error("[dashboard] ensureUiStringsFresh failed", error);
     });
+    // Same self-heal for prompt templates: improved rule sentences are
+    // patched into stored templates (edit-preserving) without a manual
+    // "Reset prompts"; the version bump regenerates cached copy.
+    void ensurePromptRulesFresh(shop).catch((error: unknown) => {
+      console.error("[dashboard] ensurePromptRulesFresh failed", error);
+    });
   } catch (error) {
     console.error("[dashboard] ensureUiStringsFresh failed", error);
   }
 
   // Housekeeping: prune IssuedOffer rows that expired more than a day ago,
-  // and EventDedup claims older than 7 days (replay protection only needs to
-  // outlive the offer TTL; OfferEvent rows are the durable analytics record).
+  // EventDedup claims older than 7 days (replay protection only needs to
+  // outlive the offer TTL; OfferEvent rows are the durable analytics record),
+  // and CopyCache rows older than 45 days — the grounding-aware cache key
+  // orphans rows whenever a product name or description changes, so old rows
+  // are unreachable garbage, and 45 days comfortably outlives any hot entry.
+  // Rows holding a discountSuggestion are EXEMPT: the baseline-pct row keeps
+  // the adopted AI discount alive via peekDiscountSuggestion on every
+  // assembly but is never rewritten, so age says nothing about its liveness
+  // — pruning it would silently reset discount convergence.
   try {
     await prisma.issuedOffer.deleteMany({
       where: { shop, expiresAt: { lt: new Date(Date.now() - 24 * 3600 * 1000) } },
     });
     await prisma.eventDedup.deleteMany({
       where: { shop, createdAt: { lt: new Date(Date.now() - 7 * 24 * 3600 * 1000) } },
+    });
+    await prisma.copyCache.deleteMany({
+      where: {
+        shop,
+        createdAt: { lt: new Date(Date.now() - 45 * 24 * 3600 * 1000) },
+        discountSuggestion: null,
+      },
     });
   } catch (error) {
     console.error("[dashboard] housekeeping prune failed", error);

@@ -283,6 +283,26 @@ model MarketSetting {
   @@unique([shop, marketHandle])
 }
 
+// Per-country variant prices fetched from Shopify's contextualPricing —
+// the REAL price a buyer in that country pays (market price adjustments and
+// fixed price-list prices included), in the market's currency. Written by
+// market-pricing.server on demand with a TTL; rows are only ever a cache.
+model ContextualPriceCache {
+  id             String   @id @default(cuid())
+  shop           String
+  variantId      String
+  country        String
+  // Null price = Shopify returned no contextual price for this variant in
+  // this country (kept so the miss is cached too and not re-fetched hot).
+  price          Float?
+  compareAtPrice Float?
+  currency       String   @default("")
+  fetchedAt      DateTime @default(now())
+
+  @@unique([shop, variantId, country])
+  @@index([shop, fetchedAt])
+}
+
 // Buyer-facing static UI strings, per language. Seeded for all store locales,
 // editable in the admin, auto-translatable via Claude/DeepL.
 model UiString {

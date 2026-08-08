@@ -579,7 +579,7 @@ Work through this on a dev store before go-live:
 - [ ] **Preview page** (`/app/preview`): generate an advanced preview in 2–3
       languages and verify translated product names and copy in each.
 - [ ] **Multi-currency preview**: set a preview FX rate on a USD market
-      (the Markets page), preview with a country from that market, and
+      (Settings → Markets), preview with a country from that market, and
       verify the offer page shows USD prices (engine thresholds and analytics
       stay in the shop currency — only the displayed prices convert).
 - [ ] **Manual product name**: set a manual name for a product in one
@@ -896,7 +896,7 @@ display-only.**
   preview rate can only make a preview look wrong, never charge a buyer
   wrongly.
 
-**The Markets health checks** (the Markets page) surface, per market row,
+**The Markets health checks** (Settings → Markets) surface, per market row,
 whatever would make offers or previews misbehave there — most relevantly for
 currency: a market with no synced `currency` (run **Re-sync**; the field is
 populated by `syncMarketsAndLocales` from the Shopify Markets API), and a
@@ -929,6 +929,34 @@ The Products tab badge counts a language as covered when any of the three
 applies (override, synced translation, or the default language via the base
 title). The AI is instructed to use the given names verbatim — the precedence
 decides what it is given, never how it may restyle them.
+
+**Language-aware grounding:** the descriptions fed to the AI for offered
+products follow the same per-language precedence as the basket side —
+merchant AI context > the Translate & Adapt description for the buyer's
+language > the synced Shopify description. This matters beyond translation
+quality: a primary-locale description usually contains the product's
+primary-locale NAME, and a model grounded in it will echo that name into
+foreign-language copy even when the brief's name field is correct. The
+system rules additionally forbid taking any product name from description
+text (names come only from the name fields), and this rule is self-healed
+into existing stores' templates from the dashboard (no "Reset prompts"
+needed — the patch is edit-preserving and bumps the template version, which
+also regenerates cached copy).
+
+**Cache invalidation:** the CopyCache key is grounding-aware — it includes
+the resolved buyer-facing names of the offered products AND basket lines,
+plus signatures of the exact per-language grounding text the prompt
+consumes (identical `loadOfferDescriptions(shop, ids, language)` call on
+both sides). Fixing a name, editing AI context, or correcting the
+description the buyer's language actually uses therefore regenerates copy
+on the very next assembly; no prompt reset or manual cache flush is
+involved.
+Already-issued offer pages (per `referenceId`) stay frozen by design —
+re-test with a new order. Rows orphaned by a grounding change are pruned by
+the dashboard housekeeping pass (CopyCache rows older than 45 days, except
+rows carrying an AI discount suggestion, which keep convergence alive). The
+AI & Prompts fast copy preview resolves names with the same precedence as
+the live engine, so a saved name fix shows up there immediately too.
 
 ### The em-dash policy
 

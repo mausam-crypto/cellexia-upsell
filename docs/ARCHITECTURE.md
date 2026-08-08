@@ -76,6 +76,9 @@ app/
                                    backfillPendingRevenue (payment recovery),
                                    dashboard stats, time series, breakdowns,
                                    experiment posteriors, CLV cohorts, toCsv
+    market-pricing.server.ts       getContextualPrices / resolveUniformPricing —
+                                   real per-country prices via Shopify
+                                   contextualPricing (+ ContextualPriceCache)
     offer-orchestrator.server.ts   assembleOfferResponse / assembleThankYouOffer
                                    (language resolution, copy, IssuedOffer)
   routes/
@@ -313,6 +316,7 @@ always read/write them with `jparse`/`jstr` from `app/lib/json.ts`.
 | `OrderRecord` / `OrderLine` | Order history from `orders/create`: totals, currency, country, customer id, per-line product/variant/qty/price, `isUpsell` marking, `hadUpsellOffer`/`acceptedUpsell` flags. Powers co-purchase affinity, suppression, repeat-purchase rates and CLV cohorts. |
 | `CustomerState` | Per-customer frequency capping: `lastOfferAt`, counters. Only exists for logged-in customers (guests can't be capped). |
 | `MarketSetting` | Per-Shopify-Market overrides: enabled, discount %, language, max offers, `countriesJson`, plus `currency` (market base currency, synced from the Markets API) and `previewFxRate` (admin-set FX rate used ONLY to simulate the market on the Preview page — never read on live-buyer paths; live buyers get the rate implied by their own order, see §6.4). Seeded from the Markets API; re-sync never overwrites admin-set overrides (incl. `previewFxRate`). |
+| `ContextualPriceCache` | Per-(shop, variantId, country) cache of Shopify's `contextualPricing` — the REAL price a buyer in that country pays (market adjustments and price lists included) in the market's currency. Written on demand by `market-pricing.server` with a 6h TTL; stale rows are served when the Admin API is unreachable. `price` null = cached known-miss. Only ever a cache — safe to truncate. |
 | `UiString` | Buyer-facing static strings per (shop, language, key). Seeded from `DEFAULT_UI_STRINGS_EN`, editable, auto-translatable. Lookup falls back requested lang → base lang (`pt-PT`→`pt`) → `en` → compiled defaults, per key. |
 
 ## 5. The recommendation engine (technical)
@@ -570,9 +574,28 @@ presentment currency is display-only.**
   `calculateChangeset`.
 - The admin Preview has no real order to imply a rate from, so a simulated
   market uses `MarketSetting.currency` + `MarketSetting.previewFxRate`
-  (admin-set, preview-only — see the Markets page's health checks). A
+  (admin-set, preview-only — see the Settings → Markets health checks). A
   wrong preview rate can only make a preview look wrong; it is never read on
   a live-buyer path.
+- **Real per-country prices** (`app/services/market-pricing.server.ts`)
+  supersede both mechanisms above for the DISPLAYED amounts whenever
+  available: at offer-build time the orchestrator fetches Shopify's
+  `ProductVariant.contextualPricing` for the offered variants in the buyer's
+  `countryCode` (via the shop's offline session — `unauthenticated.admin`),
+  which returns the market's actual price — percentage adjustments and fixed
+  price-list prices included, denominated in the market's currency. Rows are
+  DB-cached (`ContextualPriceCache`, 6h TTL, stale-served on fetch failure);
+  the Admin API call has a hard 2s timeout and is kicked off before copy
+  generation and awaited after it, so the buyer path's ShouldRender budget
+  pays ~nothing. Applied all-or-nothing per response (every offered variant
+  priced, one shared currency) — otherwise display falls back to the FX
+  mechanisms above. Engine math is untouched either way: changesets still
+  carry only percentage discounts, and Shopify prices the added item itself
+  at checkout — which is exactly why the contextual price is the correct
+  number to show. `AssembleOfferOptions.pricingSource` reports which path
+  ran ("contextual" / "fx" / "shop"); the Preview page surfaces it as a
+  badge, and IssuedOffer meta stores it alongside the applied
+  `presentmentCurrency` for reuse fidelity.
 
 ## 7. The two extensions
 

@@ -125,6 +125,27 @@ export function effectiveProductName(
   return p.title;
 }
 
+/**
+ * THE single per-language description lookup: the Translate & Adapt
+ * description for a language, resolved with the same exact →
+ * case-insensitive → base-prefix chain as names. Every caller that needs a
+ * buyer-language description MUST use this — three drifting copies of this
+ * logic caused the preview/live grounding divergence. Pure, never throws.
+ */
+export function effectiveTranslatedDescription(
+  translations: Record<string, ProductTranslationEntry> | null | undefined,
+  language: string,
+): string | undefined {
+  return pickLanguageValue(translations, language, (t) => t?.description);
+}
+
+/** Case-insensitive base-prefix language equality ("pt-PT" matches "pt"). */
+export function languagesMatch(a: string, b: string): boolean {
+  const norm = (v: string) => String(v ?? "").toLowerCase().split("-")[0];
+  const na = norm(a);
+  return na.length > 0 && na === norm(b);
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 // Page sizes are kept small so each query stays under the Admin GraphQL

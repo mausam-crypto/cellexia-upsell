@@ -192,12 +192,16 @@ interface GenerateResult {
    * presentment was simulated. rate is the ctx.presentmentRate the action
    * passed to the engine — null means no simulation ran and prices are plain
    * shop-currency amounts. rateIsDefault flags the 1.0 fallback used when
-   * the market has no preview FX rate configured yet.
+   * the market has no preview FX rate configured yet. pricingSource is the
+   * engine's out-param: "contextual" = real per-country Shopify prices were
+   * used and the FX rate was NOT applied; "fx" = converted base prices;
+   * "shop" = plain shop-currency prices.
    */
   presentment: {
     marketName: string | null;
     rate: number | null;
     rateIsDefault: boolean;
+    pricingSource: "contextual" | "fx" | "shop" | null;
   };
 }
 
@@ -398,6 +402,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         rate: presentmentRate,
         rateIsDefault:
           presentmentRate !== null && simulatedMarket?.previewFxRate == null,
+        pricingSource: options.pricingSource ?? null,
       },
     };
     return json({ ok: true as const, message: "", result });
@@ -729,7 +734,7 @@ export default function PreviewPage() {
                 options={marketOptions}
                 value={market}
                 onChange={handleMarketChange}
-                helpText="Simulates the market's display currency with its preview FX rate. Picking a market sets the shipping country."
+                helpText="Uses the real per-country prices from Shopify when available, falling back to the market's display currency with its preview FX rate. Picking a market sets the shipping country."
               />
               <Select
                 label="Shipping country"
@@ -832,7 +837,11 @@ export default function PreviewPage() {
                         : "No market (store default)"}
                     </Badge>
                     <Badge>{`Display currency: ${result.response.currency}`}</Badge>
-                    {result.presentment.rate !== null ? (
+                    {result.presentment.pricingSource === "contextual" ? (
+                      <Badge tone="success">Real market prices</Badge>
+                    ) : null}
+                    {result.presentment.pricingSource === "fx" &&
+                    result.presentment.rate !== null ? (
                       <Badge
                         tone={result.presentment.rateIsDefault ? "warning" : "info"}
                       >
@@ -878,7 +887,18 @@ export default function PreviewPage() {
                   </Text>
                 </Box>
               ) : null}
-              {result && result.presentment.rate !== null ? (
+              {result?.presentment.pricingSource === "contextual" ? (
+                <Box paddingBlockStart="200">
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    Prices are the real per-country prices fetched from Shopify
+                    (contextual pricing — market price adjustments and price
+                    lists included). The preview FX rate was not needed. Live
+                    buyers see these same amounts.
+                  </Text>
+                </Box>
+              ) : result &&
+                result.presentment.pricingSource === "fx" &&
+                result.presentment.rate !== null ? (
                 <Box paddingBlockStart="200">
                   <Text
                     as="p"
@@ -886,8 +906,8 @@ export default function PreviewPage() {
                     tone={result.presentment.rateIsDefault ? "caution" : "subdued"}
                   >
                     {result.presentment.rateIsDefault
-                      ? "Prices are simulated with the market's preview FX rate (1, the default — no rate is configured for this market yet, so amounts equal shop-currency values). Live buyers see Shopify's exact checkout conversion; set a preview FX rate on the Markets page for realistic amounts."
-                      : `Prices are simulated with the market's preview FX rate (${result.presentment.rate}) — live buyers see Shopify's exact checkout conversion.`}
+                      ? "Real per-country prices were unavailable, so prices are simulated with the market's preview FX rate (1, the default — no rate is configured for this market yet, so amounts equal shop-currency values). Live buyers see Shopify's exact checkout conversion; set a preview FX rate in Settings → Markets for realistic amounts."
+                      : `Real per-country prices were unavailable, so prices are simulated with the market's preview FX rate (${result.presentment.rate}) — live buyers see Shopify's exact checkout conversion.`}
                   </Text>
                 </Box>
               ) : null}
