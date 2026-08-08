@@ -637,6 +637,9 @@ export async function selectOffers(
 
     const isSuppressed = (p: CatalogProduct, v: CachedVariant | null): boolean => {
       if (!v) return true;
+      // Merchant allowlist (Upsell products tab): ineligible products are
+      // never offered — not by rules, not by auto-pilot, on any surface.
+      if (p.upsellEligible === false) return true;
       if (suppressed.has(normId(p.productId))) return true;
       if (p.status !== "ACTIVE") return true;
       if (v.inventoryQuantity !== null && v.inventoryQuantity < settings.minInventory) return true;

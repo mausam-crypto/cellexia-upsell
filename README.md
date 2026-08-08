@@ -105,6 +105,7 @@ app/
     app.offers.$id.tsx            Admin: rule editor
     app.preview.tsx               Admin: offer preview sandbox (production pipeline, no analytics)
     app.products.tsx              Admin: AI-context editor + translated-name coverage
+    app.upsell-products.tsx       Admin: allowlist of products the engine may offer
     app.prompts.tsx               Admin: AI prompt templates + preview
     app.settings.tsx              Admin: settings (discount, markets, languages, AI, ...)
     app.translations.tsx          Admin: buyer-facing UI strings per language

@@ -203,6 +203,25 @@ its translated names — Sync is for bulk edits and translation sessions. Your
 manual names and AI context are merchant-owned and are never touched by any
 sync or webhook.
 
+## Upsell products
+
+The allowlist of products the engine may offer. Unchecking a product
+guarantees it is **never** offered — not by rules, not by auto-pilot, not
+post-purchase, not on the thank-you page. Use it for internal-only rows in
+your catalog: duplicates from imports, B2B/sample products, or anything
+ACTIVE in the admin that buyers should never see as an offer.
+
+- Excluded products stay in the catalog and can still be used in Preview
+  test-order baskets; offer rules naming an excluded candidate silently skip
+  it.
+- The tab also warns about offerable products that have **no name for your
+  default language** (no manual name, no Translate & Adapt title) — those
+  show their Shopify base title verbatim, which is how a foreign-language
+  base title from an imported duplicate ends up on a buyer page. Exclude the
+  product or name it on the Products tab.
+- The flag survives catalog syncs and product webhooks — it is yours, like
+  AI context and manual names.
+
 ## Prompts (AI copy)
 
 Three templates, one per situation:

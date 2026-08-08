@@ -1087,6 +1087,7 @@ export async function assembleOfferResponse(
         productId: p.productId,
         baseTitle: p.title,
         status: p.status,
+        upsellEligible: p.upsellEligible,
         cacheRowUpdatedAt: updatedAtById.get(p.productId)?.toISOString() ?? null,
         aiContextLength: p.aiDescription.trim().length,
         aiContextSnippet: p.aiDescription.trim() ? debugText(p.aiDescription, 400) : null,

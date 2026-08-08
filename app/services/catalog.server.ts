@@ -49,6 +49,11 @@ export interface CatalogProduct {
    * Always wins over Translate & Adapt synced names; never touched by syncs.
    */
   nameOverrides: Record<string, string>;
+  /**
+   * Merchant-curated allowlist (Upsell products tab): false = never offered
+   * as an upsell. Merchant-owned; syncs and webhooks never touch it.
+   */
+  upsellEligible: boolean;
 }
 
 /**
@@ -308,6 +313,7 @@ function rowToProduct(row: {
   variantsJson: string;
   translationsJson: string;
   nameOverridesJson: string;
+  upsellEligible: boolean;
 }): CatalogProduct {
   return {
     productId: row.productId,
@@ -324,6 +330,7 @@ function rowToProduct(row: {
     variants: jparse<CachedVariant[]>(row.variantsJson, []),
     translations: jparse<Record<string, ProductTranslationEntry>>(row.translationsJson, {}),
     nameOverrides: jparse<Record<string, string>>(row.nameOverridesJson, {}),
+    upsellEligible: row.upsellEligible !== false,
   };
 }
 
@@ -636,6 +643,7 @@ function mapGraphqlProduct(node: any): CatalogProduct {
     variants: variantNodes.map(mapGraphqlVariant),
     translations: {},
     nameOverrides: {}, // merchant-written — never sourced from Shopify, preserved on writes
+    upsellEligible: true, // merchant-owned — omitted from upserts, preserved on writes
   };
 }
 

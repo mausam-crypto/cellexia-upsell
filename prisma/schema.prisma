@@ -67,6 +67,10 @@ model ProductCache {
   // Merchant-set per-language product names (Products tab): { "fr": "…" }.
   // Always wins over Translate & Adapt synced names; never touched by syncs.
   nameOverridesJson String  @default("{}")
+  // Merchant-curated allowlist (Upsell products tab): false = this product is
+  // never offered as an upsell (internal/duplicate/B2B products). Merchant-
+  // owned like aiDescription — never touched by syncs or webhooks.
+  upsellEligible   Boolean  @default(true)
   updatedAt        DateTime @updatedAt
 
   @@unique([shop, productId])
