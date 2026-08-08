@@ -96,6 +96,7 @@ app/
     ai.server.ts                  Claude copywriting, prompt templates, UI-string translation
     analytics.server.ts           Event recording, dashboards, experiments, CLV cohorts
     market-pricing.server.ts      Real per-country prices (Shopify contextualPricing, cached)
+    debug.server.ts               Diagnostic traces (Debug tab): prompts, provenance, name scan
     offer-orchestrator.server.ts  Assembles the full offer response for the extensions
   routes/
     app._index.tsx                Admin: dashboard
@@ -107,6 +108,7 @@ app/
     app.prompts.tsx               Admin: AI prompt templates + preview
     app.settings.tsx              Admin: settings (discount, markets, languages, AI, ...)
     app.translations.tsx          Admin: buyer-facing UI strings per language
+    app.debug.tsx                 Admin: full generation traces (prompts, provenance, name scan)
     api.offer.tsx                 Public: post-purchase offer endpoint (JWT-verified)
     api.offer-extended.tsx        Public: below-CTA copy sections, polled while extendedPending
     api.sign-changeset.tsx        Public: signs changesets from server-side IssuedOffer rows

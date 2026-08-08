@@ -51,6 +51,11 @@ import {
   type PageCopyDiagnostic,
 } from "../services/offer-orchestrator.server";
 import {
+  createDebugTrace,
+  type AliasHit,
+  type DebugEntry,
+} from "../services/debug.server";
+import {
   LANGUAGE_LABELS,
   type OfferResponse,
   type PurchaseContext,
@@ -203,6 +208,12 @@ interface GenerateResult {
     rateIsDefault: boolean;
     pricingSource: "contextual" | "fx" | "shop" | null;
   };
+  /**
+   * Full diagnostic trace of this generation (also persisted to the Debug
+   * tab): every resolution step, the exact prompts, the raw model output,
+   * and the foreign-language name scan results.
+   */
+  debug: { entries: DebugEntry[]; aliasHits: AliasHit[] } | null;
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -362,6 +373,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const options: AssembleOfferOptions = {
       copyTimeoutMs: 30_000,
       diagnostics,
+      // Full trace: every resolution step, prompts, raw model output. Also
+      // persisted to the Debug tab; returned inline for the diagnostics panel.
+      debug: createDebugTrace(),
     };
     const response = await assembleOfferResponse(ctx, options);
     const latencyMs = Date.now() - started;
@@ -404,6 +418,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           presentmentRate !== null && simulatedMarket?.previewFxRate == null,
         pricingSource: options.pricingSource ?? null,
       },
+      debug: options.debug
+        ? {
+            entries: options.debug.entries,
+            aliasHits:
+              ((options.debug.entries.find((e) => e.stage === "alias-scan")
+                ?.data as { hits?: AliasHit[] } | undefined)?.hits) ?? [],
+          }
+        : null,
     };
     return json({ ok: true as const, message: "", result });
   } catch (error) {
@@ -954,6 +976,76 @@ export default function PreviewPage() {
                   </InlineStack>
                 ) : null}
               </BlockStack>
+            ) : null}
+
+            {result?.debug ? (
+              <Card>
+                <BlockStack gap="300">
+                  <InlineStack align="space-between" blockAlign="center" wrap>
+                    <Text as="h2" variant="headingMd">
+                      Diagnostics
+                    </Text>
+                    <Text as="span" variant="bodySm" tone="subdued">
+                      Full trace of this generation — also saved to the Debug
+                      tab.
+                    </Text>
+                  </InlineStack>
+                  {result.debug.aliasHits.length > 0 ? (
+                    <Banner
+                      tone="critical"
+                      title={`Foreign-language product name detected (${result.debug.aliasHits.length} hit${result.debug.aliasHits.length === 1 ? "" : "s"})`}
+                    >
+                      <BlockStack gap="150">
+                        {result.debug.aliasHits.map((hit, i) => (
+                          <Text key={i} as="p" variant="bodySm">
+                            {`"${hit.alias}" (${hit.aliasLanguage} ${hit.aliasSource.replace("_", " ")}) appears in `}
+                            <b>{hit.foundIn}</b>
+                            {` — the ${LANGUAGE_LABELS[result.languageResolution?.language ?? ""] ?? "buyer-language"} name should be "${hit.expectedName}". Context: …${hit.excerpt}…`}
+                          </Text>
+                        ))}
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          A hit in a summary or prompt block means wrong-language
+                          data reached the prompt (check that block's source in
+                          the trace below). A hit only in model_output means the
+                          model produced it despite clean input.
+                        </Text>
+                      </BlockStack>
+                    </Banner>
+                  ) : (
+                    <Banner tone="success" title="No foreign-language product names found in the prompts or the model output" />
+                  )}
+                  <BlockStack gap="100">
+                    {result.debug.entries.map((entry, i) => (
+                      <details key={`${result.generatedAt}-${i}`}>
+                        <summary style={{ cursor: "pointer", padding: "2px 0" }}>
+                          <Text as="span" variant="bodySm" fontWeight="semibold">
+                            {entry.stage}
+                          </Text>{" "}
+                          <Text as="span" variant="bodySm" tone="subdued">
+                            {`+${entry.atMs} ms`}
+                          </Text>
+                        </summary>
+                        <pre
+                          style={{
+                            margin: "4px 0 8px",
+                            padding: "8px 12px",
+                            background: "var(--p-color-bg-surface-secondary, #f6f6f7)",
+                            borderRadius: 8,
+                            fontSize: 11,
+                            lineHeight: 1.45,
+                            overflow: "auto",
+                            maxHeight: 420,
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          {JSON.stringify(entry.data, null, 2)}
+                        </pre>
+                      </details>
+                    ))}
+                  </BlockStack>
+                </BlockStack>
+              </Card>
             ) : null}
 
             {!result && !errorMessage ? (

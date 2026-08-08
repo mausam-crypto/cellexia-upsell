@@ -50,9 +50,11 @@ import { jparse, jstr } from "../lib/json";
 import {
   effectiveDescription,
   effectiveTranslatedDescription,
+  explainTranslatedDescription,
   languagesMatch,
 } from "./catalog.server";
 import { getSettings } from "./settings.server";
+import { debugAdd, debugText, type DebugTrace } from "./debug.server";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -463,10 +465,20 @@ function translatedDescription(
  * (effectiveDescription). Never throws — a failed lookup degrades to an
  * empty map.
  */
+/** Where one product's grounding text came from — debug/diagnostics only. */
+export interface GroundingExplain {
+  source: "ai_context" | "translation" | "description_full" | "description_short" | "missing";
+  /** Translation map key that matched (translation source only). */
+  matchedKey?: string;
+  length: number;
+  snippet: string;
+}
+
 async function loadOfferDescriptions(
   shop: string,
   productIds: string[],
   language?: string,
+  explain?: Map<string, GroundingExplain>,
 ): Promise<Map<string, string>> {
   if (productIds.length === 0) return new Map();
   try {
@@ -482,11 +494,38 @@ async function loadOfferDescriptions(
     });
     return new Map(
       rows.map((row): [string, string] => {
+        const record = (
+          value: string,
+          source: GroundingExplain["source"],
+          matchedKey?: string,
+        ): [string, string] => {
+          explain?.set(row.productId, {
+            source,
+            ...(matchedKey ? { matchedKey } : {}),
+            length: value.length,
+            snippet: debugText(value, 600),
+          });
+          return [row.productId, value];
+        };
         if (language && !(row.aiDescription ?? "").trim()) {
-          const translated = translatedDescription(row.translationsJson, language);
-          if (translated) return [row.productId, translated];
+          const translated = explainTranslatedDescription(
+            jparse<Record<string, { title?: string; description?: string }>>(
+              row.translationsJson,
+              {},
+            ),
+            language,
+          );
+          if (translated) return record(translated.value, "translation", translated.matchedKey);
         }
-        return [row.productId, effectiveDescription(row)];
+        const value = effectiveDescription(row);
+        const source: GroundingExplain["source"] = (row.aiDescription ?? "").trim()
+          ? "ai_context"
+          : (row.descriptionFull ?? "").trim()
+            ? "description_full"
+            : value
+              ? "description_short"
+              : "missing";
+        return record(value, source);
       }),
     );
   } catch (error) {
@@ -526,6 +565,26 @@ async function buildTemplateVars(args: GenerateCopyArgs): Promise<Record<string,
       args.discountPct,
       cap,
     );
+  }
+  if (args.debug) {
+    // The exact text blocks the prompt is assembled from — this is where a
+    // wrong-language product name hides. Captured verbatim (truncated).
+    debugAdd(args.debug, "prompt-blocks", {
+      language: args.language,
+      mode: args.mode,
+      position: args.position,
+      discountPct: Math.round(args.discountPct),
+      currency: args.currency,
+      copyLength: args.copyLength,
+      brand_context: debugText(args.settings.brandContext),
+      tone: debugText(args.settings.tone),
+      basket_summary: debugText(basketSummary),
+      offer_summary: debugText(offerSummary),
+    });
+    debugAdd(args.debug, "grounding-provenance", {
+      note: "per offered product: which stored text grounds the copy (ai_context = merchant AI context, translation = T&A description for the buyer language, description_full/short = base Shopify description)",
+      products: Object.fromEntries(args.groundingExplain ?? new Map()),
+    });
   }
   return {
     brand_context: args.settings.brandContext,
@@ -695,15 +754,26 @@ export interface GenerateCopyArgs {
    * would permanently poison the row for every healthy future request.
    */
   groundingMemo?: Promise<Map<string, string>>;
+  /**
+   * Optional diagnostic trace (admin preview / live debug logging). Purely
+   * observational: entries are appended, nothing reads them on this path.
+   */
+  debug?: DebugTrace;
+  /** INTERNAL — grounding provenance captured by the memoized read. */
+  groundingExplain?: Map<string, GroundingExplain>;
 }
 
 /** The one grounding read per generation request (see groundingMemo). */
 function groundingDescriptions(args: GenerateCopyArgs): Promise<Map<string, string>> {
   if (!args.groundingMemo) {
+    if (args.debug && !args.groundingExplain) {
+      args.groundingExplain = new Map();
+    }
     args.groundingMemo = loadOfferDescriptions(
       args.shop,
       args.offerProducts.map((p) => p.productId),
       args.language,
+      args.groundingExplain,
     );
   }
   return args.groundingMemo;
@@ -835,13 +905,38 @@ async function generateAndCache(
   timeoutMs: number,
 ): Promise<{ copy: OfferCopy; discountSuggestion: number | null }> {
   const vars = await buildTemplateVars(args);
-  const raw = await claudeComplete({
+  const system = renderTemplate(template.systemPrompt, vars);
+  const prompt = renderTemplate(template.userPrompt, vars);
+  debugAdd(args.debug, "claude-request", {
+    position: args.position,
     model: template.model,
-    system: renderTemplate(template.systemPrompt, vars),
-    prompt: renderTemplate(template.userPrompt, vars),
+    templateVersion: template.version,
     maxTokens: template.maxTokens,
-    temperature: template.temperature,
     timeoutMs,
+    cacheKey,
+    systemPrompt: debugText(system, 40_000),
+    userPrompt: debugText(prompt, 40_000),
+  });
+  let raw: string;
+  try {
+    raw = await claudeComplete({
+      model: template.model,
+      system,
+      prompt,
+      maxTokens: template.maxTokens,
+      temperature: template.temperature,
+      timeoutMs,
+    });
+  } catch (error) {
+    debugAdd(args.debug, "claude-error", {
+      position: args.position,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+  debugAdd(args.debug, "claude-response", {
+    position: args.position,
+    raw: debugText(raw, 40_000),
   });
   const { copy, discountSuggestion } = validateModelCopy(
     parseModelObject(raw),
@@ -906,11 +1001,29 @@ export async function generateCopy(args: GenerateCopyArgs): Promise<{
 }> {
   const template = await getPromptTemplate(args.shop, args.mode, args.settings);
   const cacheKey = await buildCacheKey(args, template.version);
+  debugAdd(args.debug, "prompt-template", {
+    position: args.position,
+    mode: args.mode,
+    model: template.model,
+    version: template.version,
+    usingStoredTemplate: template.version > 0,
+    // The v1.6.2 rule-8 hardening sentence — false means the stored template
+    // never received the upgrade (merchant-edited or self-heal never ran).
+    rule8DescriptionBanPresent: template.systemPrompt.includes(
+      "NEVER take a product name from inside a description text",
+    ),
+  });
 
   if (!args.bypassCache) {
     try {
       const hit = await prisma.copyCache.findUnique({
         where: { shop_cacheKey: { shop: args.shop, cacheKey } },
+      });
+      debugAdd(args.debug, "copy-cache", {
+        position: args.position,
+        cacheKey,
+        hit: Boolean(hit),
+        ...(hit ? { language: hit.language, headline: hit.headline } : {}),
       });
       if (hit) {
         const extras = unpackBulletsJson(hit.bulletsJson);
@@ -1152,11 +1265,28 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
 }> {
   const template = await getPromptTemplate(args.shop, args.mode, args.settings);
   const cacheKey = await buildCacheKey(args, template.version);
+  debugAdd(args.debug, "prompt-template", {
+    position: args.position,
+    mode: args.mode,
+    model: args.settings.coreCopyModel || "claude-haiku-4-5",
+    templateModel: template.model,
+    version: template.version,
+    usingStoredTemplate: template.version > 0,
+    rule8DescriptionBanPresent: template.systemPrompt.includes(
+      "NEVER take a product name from inside a description text",
+    ),
+  });
 
   if (!args.bypassCache) {
     try {
       const hit = await prisma.copyCache.findUnique({
         where: { shop_cacheKey: { shop: args.shop, cacheKey } },
+      });
+      debugAdd(args.debug, "copy-cache", {
+        position: args.position,
+        cacheKey,
+        hit: Boolean(hit),
+        ...(hit ? { language: hit.language, headline: hit.headline } : {}),
       });
       if (hit) {
         const extras = unpackBulletsJson(hit.bulletsJson);
@@ -1198,12 +1328,39 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
   const timeoutMs = args.timeoutMs ?? args.settings.aiTimeoutMs;
   try {
     const vars = await buildTemplateVars(args);
-    const raw = await claudeComplete({
+    const system = renderTemplate(template.systemPrompt, vars) + "\n\n" + CORE_STAGE_OVERRIDE;
+    const prompt = renderTemplate(template.userPrompt, vars);
+    debugAdd(args.debug, "claude-request", {
+      position: args.position,
+      stage: "core",
       model: args.settings.coreCopyModel || "claude-haiku-4-5",
-      system: renderTemplate(template.systemPrompt, vars) + "\n\n" + CORE_STAGE_OVERRIDE,
-      prompt: renderTemplate(template.userPrompt, vars),
       maxTokens: CORE_MAX_TOKENS,
       timeoutMs,
+      cacheKey,
+      systemPrompt: debugText(system, 40_000),
+      userPrompt: debugText(prompt, 40_000),
+    });
+    let raw: string;
+    try {
+      raw = await claudeComplete({
+        model: args.settings.coreCopyModel || "claude-haiku-4-5",
+        system,
+        prompt,
+        maxTokens: CORE_MAX_TOKENS,
+        timeoutMs,
+      });
+    } catch (coreError) {
+      debugAdd(args.debug, "claude-error", {
+        position: args.position,
+        stage: "core",
+        error: coreError instanceof Error ? coreError.message : String(coreError),
+      });
+      throw coreError;
+    }
+    debugAdd(args.debug, "claude-response", {
+      position: args.position,
+      stage: "core",
+      raw: debugText(raw, 40_000),
     });
     const { copy, discountSuggestion } = validateModelCopy(
       parseModelObject(raw),

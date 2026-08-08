@@ -44,6 +44,8 @@ import {
   effectiveDescription,
   effectiveProductName,
   effectiveTranslatedDescription,
+  explainProductName,
+  explainTranslatedDescription,
   getProductsByIds,
   type CatalogProduct,
 } from "./catalog.server";
@@ -52,6 +54,14 @@ import {
   resolveUniformPricing,
   type ContextualVariantPrice,
 } from "./market-pricing.server";
+import {
+  createDebugTrace,
+  debugAdd,
+  debugText,
+  persistDebugTrace,
+  scanForForeignNames,
+  type DebugTrace,
+} from "./debug.server";
 
 /** Issued offers can be signed for up to 2 hours after they were assembled. */
 const OFFER_TTL_MS = 2 * 60 * 60 * 1000;
@@ -80,6 +90,15 @@ export interface AssembleOfferOptions {
    * converted with the presentment rate; "shop" = plain shop-currency prices.
    */
   pricingSource?: "contextual" | "fx" | "shop";
+  /**
+   * Diagnostic trace: pass a fresh createDebugTrace() to capture every
+   * resolution step (language, market, names, grounding, pricing, the exact
+   * prompts and raw model output). The finished trace is persisted to
+   * DebugEvent (Debug tab) AND left on this field for the caller to render.
+   * When absent, live requests self-instrument if settings.debugLiveRequests
+   * is on. Purely observational — never changes the assembled response.
+   */
+  debug?: DebugTrace;
 }
 
 /** Uniform contextual pricing applied to one response's product views. */
@@ -97,12 +116,51 @@ interface ContextualPricingResult {
 async function resolveContextualPricing(
   ctx: PurchaseContext,
   variantIds: string[],
+  trace?: DebugTrace,
 ): Promise<ContextualPricingResult | null> {
-  if (!ctx.countryCode || variantIds.length === 0) return null;
+  if (!ctx.countryCode || variantIds.length === 0) {
+    debugAdd(trace, "contextual-pricing", {
+      skipped: !ctx.countryCode ? "no country code in context" : "no offered variants",
+    });
+    return null;
+  }
   try {
     const prices = await getContextualPrices(ctx.shop, variantIds, ctx.countryCode);
+    if (trace) {
+      // Per-variant raw result + WHY the all-or-nothing check accepts/rejects.
+      let rejectedBecause: string | null = prices === null ? "no contextual prices available at all (offline session missing, Shopify error/timeout with no cached rows, or invalid country)" : null;
+      let currency = "";
+      if (prices !== null) {
+        for (const id of variantIds) {
+          const p = prices.get(id);
+          if (!p) { rejectedBecause = `variant ${id}: no contextual price row`; break; }
+          if (p.price === null || p.price <= 0) { rejectedBecause = `variant ${id}: Shopify returned no buyer price for ${ctx.countryCode} (variant likely not published in that market's catalog) — cached as a miss for up to 6h`; break; }
+          if (!p.currency) { rejectedBecause = `variant ${id}: price row has no currency`; break; }
+          if (!currency) currency = p.currency;
+          else if (currency !== p.currency) { rejectedBecause = `currency mismatch across variants: ${currency} vs ${p.currency} (${id})`; break; }
+        }
+      }
+      debugAdd(trace, "contextual-pricing", {
+        country: ctx.countryCode,
+        variants: variantIds.map((id) => {
+          const p = prices?.get(id);
+          return {
+            variantId: id,
+            price: p?.price ?? null,
+            compareAtPrice: p?.compareAtPrice ?? null,
+            currency: p?.currency || null,
+            rowPresent: Boolean(p),
+          };
+        }),
+        accepted: rejectedBecause === null,
+        ...(rejectedBecause ? { rejectedBecause } : {}),
+      });
+    }
     return resolveUniformPricing(prices, variantIds);
   } catch (error) {
+    debugAdd(trace, "contextual-pricing", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     console.error(`[orchestrator] contextual pricing failed for ${ctx.shop}`, error);
     return null;
   }
@@ -500,6 +558,23 @@ async function buildOfferPage(args: {
     .filter((p) => Number.isFinite(gidToNumber(p.variantId)));
   if (products.length === 0) return null;
 
+  if (options?.debug) {
+    debugAdd(options.debug, "offer-names", {
+      position: offer.position,
+      language,
+      products: products.map((p) => {
+        const cached = catalogById.get(p.productId);
+        return {
+          productId: p.productId,
+          briefName: p.translatedTitle ?? p.title,
+          ...(cached
+            ? { resolution: explainProductName(cached, language), baseTitle: cached.title }
+            : { resolution: null, note: "product missing from catalog cache — engine title used as-is" }),
+        };
+      }),
+    });
+  }
+
   const mode: PromptKey =
     selection.displayMode === "bundle" && products.length > 1
       ? "bundle"
@@ -520,6 +595,7 @@ async function buildOfferPage(args: {
     currency: ctx.currency,
     copyLength: selection.copyLength,
     ...(options?.copyTimeoutMs ? { timeoutMs: options.copyTimeoutMs } : {}),
+    ...(options?.debug ? { debug: options.debug } : {}),
   };
 
   let copy: OfferCopy;
@@ -786,12 +862,30 @@ export async function assembleOfferResponse(
   ctx: PurchaseContext,
   options?: AssembleOfferOptions,
 ): Promise<OfferResponse> {
+  options = options ?? {};
   // Idempotency first: a re-fetch for a referenceId we already issued offers
   // for returns the stored pages — no new selection, no new rows.
   const stored = await findStoredOfferResponse(ctx);
   if (stored) {
     for (const page of stored.offers) {
       options?.diagnostics?.push({ position: page.position, source: "reused" });
+    }
+    if (options.debug) {
+      debugAdd(options.debug, "stored-reuse", {
+        note: "live IssuedOffer rows for this referenceId already carry pages — returned verbatim, no selection/copy/pricing ran",
+        pages: stored.offers.map((p) => p.position),
+        language: stored.language,
+        currency: stored.currency,
+      });
+      finalizeDebug({
+        trace: options.debug,
+        ctx,
+        language: stored.language,
+        catalogById: new Map(),
+        response: stored,
+        options,
+        marketHandle: null,
+      });
     }
     return stored;
   }
@@ -804,8 +898,74 @@ export async function assembleOfferResponse(
 
   try {
     settings = await getSettings(ctx.shop);
+    // Live-request self-instrumentation: when the Debug tab's "record live
+    // buyer requests" toggle is on and the caller passed no trace (the buyer
+    // routes never do), create one here. Purely additive — the buyer path
+    // only ever appends to it in memory; the single DB write is
+    // fire-and-forget at the end.
+    if (!options.debug && settings.debugLiveRequests) {
+      options.debug = createDebugTrace();
+    }
+    debugAdd(options.debug, "context", {
+      shop: ctx.shop,
+      referenceId: ctx.referenceId,
+      surface: ctx.surface,
+      countryCode: ctx.countryCode,
+      locale: ctx.locale,
+      currency: ctx.currency,
+      totalAmount: ctx.totalAmount,
+      presentmentCurrency: ctx.presentmentCurrency ?? null,
+      presentmentRate: ctx.presentmentRate ?? null,
+      lineItems: ctx.lineItems.map((li) => ({
+        productId: li.productId,
+        variantId: li.variantId,
+        quantity: li.quantity,
+        title: li.title ?? null,
+      })),
+    });
+    debugAdd(options.debug, "settings", {
+      defaultLanguage: settings.defaultLanguage,
+      languages: settings.languages,
+      aiEnabled: settings.aiEnabled,
+      aiModel: settings.aiModel,
+      coreCopyModel: settings.coreCopyModel,
+      copyLength: settings.copyLength,
+      discountMode: settings.discount.mode,
+      brandContextLength: (settings.brandContext ?? "").length,
+    });
     const market = await findMarketForCountry(ctx.shop, ctx.countryCode);
     marketHandle = market?.marketHandle ?? null;
+    if (options.debug && ctx.countryCode) {
+      // ALL market rows matching this country — more than one match means
+      // duplicate/stale MarketSetting rows, where "first match wins" is
+      // effectively arbitrary (unordered findMany).
+      try {
+        const rows = await prisma.marketSetting.findMany({ where: { shop: ctx.shop } });
+        const cc = ctx.countryCode.trim().toUpperCase();
+        debugAdd(options.debug, "market-resolution", {
+          country: cc,
+          chosen: marketHandle,
+          matches: rows
+            .filter((m) =>
+              jparse<string[]>(m.countriesJson, []).some(
+                (c) => String(c).trim().toUpperCase() === cc,
+              ),
+            )
+            .map((m) => ({
+              handle: m.marketHandle,
+              name: m.name,
+              enabled: m.enabled,
+              currency: m.currency,
+              discountOverride: m.discountOverride,
+              languageOverride: m.languageOverride,
+              maxOffersOverride: m.maxOffersOverride,
+              previewFxRate: m.previewFxRate,
+            })),
+        });
+      } catch {
+        // diagnostics only
+      }
+    }
     const resolved = resolveLanguageWithSource(
       ctx.locale,
       settings,
@@ -813,14 +973,40 @@ export async function assembleOfferResponse(
     );
     language = resolved.language;
     if (options) options.languageResolution = resolved;
+    debugAdd(options.debug, "language-resolution", {
+      requestedLocale: ctx.locale ?? null,
+      resolvedLanguage: resolved.language,
+      source: resolved.source,
+      marketLanguageOverride: market?.languageOverride ?? null,
+      enabledLanguages: settings.languages,
+      defaultLanguage: settings.defaultLanguage,
+    });
     strings = await safeGetUiStrings(ctx.shop, language);
     try {
       selection = await selectOffers(ctx, settings);
+      debugAdd(options.debug, "selection", {
+        matchedRuleId: selection.matchedRuleId,
+        displayMode: selection.displayMode,
+        copyLength: selection.copyLength,
+        offers: selection.offers.map((o) => ({
+          position: o.position,
+          discountPct: o.discountPct,
+          products: o.products.map((p) => ({
+            productId: p.productId,
+            variantId: p.variantId,
+            engineTitle: p.title,
+            price: p.price,
+          })),
+        })),
+      });
     } catch (error) {
       console.error(`[orchestrator] selectOffers failed for ${ctx.shop}`, error);
       selection = null;
     }
   } catch (error) {
+    debugAdd(options.debug, "setup-error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     console.error(`[orchestrator] assembleOfferResponse setup failed for ${ctx.shop}`, error);
   }
 
@@ -840,7 +1026,7 @@ export async function assembleOfferResponse(
   const offeredVariantIds = (selection?.offers ?? [])
     .flatMap((o) => o.products.map((p) => p.variantId))
     .filter((v) => Number.isFinite(gidToNumber(v)));
-  const ctxPricingPromise = resolveContextualPricing(ctx, offeredVariantIds);
+  const ctxPricingPromise = resolveContextualPricing(ctx, offeredVariantIds, options.debug);
   const response: OfferResponse = {
     offers: [],
     displayMode,
@@ -859,11 +1045,100 @@ export async function assembleOfferResponse(
   if (!settings || !selection || selection.offers.length === 0) {
     const fx = displayFxFromContext(ctx);
     response.currency = fx?.currency ?? ctx.currency;
+    debugAdd(options.debug, "empty-result", {
+      reason: !settings
+        ? "settings unavailable"
+        : !selection
+          ? "selection failed"
+          : "engine returned no offers (kill switch, market gating, or no eligible candidates — see the [engine] server logs)",
+    });
+    finalizeDebug({
+      trace: options.debug,
+      ctx,
+      language,
+      catalogById: new Map(),
+      response,
+      options,
+      marketHandle,
+    });
     return response;
   }
 
   const catalogById = await loadCatalog(ctx, selection);
+  if (options.debug) {
+    // Snapshot of every catalog row involved (basket + offers): staleness
+    // (cacheRowUpdatedAt), the base title/description ACTUALLY in the cache,
+    // which languages have T&A entries / manual names, and how the name
+    // resolves for the buyer language. A German descriptionFullSnippet on an
+    // English page is visible right here.
+    let updatedAtById = new Map<string, Date>();
+    try {
+      const metaRows = await prisma.productCache.findMany({
+        where: { shop: ctx.shop, productId: { in: [...catalogById.keys()] } },
+        select: { productId: true, updatedAt: true },
+      });
+      updatedAtById = new Map(metaRows.map((r) => [r.productId, r.updatedAt]));
+    } catch {
+      // diagnostics only
+    }
+    debugAdd(options.debug, "catalog-products", {
+      language,
+      products: [...catalogById.values()].map((p) => ({
+        productId: p.productId,
+        baseTitle: p.title,
+        status: p.status,
+        cacheRowUpdatedAt: updatedAtById.get(p.productId)?.toISOString() ?? null,
+        aiContextLength: p.aiDescription.trim().length,
+        aiContextSnippet: p.aiDescription.trim() ? debugText(p.aiDescription, 400) : null,
+        descriptionFullLength: p.descriptionFull.length,
+        descriptionFullSnippet: debugText(p.descriptionFull, 400),
+        translationLanguages: Object.keys(p.translations),
+        nameOverrides: p.nameOverrides,
+        nameForThisLanguage: explainProductName(p, language),
+      })),
+    });
+  }
   const basket = buildBasket(ctx, catalogById, language);
+  if (options.debug) {
+    debugAdd(options.debug, "basket-grounding", {
+      language,
+      lines: ctx.lineItems.map((line) => {
+        const cached = catalogById.get(line.productId);
+        if (!cached) {
+          return {
+            productId: line.productId,
+            cached: false,
+            titleUsed: line.title ?? null,
+            note: "not in catalog cache — order-line title used",
+          };
+        }
+        const name = explainProductName(cached, language);
+        const hasAi = Boolean(cached.aiDescription.trim());
+        const translated = hasAi
+          ? undefined
+          : explainTranslatedDescription(cached.translations, language);
+        const text = hasAi
+          ? cached.aiDescription
+          : translated?.value ?? effectiveDescription(cached);
+        return {
+          productId: line.productId,
+          quantity: line.quantity,
+          titleUsed: name.value,
+          titleResolution: name,
+          descriptionSource: hasAi
+            ? "ai_context"
+            : translated
+              ? `translation:${translated.matchedKey}`
+              : cached.descriptionFull.trim()
+                ? "description_full"
+                : cached.descriptionShort.trim()
+                  ? "description_short"
+                  : "missing",
+          descriptionSnippet: debugText(text, 400),
+        };
+      }),
+    });
+  }
   const totalOffers = selection.offers.length;
 
   for (const offer of selection.offers) {
@@ -897,8 +1172,107 @@ export async function assembleOfferResponse(
   const fx = ctxPricing ? null : displayFxFromContext(ctx);
   if (options) options.pricingSource = ctxPricing ? "contextual" : fx ? "fx" : "shop";
   response.currency = ctxPricing?.currency ?? fx?.currency ?? ctx.currency;
+  debugAdd(options.debug, "display-pricing", {
+    pricingSource: options.pricingSource,
+    responseCurrency: response.currency,
+    ...(fx ? { fxCurrency: fx.currency, fxRate: fx.rate } : {}),
+    ...(ctxPricing ? { contextualCurrency: ctxPricing.currency } : {}),
+    note:
+      options.pricingSource === "contextual"
+        ? "real per-country Shopify prices — the FX rate was NOT applied"
+        : options.pricingSource === "fx"
+          ? "shop-currency prices multiplied by the presentment rate (preview: the market's previewFxRate, default 1 — amounts are NOT converted when the rate is 1)"
+          : "plain shop-currency prices",
+  });
 
+  finalizeDebug({
+    trace: options.debug,
+    ctx,
+    language,
+    catalogById,
+    response,
+    options,
+    marketHandle,
+  });
   return response;
+}
+
+/**
+ * Close out a debug trace: run the foreign-name alias scan over every captured
+ * prompt/output text block, append the summary, and persist to DebugEvent
+ * (fire-and-forget). The scan is the root-cause hunter for wrong-language
+ * product names: every known name of every involved product (base title, T&A
+ * titles, manual overrides — all languages) is searched in every block, and
+ * any occurrence that is not the buyer-language name is reported with its
+ * exact location (brand_context, page1:offer_summary, page1:model_output, …).
+ * Never throws.
+ */
+function finalizeDebug(args: {
+  trace: DebugTrace | undefined;
+  ctx: PurchaseContext;
+  language: string;
+  catalogById: Map<string, CatalogProduct>;
+  response: OfferResponse;
+  options?: AssembleOfferOptions;
+  marketHandle: string | null;
+}): void {
+  const { trace, ctx, language, catalogById, response, options, marketHandle } = args;
+  if (!trace) return;
+  try {
+    const blocks: Record<string, string> = {};
+    for (const entry of trace.entries) {
+      const d = entry.data as Record<string, unknown>;
+      if (!d || typeof d !== "object") continue;
+      const position = typeof d.position === "number" ? d.position : "?";
+      if (entry.stage === "prompt-blocks") {
+        blocks[`page${position}:basket_summary`] = String(d.basket_summary ?? "");
+        blocks[`page${position}:offer_summary`] = String(d.offer_summary ?? "");
+        blocks["brand_context"] = String(d.brand_context ?? "");
+        blocks["tone"] = String(d.tone ?? "");
+      } else if (entry.stage === "claude-request") {
+        blocks[`page${position}:system_prompt`] = String(d.systemPrompt ?? "");
+        blocks[`page${position}:user_prompt`] = String(d.userPrompt ?? "");
+      } else if (entry.stage === "claude-response") {
+        blocks[`page${position}:model_output`] = String(d.raw ?? "");
+      }
+    }
+    const hits = scanForForeignNames(
+      [...catalogById.values()].map((p) => ({
+        product: p,
+        expectedName: effectiveProductName(p, language),
+      })),
+      blocks,
+      language,
+    );
+    debugAdd(trace, "alias-scan", {
+      note: "product names in OTHER languages found inside the prompts or the model output — each hit is a wrong-language name with its exact location. A hit in *_summary/system_prompt means bad INPUT data reached the prompt; a hit ONLY in model_output means the model produced it despite clean input.",
+      buyerLanguage: language,
+      scannedBlocks: Object.keys(blocks),
+      hits,
+    });
+    const summary = {
+      language,
+      languageSource: options?.languageResolution?.source ?? null,
+      market: marketHandle,
+      country: ctx.countryCode ?? null,
+      offers: response.offers.length,
+      currency: response.currency,
+      pricingSource: options?.pricingSource ?? null,
+      copySources: (options?.diagnostics ?? []).map((d) => `p${d.position}:${d.source}`),
+      aliasHits: hits.length,
+      tookMs: Date.now() - trace.startedAt,
+    };
+    debugAdd(trace, "summary", summary);
+    void persistDebugTrace({
+      shop: ctx.shop,
+      referenceId: ctx.referenceId,
+      surface: ctx.surface ?? "post_purchase",
+      trace,
+      summary,
+    });
+  } catch (error) {
+    console.error(`[orchestrator] debug finalize failed for ${ctx.shop}`, error);
+  }
 }
 
 // ── Thank-you-page offer assembly ────────────────────────────────────────────

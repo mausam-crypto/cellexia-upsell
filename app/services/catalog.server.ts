@@ -73,34 +73,42 @@ export function effectiveDescription(p: {
  * ("pt-PT" matches "pt", and vice versa). Entries whose extracted value is
  * empty/whitespace are treated as unset so the chain keeps falling through.
  */
-function pickLanguageValue<T>(
+function pickLanguageEntry<T>(
   map: Record<string, T> | null | undefined,
   language: string,
   get: (entry: T) => string | undefined,
-): string | undefined {
+): { value: string; key: string; stage: "exact" | "case_insensitive" | "base_prefix" } | undefined {
   if (!map) return undefined;
   const useful = (value: string | undefined): string | undefined =>
     typeof value === "string" && value.trim().length > 0 ? value : undefined;
   if (map[language] !== undefined) {
     const direct = useful(get(map[language]));
-    if (direct) return direct;
+    if (direct) return { value: direct, key: language, stage: "exact" };
   }
   // String() guard: public paths never throw, even on a malformed locale.
   const lower = String(language ?? "").toLowerCase();
   for (const [key, entry] of Object.entries(map)) {
     if (key.toLowerCase() === lower) {
       const value = useful(get(entry));
-      if (value) return value;
+      if (value) return { value, key, stage: "case_insensitive" };
     }
   }
   const base = lower.split("-")[0];
   for (const [key, entry] of Object.entries(map)) {
     if (key.toLowerCase().split("-")[0] === base) {
       const value = useful(get(entry));
-      if (value) return value;
+      if (value) return { value, key, stage: "base_prefix" };
     }
   }
   return undefined;
+}
+
+function pickLanguageValue<T>(
+  map: Record<string, T> | null | undefined,
+  language: string,
+  get: (entry: T) => string | undefined,
+): string | undefined {
+  return pickLanguageEntry(map, language, get)?.value;
 }
 
 /**
@@ -137,6 +145,58 @@ export function effectiveTranslatedDescription(
   language: string,
 ): string | undefined {
   return pickLanguageValue(translations, language, (t) => t?.description);
+}
+
+/** Provenance of a resolved product name — debug/diagnostics only. */
+export interface NameResolution {
+  value: string;
+  source: "name_override" | "translation" | "base_title";
+  /** The map key that matched (override/translation sources only). */
+  matchedKey?: string;
+  matchStage?: "exact" | "case_insensitive" | "base_prefix";
+}
+
+/**
+ * effectiveProductName with full provenance — same chain, same result, but
+ * reports WHERE the name came from. Diagnostic paths only; the buyer path
+ * keeps calling effectiveProductName.
+ */
+export function explainProductName(
+  p: {
+    nameOverrides?: Record<string, string> | null;
+    translations?: Record<string, ProductTranslationEntry> | null;
+    title: string;
+  },
+  language: string,
+): NameResolution {
+  const override = pickLanguageEntry(p.nameOverrides, language, (v) => v);
+  if (override) {
+    return {
+      value: override.value,
+      source: "name_override",
+      matchedKey: override.key,
+      matchStage: override.stage,
+    };
+  }
+  const translated = pickLanguageEntry(p.translations, language, (t) => t?.title);
+  if (translated) {
+    return {
+      value: translated.value,
+      source: "translation",
+      matchedKey: translated.key,
+      matchStage: translated.stage,
+    };
+  }
+  return { value: p.title, source: "base_title" };
+}
+
+/** Provenance of a resolved translated description — debug/diagnostics only. */
+export function explainTranslatedDescription(
+  translations: Record<string, ProductTranslationEntry> | null | undefined,
+  language: string,
+): { value: string; matchedKey: string; matchStage: "exact" | "case_insensitive" | "base_prefix" } | undefined {
+  const entry = pickLanguageEntry(translations, language, (t) => t?.description);
+  return entry ? { value: entry.value, matchedKey: entry.key, matchStage: entry.stage } : undefined;
 }
 
 /** Case-insensitive base-prefix language equality ("pt-PT" matches "pt"). */

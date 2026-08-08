@@ -28,6 +28,7 @@ export default function App() {
         <Link to="/app/preview">Preview</Link>
         <Link to="/app/translations">Translations</Link>
         <Link to="/app/analytics">Analytics</Link>
+        <Link to="/app/debug">Debug</Link>
         <Link to="/app/settings">Settings</Link>
       </NavMenu>
       <Outlet />

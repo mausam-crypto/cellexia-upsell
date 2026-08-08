@@ -100,6 +100,12 @@ export interface AppSettings {
    */
   knownShopifyLocales: string[];
   weights: ScoringWeights;
+  /**
+   * Record a full debug trace (DebugEvent) for LIVE buyer requests too —
+   * admin previews are always traced. Toggled from the Debug tab; leave off
+   * in normal operation (each request writes one trace row, 7-day retention).
+   */
+  debugLiveRequests: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -149,6 +155,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultLanguage: "en",
   knownShopifyLocales: [],
   weights: { compatibility: 0.35, repeatPurchase: 0.2, acceptance: 0.25, margin: 0.2 },
+  debugLiveRequests: false,
 };
 
 // ── Offer rules ─────────────────────────────────────────────────────────────

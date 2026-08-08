@@ -453,6 +453,33 @@ and Save. **Auto-translate missing** fills gaps via AI; **Re-translate all**
 redoes the language from scratch. Worth a native-speaker skim for your top
 languages — these strings sit right next to the buy button.
 
+## Debug
+
+Every Preview generation records a **full diagnostic trace**: the purchase
+context, how the language and market were resolved (including duplicate
+market rows), where each product's **name** and **grounding description**
+came from (manual name / Translate & Adapt / base title, with the cache row's
+last-update time), per-country pricing with the exact accept/reject reason,
+the copy cache key and hit/miss, the **exact prompts sent to the AI**, and
+the **raw model output**.
+
+On top of that, every trace runs a **foreign-language name scan**: all known
+names of the involved products (base titles, Translate & Adapt titles, manual
+names — in every language) are searched across the prompts and the model
+output. Any name that is not the buyer-language name is flagged with its
+exact location — so "a German product name showed up on an English page"
+becomes a one-line finding pointing at the source instead of a guessing game.
+
+- The scan result appears directly under the Preview (Diagnostics panel) and
+  in the Debug tab (traces are kept for 7 days, newest first).
+- **Record live buyer requests** additionally traces real post-purchase
+  requests. Turn it on, reproduce the problem, read the trace, turn it off.
+- Reading a trace: a foreign-name hit in `basket_summary`, `offer_summary`,
+  `brand_context` or a prompt block means wrong-language **input data**
+  reached the prompt — the `catalog-products` and `basket-grounding` entries
+  show exactly which stored field it came from. A hit **only** in
+  `model_output` means the model produced it despite clean input.
+
 ## Analytics
 
 Use the period selector (7 / 30 / 90 days) and **Export CSV** for offline

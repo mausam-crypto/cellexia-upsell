@@ -302,6 +302,25 @@ model ContextualPriceCache {
   @@index([shop, fetchedAt])
 }
 
+// Full diagnostic trace of one offer assembly (preview or live buyer request):
+// language/market/name/grounding resolution, pricing, cache keys, the exact
+// rendered prompts and raw model output. Written fire-and-forget (never on the
+// request's critical path); pruned on write (7-day TTL). dataJson: DebugEntry[].
+model DebugEvent {
+  id          String   @id @default(cuid())
+  shop        String
+  referenceId String
+  surface     String   @default("post_purchase")
+  // Quick-scan summary for the list view (language, market, pricing source,
+  // copy sources, alias-scan hit count) so the tab renders without parsing
+  // every dataJson blob.
+  summaryJson String   @default("{}")
+  dataJson    String   @default("[]")
+  createdAt   DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
 // Buyer-facing static UI strings, per language. Seeded for all store locales,
 // editable in the admin, auto-translatable via Claude/DeepL.
 model UiString {
