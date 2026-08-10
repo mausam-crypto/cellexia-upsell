@@ -38,6 +38,13 @@ methods Shopify excludes from the post-purchase page.
   paid with Apple Pay / Google Pay / PayPal / Klarna etc., which Shopify
   excludes from the post-purchase page (platform limitation: plain credit-card
   payments only).
+- **Live health checks (Debug tab)** — a ~33-check battery that verifies every
+  key feature against the LIVE store through the real code paths: billing/
+  changeset signing, scopes, webhooks, payment-recovery retries, all 17
+  languages, catalog, AI models, per-country pricing, discount codes, and
+  extension reachability. Runs on demand, automatically every 6h, and via a
+  token-protected `/api/health` endpoint for external uptime monitors
+  (HTTP 200 healthy / 503 failing).
 
 ## Quick start
 
@@ -97,6 +104,8 @@ app/
     analytics.server.ts           Event recording, dashboards, experiments, CLV cohorts
     market-pricing.server.ts      Real per-country prices (Shopify contextualPricing, cached)
     debug.server.ts               Diagnostic traces (Debug tab): prompts, provenance, name scan
+    health.server.ts              Live health-check battery (Debug tab): ~33 checks against the real store
+    language-guard.server.ts      Wrong-language detection + enforcement for buyer copy
     offer-orchestrator.server.ts  Assembles the full offer response for the extensions
   routes/
     app._index.tsx                Admin: dashboard
@@ -109,12 +118,13 @@ app/
     app.prompts.tsx               Admin: AI prompt templates + preview
     app.settings.tsx              Admin: settings (discount, markets, languages, AI, ...)
     app.translations.tsx          Admin: buyer-facing UI strings per language
-    app.debug.tsx                 Admin: full generation traces (prompts, provenance, name scan)
+    app.debug.tsx                 Admin: live health checks + full generation traces
     api.offer.tsx                 Public: post-purchase offer endpoint (JWT-verified)
     api.offer-extended.tsx        Public: below-CTA copy sections, polled while extendedPending
     api.sign-changeset.tsx        Public: signs changesets from server-side IssuedOffer rows
     api.events.tsx                Public: impression/accept/decline/error events
     api.typ-offer.tsx             Public: thank-you-page offer (discount-code based)
+    api.health.tsx                Public: health-echo probe + token-protected uptime-monitor status
     auth.login.tsx                Shop-domain login form into the OAuth flow
     webhooks.tsx                  Webhooks: orders, products, app lifecycle, GDPR
   components/

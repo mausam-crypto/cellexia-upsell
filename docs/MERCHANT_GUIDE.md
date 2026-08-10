@@ -474,6 +474,43 @@ languages — these strings sit right next to the buy button.
 
 ## Debug
 
+The Debug tab has two views: **Health checks** (is everything working on the
+live store right now?) and **Offer traces** (what exactly happened inside one
+offer generation?).
+
+### Health checks
+
+The health-check battery verifies every key feature **against the live
+store**, through the same code paths buyers hit — not simulations. One click
+answers "will this break in production?": billing/changeset signing, Shopify
+permissions, webhook registration, payment-recovery retries, all 17
+languages' translations and product names, catalog freshness, offer rules,
+the AI models, per-country pricing, thank-you discount codes, and whether the
+extensions are actually reaching the backend.
+
+- **Run checks** — the standard battery (~30 checks, a few seconds). Safe:
+  read-only apart from two self-cleaning database probes.
+- **Run deep checks** — additionally makes one live translation call and
+  creates **then immediately deletes** a 1% test discount code, proving the
+  thank-you code path end-to-end.
+- Every result is **green / yellow / red** with a plain-language summary and
+  a **Fix** line saying what to do. Open a row for the evidence.
+- Checks re-run automatically every 6 hours while the admin is open, and the
+  Dashboard shows a red banner the moment any check fails — you don't have to
+  remember to look.
+- **External monitoring**: the panel shows a private URL you can paste into a
+  free uptime monitor (e.g. UptimeRobot). It answers HTTP 200 while healthy
+  and 503 when any check fails, so you get an email/SMS the moment something
+  breaks on the live store — even at 3am, even with the admin closed. Keep
+  the URL private.
+
+Run the checks (including deep) **before going live**, after every deploy,
+and after changing Shopify settings (languages, markets, checkout, staff
+permissions). Green across the board = every dependency the app has on your
+store, your hosting and your API keys has just been exercised for real.
+
+### Offer traces
+
 Every Preview generation records a **full diagnostic trace**: the purchase
 context, how the language and market were resolved (including duplicate
 market rows), where each product's **name** and **grounding description**
@@ -498,6 +535,12 @@ becomes a one-line finding pointing at the source instead of a guessing game.
   reached the prompt — the `catalog-products` and `basket-grounding` entries
   show exactly which stored field it came from. A hit **only** in
   `model_output` means the model produced it despite clean input.
+- `language-guard` entries show the copy **language enforcement** at work:
+  every generated field is checked against the buyer's language; a failed
+  check triggers one corrective regeneration, and any field still wrong is
+  machine-translated before the copy is shown or cached. Wrong-language copy
+  can no longer be cached, so one bad generation can no longer keep serving
+  English to every buyer of a language.
 
 ## Analytics
 

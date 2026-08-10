@@ -6,10 +6,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
-import jwt from "jsonwebtoken";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { jparse } from "../lib/json";
+import { signChangesetToken } from "../lib/changeset-token.server";
 import type { OfferChange } from "../types";
 
 /** Answers CORS preflight / GET probes. */
@@ -78,16 +78,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return cors(json({ error: "Offer has no signable changes" }, { status: 404 }));
     }
 
-    const signed = jwt.sign(
-      {
-        iss: process.env.SHOPIFY_API_KEY,
-        jti: crypto.randomUUID(),
-        sub: String(referenceId),
-        changes,
-      },
-      process.env.SHOPIFY_API_SECRET || "",
-      { expiresIn: "10m" },
-    );
+    const signed = signChangesetToken(referenceId, changes);
 
     return cors(json({ token: signed }));
   } catch (error) {

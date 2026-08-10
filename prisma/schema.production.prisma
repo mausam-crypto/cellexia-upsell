@@ -326,6 +326,27 @@ model DebugEvent {
   @@index([shop, createdAt])
 }
 
+// One execution of the live health-check battery (Debug tab → Health checks).
+// resultsJson: HealthCheckResult[] — every check with status/summary/detail/fix.
+// Runs are triggered manually, automatically (throttled from admin loaders) or
+// externally (/api/health monitor endpoint); pruned to the most recent 50.
+model HealthCheckRun {
+  id          String   @id @default(cuid())
+  shop        String
+  trigger     String   @default("manual") // "manual" | "auto" | "external"
+  deep        Boolean  @default(false)
+  status      String // "ok" | "warn" | "fail"
+  okCount     Int      @default(0)
+  warnCount   Int      @default(0)
+  failCount   Int      @default(0)
+  skipCount   Int      @default(0)
+  tookMs      Int      @default(0)
+  resultsJson String   @default("[]")
+  createdAt   DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
 // Buyer-facing static UI strings, per language. Seeded for all store locales,
 // editable in the admin, auto-translatable via Claude/DeepL.
 model UiString {

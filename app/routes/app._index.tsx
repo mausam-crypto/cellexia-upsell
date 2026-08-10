@@ -32,6 +32,7 @@ import {
 import { autoPickWinners } from "../services/recommendation.server";
 import { ensurePromptRulesFresh, ensureUiStringsFresh } from "../services/ai.server";
 import { syncCatalog, syncMarketsAndLocales } from "../services/catalog.server";
+import { getLatestHealthRun, maybeAutoRunHealthChecks } from "../services/health.server";
 import type { AdminGraphql } from "../types";
 import { MiniChart } from "../components/MiniChart";
 
@@ -96,16 +97,33 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     console.error("[dashboard] housekeeping prune failed", error);
   }
 
-  const [stats, timeSeries, offerRows, shopRow, enabledRuleCount] =
+  // Keep the live health-check battery running on its 6h cadence whenever the
+  // admin is used (fire-and-forget), and surface the latest verdict below.
+  maybeAutoRunHealthChecks(shop);
+
+  const [stats, timeSeries, offerRows, shopRow, enabledRuleCount, healthRun] =
     await Promise.all([
       getDashboardStats(shop, DASHBOARD_DAYS),
       getTimeSeries(shop, DASHBOARD_DAYS),
       getOfferPerformance(shop, DASHBOARD_DAYS),
       prisma.shop.findUnique({ where: { shop } }),
       prisma.offerRule.count({ where: { shop, enabled: true } }),
+      getLatestHealthRun(shop),
     ]);
 
   return json({
+    health: healthRun
+      ? {
+          status: healthRun.status,
+          failCount: healthRun.failCount,
+          warnCount: healthRun.warnCount,
+          createdAt: healthRun.createdAt,
+          failing: healthRun.results
+            .filter((r) => r.status === "fail")
+            .slice(0, 3)
+            .map((r) => r.name),
+        }
+      : null,
     stats,
     series: timeSeries.map((point) => ({
       date: point.date,
@@ -170,7 +188,7 @@ function formatPct(ratio: number): string {
 }
 
 export default function Dashboard() {
-  const { stats, series, topOffers, checklist } = useLoaderData<typeof loader>();
+  const { stats, series, topOffers, checklist, health } = useLoaderData<typeof loader>();
   const shopify = useAppBridge();
   const fetcher = useFetcher<typeof action>();
   const syncing = fetcher.state !== "idle";
@@ -276,6 +294,21 @@ export default function Dashboard() {
       secondaryActions={[{ content: "View analytics", url: "/app/analytics" }]}
     >
       <Layout>
+        {health && health.status === "fail" ? (
+          <Layout.Section>
+            <Banner
+              tone="critical"
+              title={`${health.failCount} live health check${health.failCount === 1 ? " is" : "s are"} failing${health.failing.length > 0 ? `: ${health.failing.join(", ")}` : ""}`}
+              action={{ content: "Open health checks", url: "/app/debug" }}
+            >
+              <Text as="p">
+                Detected {new Date(health.createdAt).toLocaleString("en-GB")} — buyers may be affected.
+                The Debug tab shows exactly what is broken and how to fix it.
+              </Text>
+            </Banner>
+          </Layout.Section>
+        ) : null}
+
         <Layout.Section>
           <InlineGrid columns={{ xs: 1, sm: 2, md: 3, lg: 5 }} gap="300">
             {kpis.map((kpi) => (

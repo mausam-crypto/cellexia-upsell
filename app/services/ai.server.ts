@@ -55,6 +55,11 @@ import {
 } from "./catalog.server";
 import { getSettings } from "./settings.server";
 import { debugAdd, debugText, type DebugTrace } from "./debug.server";
+import {
+  applyFieldText,
+  checkCopyLanguage,
+  type FlaggedField,
+} from "./language-guard.server";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -114,7 +119,7 @@ Voice and tone: {{tone}}
 You are writing a post-purchase upsell page shown seconds after a customer completed checkout. This is the most-aware audience there is: they proved their desire minutes ago with their own money, on these exact products. Do not re-sell the category and do not manufacture excitement — channel the desire their order already demonstrates onto the offered product. The offer can be added with ONE click, is charged to the payment method they just used, and ships together with their order at no extra shipping cost. The customer is in a moment of confidence about their purchase — extend that confidence, never question it.
 
 Non-negotiable rules:
-1. Write every field in the language with IETF code "{{language}}". Never mix languages. Use the formal/informal register typical of premium skincare retail in that market.
+1. Write every field in the language with IETF code "{{language}}". Never mix languages. This includes "proof" and "closer": research statements and reassurance lines are written in that language too. These instructions and their example sentences are in English, but your output must be in "{{language}}" unless that IS the language. Use the formal/informal register typical of premium skincare retail in that market.
 2. The customer's completed purchase was an excellent choice. NEVER imply it was wrong, incomplete, insufficient, or missing anything. Frame the offer as amplifying and protecting the results they already secured — never as fixing a gap.
 3. Cosmetic claims only. No medical, drug-like, or therapeutic claims: nothing that "treats", "cures", "heals", "repairs damage", "regenerates cells", or is "clinically proven". Speak only about the look and feel of skin — visible smoothness, hydration, radiance, the feeling of firmness.
 4. Premium register, zero pressure. No emojis, no ALL-CAPS words, at most one exclamation mark across all fields — zero is better. No urgency, scarcity, or countdown language of any kind: never "limited", "only today", "last chance", "while stocks last", "hurry". The page handles timing; your copy persuades with facts.
@@ -221,6 +226,14 @@ const PROMPT_RULE_UPGRADES: Array<{ from: string; to: string }> = [
     // from description text (observed: German name echoed into English copy).
     from: "8. Use every product name EXACTLY as written in the brief — the names are already in the customer's language; never translate, shorten, or restyle a product name.",
     to: "8. Use every product name EXACTLY as written at the START of its brief line — those name fields are already in the customer's language; never translate, shorten, or restyle a product name. Descriptions are grounding material only: they may be written in another language and may refer to a product under a different or translated name — NEVER take a product name from inside a description text.",
+  },
+  {
+    // Rule 1 sharpening: models drifted into English on "proof" (rule 10's
+    // example sentence is English) and "closer" — observed as English research
+    // bullets and closers on non-English pages. The language guard enforces
+    // this mechanically; the rule makes the first attempt more likely to pass.
+    from: '1. Write every field in the language with IETF code "{{language}}". Never mix languages. Use the formal/informal register typical of premium skincare retail in that market.',
+    to: '1. Write every field in the language with IETF code "{{language}}". Never mix languages. This includes "proof" and "closer": research statements and reassurance lines are written in that language too. These instructions and their example sentences are in English, but your output must be in "{{language}}" unless that IS the language. Use the formal/informal register typical of premium skincare retail in that market.',
   },
 ];
 
@@ -898,6 +911,91 @@ function unpackBulletsJson(bulletsJson: string): {
   return { bullets: [], paragraphs: [], closer: "", proof: [] };
 }
 
+/** Product names that may legitimately appear untranslated in any language. */
+function guardIgnoreNames(args: GenerateCopyArgs): string[] {
+  return [
+    ...args.offerProducts.flatMap((p) => [p.translatedTitle ?? "", p.title]),
+    ...args.basket.map((line) => line.title),
+  ].filter(Boolean);
+}
+
+/** Corrective instruction appended to the system prompt for the retry pass. */
+function languageCorrection(flagged: FlaggedField[], language: string): string {
+  return (
+    `\n\nLANGUAGE CORRECTION — your previous attempt wrote these fields in the wrong language: ${flagged
+      .map((f) => f.path)
+      .join(", ")}. Every field of the JSON must be written STRICTLY in the language with IETF code "${language}". ` +
+    "The instructions and examples are English; your output must not be, unless that IS the language. Rewrite ALL fields now."
+  );
+}
+
+/**
+ * ENFORCE the output language on generated copy (the deep fix for "parts of
+ * the copy are sometimes in English"): after a failed check the copy is
+ * regenerated ONCE with an explicit correction; any fields still flagged are
+ * machine-translated via the configured provider as a last resort. Callers
+ * receive copy that passed the guard (or the best achievable) — only that is
+ * ever cached. `regenerate` runs the caller's own generation pass again.
+ * Never throws; on total failure the original copy is returned unchanged.
+ */
+async function enforceCopyLanguage(
+  args: GenerateCopyArgs,
+  copy: OfferCopy,
+  regenerate: () => Promise<OfferCopy>,
+): Promise<{ copy: OfferCopy; action: "clean" | "retried" | "translated" | "unresolved" }> {
+  const ignore = guardIgnoreNames(args);
+  let flagged = checkCopyLanguage(copy, args.language, ignore);
+  if (flagged.length === 0) return { copy, action: "clean" };
+  debugAdd(args.debug, "language-guard", {
+    position: args.position,
+    language: args.language,
+    flagged: flagged.map((f) => ({ path: f.path, text: debugText(f.text, 200) })),
+    action: "retrying with correction",
+  });
+
+  // Pass 2 — one corrective regeneration. Keep whichever result is cleaner.
+  try {
+    const retried = await regenerate();
+    const retriedFlagged = checkCopyLanguage(retried, args.language, ignore);
+    if (retriedFlagged.length < flagged.length) {
+      copy = retried;
+      flagged = retriedFlagged;
+    }
+    if (flagged.length === 0) {
+      debugAdd(args.debug, "language-guard", { position: args.position, action: "retry produced clean copy" });
+      return { copy, action: "retried" };
+    }
+  } catch (error) {
+    console.error(`[ai] language-guard retry failed for ${args.shop}:`, error);
+  }
+
+  // Pass 3 — machine-translate ONLY the still-flagged fields.
+  try {
+    const translated = await translateTexts(
+      args.settings,
+      flagged.map((f) => f.text),
+      args.language,
+    );
+    flagged.forEach((field, i) => applyFieldText(copy, field, translated[i] ?? ""));
+    const remaining = checkCopyLanguage(copy, args.language, ignore);
+    debugAdd(args.debug, "language-guard", {
+      position: args.position,
+      action: "translated flagged fields via provider",
+      translatedPaths: flagged.map((f) => f.path),
+      stillFlagged: remaining.map((f) => f.path),
+    });
+    return { copy, action: remaining.length === 0 ? "translated" : "unresolved" };
+  } catch (error) {
+    console.error(`[ai] language-guard translation fallback failed for ${args.shop}:`, error);
+    debugAdd(args.debug, "language-guard", {
+      position: args.position,
+      action: "unresolved — provider translation failed",
+      stillFlagged: flagged.map((f) => f.path),
+    });
+    return { copy, action: "unresolved" };
+  }
+}
+
 async function generateAndCache(
   args: GenerateCopyArgs,
   template: ResolvedPromptTemplate,
@@ -938,10 +1036,25 @@ async function generateAndCache(
     position: args.position,
     raw: debugText(raw, 40_000),
   });
-  const { copy, discountSuggestion } = validateModelCopy(
-    parseModelObject(raw),
-    args.copyLength,
-  );
+  const validated = validateModelCopy(parseModelObject(raw), args.copyLength);
+  const discountSuggestion = validated.discountSuggestion;
+  // Language enforcement: retry once with a correction, then translate any
+  // still-flagged fields — only guard-passed copy is ever cached.
+  const enforced = await enforceCopyLanguage(args, validated.copy, async () => {
+    const retryRaw = await claudeComplete({
+      model: template.model,
+      system: system + languageCorrection(
+        checkCopyLanguage(validated.copy, args.language, guardIgnoreNames(args)),
+        args.language,
+      ),
+      prompt,
+      maxTokens: template.maxTokens,
+      temperature: template.temperature,
+      timeoutMs,
+    });
+    return validateModelCopy(parseModelObject(retryRaw), args.copyLength).copy;
+  });
+  const copy = enforced.copy;
   await prisma.copyCache.upsert({
     where: { shop_cacheKey: { shop: args.shop, cacheKey } },
     update: {
@@ -1199,7 +1312,7 @@ const CORE_MAX_TOKENS = 1500;
  * while every other rule (language, claims, discount mention) stands.
  */
 const CORE_STAGE_OVERRIDE =
-  'FOR THIS CALL ONLY, OVERRIDE THE OUTPUT SCHEMA: respond with {"headline":string,"lead":string,"bullets":string[],"closer":string,"discount_suggestion":number|null} — do NOT write paragraphs or proof (they are generated separately). Every other rule stands.';
+  'FOR THIS CALL ONLY, OVERRIDE THE OUTPUT SCHEMA: respond with {"headline":string,"lead":string,"bullets":string[],"closer":string,"discount_suggestion":number|null} — do NOT write paragraphs or proof (they are generated separately). Every other rule stands, above all rule 1: every field is written in the buyer language from rule 1, never the language of these instructions.';
 
 /**
  * Upsert a CopyCache row. `discountSuggestion === undefined` leaves an
@@ -1370,6 +1483,25 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
     // model wrote despite the override so the page renders a clean core.
     const coreCopy: OfferCopy = { ...copy, paragraphs: [], proof: [] };
 
+    // Language guard (pure string check — no latency): a core result in the
+    // wrong language must never reach a buyer or the cache. Throwing routes
+    // to the catch below: the buyer gets the translated deterministic
+    // fallback NOW, and the background full-generation warms the cache with
+    // enforcement (retry + provider translation) for the next buyer.
+    const coreFlagged = checkCopyLanguage(coreCopy, args.language, guardIgnoreNames(args));
+    if (coreFlagged.length > 0) {
+      debugAdd(args.debug, "language-guard", {
+        position: args.position,
+        stage: "core",
+        language: args.language,
+        flagged: coreFlagged.map((f) => ({ path: f.path, text: debugText(f.text, 200) })),
+        action: "core copy rejected — serving fallback, warming cache with enforcement",
+      });
+      throw new Error(
+        `core copy failed the language guard (${coreFlagged.map((f) => f.path).join(", ")}) for ${args.language}`,
+      );
+    }
+
     if (args.copyLength === "long") {
       // NEVER cache a core-only result under the full cacheKey — the merged
       // copy is written by completeExtendedCopy when the background call lands.
@@ -1449,19 +1581,26 @@ export async function completeExtendedCopy(
     const cacheKey = pinnedCacheKey ?? (await buildCacheKey(args, template.version));
     const vars = await buildTemplateVars(args);
     const stageOverride =
-      'The core copy for this page is already live (verbatim below). FOR THIS CALL ONLY output {"paragraphs":string[],"proof":string[]} completing it — same angle, no repetition of the lead or bullets, all standing rules apply (mechanism/proof/relevance, research guardrails, no discount mention). CORE COPY: ' +
+      'The core copy for this page is already live (verbatim below). FOR THIS CALL ONLY output {"paragraphs":string[],"proof":string[]} completing it — same angle, no repetition of the lead or bullets, all standing rules apply (mechanism/proof/relevance, research guardrails, no discount mention). ' +
+      `Write every string strictly in the language with IETF code "${args.language}" — the language of the core copy below, never the language of these instructions. CORE COPY: ` +
       JSON.stringify(core);
-    const raw = await claudeComplete({
-      model: template.model,
-      system: renderTemplate(template.systemPrompt, vars) + "\n\n" + stageOverride,
-      prompt: renderTemplate(template.userPrompt, vars),
-      maxTokens: template.maxTokens,
-      timeoutMs: BACKGROUND_TIMEOUT_MS,
-    });
-    const parsed = parseModelObject(raw);
-    const paragraphs = stringItems(parsed.paragraphs, PARAGRAPH_HARD_MAX, 3);
-    const proof = stringItems(parsed.proof, PROOF_HARD_MAX, 3);
-    if (paragraphs.length === 0) {
+    const system = renderTemplate(template.systemPrompt, vars) + "\n\n" + stageOverride;
+    const prompt = renderTemplate(template.userPrompt, vars);
+    const extendedPass = async (extraSystem = ""): Promise<{ paragraphs: string[]; proof: string[] } | null> => {
+      const raw = await claudeComplete({
+        model: template.model,
+        system: system + extraSystem,
+        prompt,
+        maxTokens: template.maxTokens,
+        timeoutMs: BACKGROUND_TIMEOUT_MS,
+      });
+      const parsed = parseModelObject(raw);
+      const paragraphs = stringItems(parsed.paragraphs, PARAGRAPH_HARD_MAX, 3);
+      const proof = stringItems(parsed.proof, PROOF_HARD_MAX, 3);
+      return paragraphs.length > 0 ? { paragraphs, proof } : null;
+    };
+    const first = await extendedPass();
+    if (!first) {
       // A "merged" copy without paragraphs is a core-only result in disguise —
       // never cache it under the full cacheKey (proof alone may be [] by rule 10).
       console.error(
@@ -1471,7 +1610,24 @@ export async function completeExtendedCopy(
     }
     // The extended schema carries no closer — the live core's closer stands.
     const closer = core.closer ?? "";
-    const merged: OfferCopy = { ...core, paragraphs, closer, proof };
+    let merged: OfferCopy = { ...core, paragraphs: first.paragraphs, closer, proof: first.proof };
+    // Language enforcement for the below-CTA sections — the observed failure
+    // mode ("research bullets in English on a French page"). Retry once with
+    // a correction, then provider-translate anything still flagged; only
+    // guard-passed sections are cached and patched into the live page.
+    const enforced = await enforceCopyLanguage(args, merged, async () => {
+      const retried = await extendedPass(
+        languageCorrection(
+          checkCopyLanguage(merged, args.language, guardIgnoreNames(args)),
+          args.language,
+        ),
+      );
+      if (!retried) throw new Error("extended retry returned no paragraphs");
+      return { ...core, paragraphs: retried.paragraphs, closer, proof: retried.proof };
+    });
+    merged = enforced.copy;
+    const paragraphs = merged.paragraphs ?? [];
+    const proof = merged.proof ?? [];
     try {
       // undefined: never clobber an existing row's suggestion; on CREATE the
       // core call's suggestion is stored so the next assembly can peek it.
@@ -1564,10 +1720,15 @@ export function fallbackCopy(
     .map((p) => stripDashes(firstSentences(args.offerDescriptions?.[p.productId] ?? "")))
     .filter((paragraph) => paragraph.length > 0)
     .slice(0, 2);
-  const closer = truncate(
-    stripDashes(guaranteeLine(args.settings.brandContext) || s("ships_free")),
-    CLOSER_MAX,
-  );
+  // The guarantee sentence is quoted VERBATIM from the merchant's brand
+  // context, which has one language (English here) — quoting it on any other
+  // language's page was a hard-coded wrong-language leak. Only buyers of the
+  // store's default language may see it; everyone else gets the translated
+  // ships_free string.
+  const guaranteeSafe = languagesMatch(args.language, args.settings.defaultLanguage)
+    ? guaranteeLine(args.settings.brandContext)
+    : "";
+  const closer = truncate(stripDashes(guaranteeSafe || s("ships_free")), CLOSER_MAX);
   // Research proof stays EMPTY in the deterministic fallback — by design.
   // Even when a merchant's aiDescription/description contains an explicit
   // "studies/research/clinical" sentence, extracting it heuristically risks
@@ -1680,19 +1841,40 @@ const OLD_DEFAULTS: Record<string, string> = {
  */
 export async function ensureUiStringsFresh(shop: string): Promise<void> {
   try {
-    const enRows = await prisma.uiString.findMany({
-      where: { shop, language: "en" },
-      select: { key: true, value: true },
-    });
+    const [settings, allRows] = await Promise.all([
+      getSettings(shop),
+      prisma.uiString.findMany({
+        where: { shop },
+        select: { language: true, key: true, value: true },
+      }),
+    ]);
+    const enRows = allRows.filter((row) => row.language === "en");
     const have = new Set(enRows.map((row) => row.key));
     const missing = UI_STRING_KEYS.some((key) => !have.has(key));
     const staleKeys = enRows
       .filter((row) => OLD_DEFAULTS[row.key] === row.value)
       .map((row) => row.key);
-    if (!missing && staleKeys.length === 0) return;
+    // Gap repair for the OTHER configured languages too: a language whose
+    // translation pass once failed (provider timeout, lost placeholder) kept
+    // missing keys FOREVER — every missing key fell back to the English
+    // default on the buyer page. Re-queue exactly the gap languages.
+    const keysByLanguage = new Map<string, Set<string>>();
+    for (const row of allRows) {
+      let set = keysByLanguage.get(row.language);
+      if (!set) {
+        set = new Set();
+        keysByLanguage.set(row.language, set);
+      }
+      set.add(row.key);
+    }
+    const gapLanguages = (settings.languages ?? []).filter((lang) => {
+      if (!lang || lang === "en") return false;
+      const keys = keysByLanguage.get(lang);
+      return !keys || UI_STRING_KEYS.some((key) => !keys.has(key));
+    });
+    if (!missing && staleKeys.length === 0 && gapLanguages.length === 0) return;
 
     void (async () => {
-      const settings = await getSettings(shop);
       if (staleKeys.length > 0) {
         for (const key of staleKeys) {
           const value = DEFAULT_UI_STRINGS_EN[key];
@@ -1718,6 +1900,16 @@ export async function ensureUiStringsFresh(shop: string): Promise<void> {
       }
       if (missing) {
         await ensureUiStrings(shop, settings.languages);
+      }
+      // Fill per-language gaps last (after any EN re-seeding above): only
+      // missing rows are written, so merchant edits are never overwritten.
+      if (gapLanguages.length > 0) {
+        const { errors } = await translateUiStrings(shop, gapLanguages, {
+          onlyMissing: true,
+        });
+        for (const message of errors) {
+          console.error(`[ai] ensureUiStringsFresh gap repair issue for ${shop}: ${message}`);
+        }
       }
     })().catch((error) =>
       console.error(`[ai] ensureUiStringsFresh repair failed for ${shop}:`, error),

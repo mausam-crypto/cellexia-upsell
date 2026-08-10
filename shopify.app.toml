@@ -13,7 +13,7 @@ embedded = true
 automatically_update_urls_on_dev = true
 
 [access_scopes]
-scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,write_discounts"
+scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,read_translations,write_discounts"
 
 [auth]
 redirect_urls = [

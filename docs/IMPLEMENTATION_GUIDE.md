@@ -34,6 +34,7 @@ read [MERCHANT_GUIDE.md](MERCHANT_GUIDE.md).
 22. [The two-stage copy pipeline & Anthropic API notes](#22-the-two-stage-copy-pipeline--anthropic-api-notes)
 23. [Multi-currency display & the Markets health checks](#23-multi-currency-display--the-markets-health-checks)
 24. [Manual product names, the em-dash policy & self-healing UI strings](#24-manual-product-names-the-em-dash-policy--self-healing-ui-strings)
+25. [Live health checks & external monitoring](#25-live-health-checks--external-monitoring)
 
 ---
 
@@ -81,7 +82,7 @@ Pick your organization and the app you created. This rewrites
 What's already configured in `shopify.app.toml` (do not remove):
 
 - `embedded = true` — the admin UI runs embedded in the Shopify admin.
-- `[access_scopes] scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,write_discounts"`
+- `[access_scopes] scopes = "read_products,read_orders,read_inventory,read_locales,read_markets,read_translations,write_discounts"`
 - `[webhooks] api_version = "2026-01"` with subscriptions for
   `app/uninstalled`, `app/scopes_update`, `orders/create`, `orders/updated`
   (payment-recovery revenue backfill: an accepted upsell whose one-click
@@ -110,7 +111,7 @@ cp .env.example .env
 | `SHOPIFY_API_KEY` | prod | The app's **Client ID** — Partner Dashboard → your app → Overview. In dev, `shopify app dev` injects it automatically; you can leave it blank in `.env`. |
 | `SHOPIFY_API_SECRET` | prod | The app's **Client secret** — same page. Also injected by the CLI in dev. Used to verify post-purchase JWTs and sign changesets, so it must be set (by CLI or env) wherever the app runs. |
 | `SHOPIFY_APP_URL` | prod | The app's public HTTPS URL. In dev the CLI provides a tunnel URL automatically. In production: your host URL, e.g. `https://cellexia-upsell.fly.dev`. |
-| `SCOPES` | prod | `read_products,read_orders,read_inventory,read_locales,read_markets,write_discounts` — must match `shopify.app.toml`. |
+| `SCOPES` | prod | `read_products,read_orders,read_inventory,read_locales,read_markets,read_translations,write_discounts` — must match `shopify.app.toml`. |
 | `DATABASE_URL` | always | Dev default: `file:dev.sqlite` (SQLite, zero setup). Production: a Postgres connection string — see [§13](#13-switch-the-database-to-postgres). |
 | `ANTHROPIC_API_KEY` | strongly recommended | <https://console.anthropic.com/> → API Keys. **The Shopify CLI does not inject this** — set it in `.env` even in dev, or all copy falls back to the deterministic non-AI templates. |
 | `DEEPL_API_KEY` | optional | <https://www.deepl.com/pro-api>. Only used when the admin sets Settings → AI → Translation provider to DeepL. Keys ending in `:fx` are free-plan keys — the app automatically uses the `api-free.deepl.com` host for those. |
@@ -373,7 +374,7 @@ fly secrets set \
   SHOPIFY_API_KEY="<client id>" \
   SHOPIFY_API_SECRET="<client secret>" \
   SHOPIFY_APP_URL="https://cellexia-upsell.fly.dev" \
-  SCOPES="read_products,read_orders,read_inventory,read_locales,read_markets,write_discounts" \
+  SCOPES="read_products,read_orders,read_inventory,read_locales,read_markets,read_translations,write_discounts" \
   ANTHROPIC_API_KEY="<key>"
 # optional: DEEPL_API_KEY="<key>"
 
@@ -997,3 +998,49 @@ dashboard visit. It:
 
 Merchants can still review or override every string on the Translations page
 — the self-healing pass respects those edits.
+
+## 25. Live health checks & external monitoring
+
+The Debug tab's **Health checks** view (see ARCHITECTURE §10 for internals)
+verifies every production dependency against the live store. Operationally:
+
+**Before go-live.** Run **deep checks** once and get everything green (or a
+consciously accepted yellow). The battery catches exactly the class of
+problems local testing can't: wrong `APP_URL` baked into the deployed
+extension, missing `write_discounts` after a scope change, webhooks pointing
+at an old host, SQLite still configured in production, an invalid model id,
+clock skew, untranslated languages.
+
+**After every deploy.** Run standard checks. The schema-drift probe fails
+loudly if `npx prisma db push` was skipped (the classic P2022-on-every-
+request breakage); the self-reach probe fails if the domain or TLS broke.
+
+**Always-on monitoring.** Checks re-run automatically every ~6 hours while
+anyone uses the admin, and the Dashboard shows a red banner when anything
+fails. For coverage while the admin is closed, copy the **External uptime
+monitoring** URL from the Debug tab into any uptime monitor:
+
+```
+https://<your-app-host>/api/health?shop=<shop>.myshopify.com&token=<token>
+```
+
+- HTTP **200** while all checks pass (or only warnings), **503** when any
+  check fails → configure the monitor to alert on non-200.
+- Append `&run=1` to have each poll also trigger a fresh background run
+  (rate-limited to one per 10 minutes). With a 5-minute poll interval this
+  gives fully unattended coverage: broken feature → fresh run fails → next
+  poll returns 503 → alert email/SMS.
+- The token is derived from the app secret plus a rotatable salt
+  (`healthMonitorToken` in `app/services/health.server.ts`). If the URL ever
+  leaks, set or change `HEALTH_MONITOR_SALT` in the environment — every
+  monitor URL rotates instantly (the Debug tab always shows the current one).
+  Treat the URL as a secret; the JSON it returns includes check names and
+  scrubbed summaries (no customer data, no keys, no internal hosts).
+
+**Cost note.** A manual standard run pings each configured Claude model once
+with a ~10-token prompt (fractions of a cent); background runs (auto / the
+monitor's `&run=1`) ping only the core copy model, so even a 5-minute poll
+cadence costs cents per month. Deep runs add one translation call and one
+discount-code create+delete on the live store (deleted immediately,
+usage-limited, 10-minute expiry — harmless if a delete ever failed, and the
+check tells you which code to remove if so).

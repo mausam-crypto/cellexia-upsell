@@ -57,6 +57,10 @@ app/
   lib/
     json.ts                        jparse/jstr (JSON-in-string columns),
                                    deepMerge, gidToNumber, toGid
+    changeset-token.server.ts      signChangesetToken/verifyChangesetToken —
+                                   the ONE place changeset JWTs are minted
+                                   (used by api.sign-changeset AND the
+                                   health-check battery)
   services/
     settings.server.ts             getSettings/saveSettings (deep-merge over
                                    DEFAULT_SETTINGS), ensureShop
@@ -81,6 +85,10 @@ app/
                                    contextualPricing (+ ContextualPriceCache)
     offer-orchestrator.server.ts   assembleOfferResponse / assembleThankYouOffer
                                    (language resolution, copy, IssuedOffer)
+    health.server.ts               runHealthChecks — the live health-check
+                                   battery (Debug tab); maybeAutoRunHealthChecks
+                                   (6h cadence from admin loaders),
+                                   healthMonitorToken (see §10)
   routes/
     app.tsx                        Embedded app frame + nav
     app._index.tsx                 Dashboard (KPIs, chart, checklist, sync;
@@ -104,6 +112,9 @@ app/
                                    validated against IssuedOffer)
     api.events.tsx                 POST: impression/accepted/declined/error
     api.typ-offer.tsx              POST: thank-you offer + discount code
+    api.health.tsx                 GET: echo probe (self-reachability) +
+                                   token-protected status for external
+                                   uptime monitors (200/503; see §10)
     webhooks.tsx                   All webhook topics incl. GDPR
     auth.$.tsx, _index.tsx         OAuth + login redirect
     auth.login.tsx                 Shop-domain login form (Polaris-free — it
@@ -699,3 +710,53 @@ presentment currency is display-only.**
 - **Single hard limits to remember**: max 3 offers per checkout (Shopify),
   changeset JWT 10 min, issued offer 2 h, discount clamped to
   `settings.discount.min/max`, thank-you surface always 1 offer.
+
+## 10. Live health checks (Debug tab)
+
+`app/services/health.server.ts` runs a ~33-check battery against the LIVE
+store through the same code paths buyers hit — `selectOffers`,
+`signChangesetToken`, `getContextualPrices`, `claudeComplete`, Admin GraphQL
+via the offline session — so a green check certifies the production path, not
+a lookalike. Groups: Environment (env vars, app-URL vs the extension's baked
+APP_URL constant, DB provider + schema-drift probes, public-URL self-fetch,
+clock skew vs Shopify's Date header), Shopify connection (offline session,
+GraphQL latency/deprecations, granted scopes vs REQUIRED_SCOPES, webhook
+config drift — the toml's declared topics, since app-config subscriptions are
+invisible to the webhookSubscriptions query, delivery being judged by the
+flow checks — plus stray shop-scoped subscription hygiene, published locales
+vs enabled languages), Billing &
+accept path (changeset sign→verify round-trip through a synthetic
+IssuedOffer, live error-event rate, payment-recovery backlog, EventDedup
+unique-constraint probe, housekeeping backlogs), Offer engine & catalog
+(cache freshness vs live productsCount, offerable-pool gates, rule-candidate
+integrity, a read-only `selectOffers` dry-run on the latest real order's
+basket, markets config, one contextualPricing probe), Languages (config,
+UI-string coverage incl. em-dash policy, per-language product-name coverage,
+deep-only live translation probe), AI (templates, live ping of every
+configured model id, fallback-share audit over recent traces + CopyCache
+writes), Thank-you surface (traffic proxy, hourly cap, deep-only discount
+code create+delete), Order & event flow (local OrderRecord vs live
+ordersCount, extension-traffic proxy, analytics integrity).
+
+Mechanics: every check runs under a 12 s timeout with its own try/catch — a
+crashed check IS a "fail" finding, the runner never throws. Results persist
+to `HealthCheckRun` (last 50 kept). Standard runs are read-only apart from
+two self-cleaning probes (synthetic IssuedOffer for signing, EventDedup
+duplicate insert); deep runs (explicit button) add one paid translation call
+and a create-then-delete 1% discount code. Scheduling without cron:
+`maybeAutoRunHealthChecks` is void-called from the dashboard and Debug
+loaders and fires a background run when the latest is older than 6 h (per-
+process in-flight lock). The dashboard loader surfaces the latest run as a
+critical banner when anything fails. External monitors poll
+`GET /api/health?shop=…&token=…` — token = sha256(app secret ‖ shop) so it
+needs no storage (rotate by setting/changing `HEALTH_MONITOR_SALT`); the
+endpoint answers 200 (ok/warn) or 503 (fail) with scrubbed summaries, and
+`&run=1` triggers an async fresh run throttled to 10 min by BOTH persisted-
+run age and an in-memory timestamp; concurrent runs per shop coalesce inside
+`runHealthChecks`. The same route's `?probe=echo&nonce=…` is the
+self-reachability target: the battery writes the nonce as an EventDedup claim
+first, and the echo answers `known: true` only when it finds that row in ITS
+database — proving the public URL routes to this deployment, not merely to
+something that reflects query params. Deliberate merchant states (AI copy
+off, app kill-switch off, disabled markets) surface as skip/warn, never as
+fail — the red banner and monitor 503 are reserved for genuine breakage.
