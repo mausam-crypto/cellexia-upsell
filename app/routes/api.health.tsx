@@ -7,6 +7,9 @@
 //    before fetching), so a stale or foreign deployment answering on the URL
 //    is detected: it can reflect the nonce but cannot know it.
 //
+// 3. ?probe=version                    → { version, date } — deployed build id.
+// 4. ?shop=<domain>&token=<t>&gate=1  → post-purchase gate only (see below).
+//
 // 2. ?shop=<domain>&token=<t>[&run=1] → latest health-run summary for external
 //    uptime monitors (UptimeRobot etc.). Token is derived from the app secret
 //    + rotatable HEALTH_MONITOR_SALT (see healthMonitorToken; shown in the
@@ -22,16 +25,21 @@
 import { json, type LoaderFunctionArgs } from "@remix-run/node";
 import { timingSafeEqual, createHash } from "node:crypto";
 import prisma from "../db.server";
+import { APP_VERSION, APP_VERSION_DATE } from "../lib/version";
 import {
   getLatestHealthRun,
   healthMonitorToken,
+  listGateSamples,
   runHealthChecks,
+  samplePostPurchaseGate,
 } from "../services/health.server";
 
 const FRESH_RUN_MIN_AGE_MS = 10 * 60 * 1000;
+const GATE_MIN_AGE_MS = 10 * 60 * 1000;
 
-// Second throttle for &run=1, independent of DB persistence.
+// Second throttle for &run=1 / &gate=1, independent of DB persistence.
 const lastExternalRunAt = new Map<string, number>();
+const lastExternalGateAt = new Map<string, number>();
 
 function tokensMatch(provided: string, expected: string): boolean {
   const a = createHash("sha256").update(provided).digest();
@@ -53,6 +61,13 @@ function scrubSummary(id: string, summary: string): string {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
+
+  // 3. ?probe=version → { version, date } — which backend build is deployed.
+  //    Public and non-sensitive; answers "is v1.9 live on Render yet?" without
+  //    inference from response headers.
+  if (url.searchParams.get("probe") === "version") {
+    return json({ version: APP_VERSION, date: APP_VERSION_DATE });
+  }
 
   if (url.searchParams.get("probe") === "echo") {
     const nonce = url.searchParams.get("nonce") ?? "";
@@ -79,6 +94,38 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   if (!process.env.SHOPIFY_API_SECRET || !tokensMatch(token, healthMonitorToken(shop))) {
     // Same shape as the missing-parameter case — no oracle for probing shops.
     return json({ error: "not found" }, { status: 404 });
+  }
+
+  // 4. …&gate=1 → the post-purchase GATE only (Shopify's storefront flag +
+  //    isPostPurchaseAppInUse), sampled at most every 10 minutes and answered
+  //    synchronously: HTTP 200 while the gate is open, 503 when it is closed
+  //    or unreadable. Point an uptime monitor here to be told the moment the
+  //    checkout selection drops — a full battery run is far heavier.
+  if (url.searchParams.get("gate") === "1") {
+    const memoryAge = Date.now() - (lastExternalGateAt.get(shop) ?? 0);
+    let latest = (await listGateSamples(shop, 1))[0] ?? null;
+    const persistedAge = latest ? Date.now() - Date.parse(latest.at) : Infinity;
+    if (persistedAge > GATE_MIN_AGE_MS && memoryAge > GATE_MIN_AGE_MS) {
+      lastExternalGateAt.set(shop, Date.now());
+      try {
+        latest = (await samplePostPurchaseGate(shop, "external")) ?? latest;
+      } catch (error) {
+        console.error(`[health] external gate sample failed for ${shop}`, error);
+      }
+    }
+    if (!latest) return json({ gate: "unknown", message: "No gate sample yet — retry in a minute." }, { status: 503 });
+    const open = latest.storefrontFlag === true && latest.inUse !== false;
+    return json(
+      {
+        gate: open ? "open" : "closed",
+        storefrontFlag: latest.storefrontFlag,
+        isPostPurchaseAppInUse: latest.inUse,
+        sampledAt: latest.at,
+        source: latest.source,
+        note: latest.note ? latest.note.replace(/https?:\/\/\S+/g, "<url>").slice(0, 200) : null,
+      },
+      { status: open ? 200 : 503 },
+    );
   }
 
   const run = await getLatestHealthRun(shop);

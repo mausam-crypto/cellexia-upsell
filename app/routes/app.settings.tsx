@@ -26,7 +26,7 @@ import { DeleteIcon } from "@shopify/polaris-icons";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
-import { jparse } from "../lib/json";
+import { gidToNumber, jparse } from "../lib/json";
 import { getSettings, saveSettings } from "../services/settings.server";
 import { ensureUiStrings } from "../services/ai.server";
 import {
@@ -192,12 +192,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     case "hygiene": {
+      // Test customer ids: comma/space/newline separated numeric ids or
+      // customer gids; anything else is dropped (max 50).
+      const testCustomerIds = Array.from(
+        new Set(
+          fstr(fd, "testCustomerIds")
+            .split(/[\s,;]+/)
+            .map((raw) => raw.trim())
+            .filter(Boolean)
+            .map((raw) => (raw.startsWith("gid://") ? String(gidToNumber(raw)) : raw))
+            .filter((id) => /^\d{1,20}$/.test(id)),
+        ),
+      ).slice(0, 50);
       await saveSettings(shop, {
         frequencyCapDays: fint(fd, "frequencyCapDays", 14, 0, 365),
         suppressionDays: fint(fd, "suppressionDays", 60, 0, 730),
         minInventory: fint(fd, "minInventory", 1, 0, 100000),
+        testCustomerIds,
       });
-      return respond(true, "Frequency & hygiene settings saved.");
+      return respond(true, `Frequency & hygiene settings saved${testCustomerIds.length ? ` (${testCustomerIds.length} test customer id${testCustomerIds.length === 1 ? "" : "s"} bypass the cap and suppression)` : ""}.`);
     }
 
     case "optimization": {
@@ -382,6 +395,7 @@ interface HygieneState {
   frequencyCapDays: string;
   suppressionDays: string;
   minInventory: string;
+  testCustomerIds: string;
 }
 
 interface OptimizationState {
@@ -546,6 +560,7 @@ export default function SettingsPage() {
     frequencyCapDays: String(s.frequencyCapDays),
     suppressionDays: String(s.suppressionDays),
     minInventory: String(s.minInventory),
+    testCustomerIds: (s.testCustomerIds ?? []).join(", "),
   });
   const [hygiene, setHygiene] = useState<HygieneState>(toHygieneState);
   const setH = (patch: Partial<HygieneState>) =>
@@ -1012,6 +1027,15 @@ export default function SettingsPage() {
                 autoComplete="off"
                 helpText="Hide offers whose variant has tracked stock below this."
               />
+              <TextField
+                label="Test customer IDs (bypass cap and suppression)"
+                value={hygiene.testCustomerIds}
+                onChange={(v) => setH({ testCustomerIds: v })}
+                autoComplete="off"
+                multiline={2}
+                placeholder="e.g. 25532488843639, 24108487639415"
+                helpText="Customer IDs used for your own test orders (Shopify admin → Customers → open the customer; the number at the end of the URL). These accounts skip the frequency cap and the purchase-suppression window, so repeated real-card tests with the same account are never blocked by their own history. Real buyers are unaffected."
+              />
               <InlineStack align="end">
                 <Button
                   variant="primary"
@@ -1021,6 +1045,7 @@ export default function SettingsPage() {
                       frequencyCapDays: hygiene.frequencyCapDays,
                       suppressionDays: hygiene.suppressionDays,
                       minInventory: hygiene.minInventory,
+                      testCustomerIds: hygiene.testCustomerIds,
                     })
                   }
                 >

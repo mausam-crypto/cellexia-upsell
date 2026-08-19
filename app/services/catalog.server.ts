@@ -1201,6 +1201,22 @@ export async function syncMarketsAndLocales(
         console.error(`[catalog] market upsert failed for "${market.handle}" on ${shop}`, error);
       }
     }
+    // Reconcile stale rows (v1.9): a market that no longer exists in Shopify
+    // must not keep governing its countries here — a stale disabled row that
+    // still lists FR would silently gate every French buyer (first-match
+    // resolution on v1.7, and even the most-specific rule can pick a stale
+    // row when it is narrower). Only when this run fetched a non-empty list.
+    if (markets.length > 0) {
+      const liveHandles = markets.map((m) => m.handle);
+      const stale = await prisma.marketSetting.findMany({
+        where: { shop, marketHandle: { notIn: liveHandles } },
+        select: { id: true, marketHandle: true },
+      });
+      if (stale.length > 0) {
+        await prisma.marketSetting.deleteMany({ where: { id: { in: stale.map((r) => r.id) } } });
+        console.log(`[catalog] removed ${stale.length} stale market row(s) for ${shop}: ${stale.map((r) => r.marketHandle).join(", ")}`);
+      }
+    }
   } catch (error) {
     console.error(`[catalog] markets sync failed for ${shop} (best-effort, continuing)`, error);
   }
@@ -1230,6 +1246,15 @@ export async function upsertProductFromWebhook(shop: string, payload: any): Prom
   const unitCostByVariantId = new Map<string, number | null>(
     existingVariants.map((v) => [v.id, v.unitCost]),
   );
+  // Whether the full GraphQL sync last saw the variant as inventory-tracked
+  // (null inventoryQuantity = untracked). Product webhooks on API 2024-07+ no
+  // longer carry `inventory_management`, and an UNTRACKED variant reports
+  // inventory_quantity 0 — coercing that to 0 would flip an untracked,
+  // always-offerable variant into "out of stock" (suppressed by minInventory)
+  // on the very next products/update webhook. Preserve the synced state.
+  const untrackedByVariantId = new Set(
+    existingVariants.filter((v) => v.inventoryQuantity === null).map((v) => v.id),
+  );
 
   const images: any[] = Array.isArray(payload?.images) ? payload.images : [];
   const imageSrcById = new Map<string, string>();
@@ -1243,9 +1268,15 @@ export async function upsertProductFromWebhook(shop: string, payload: any): Prom
   if (Array.isArray(payload?.variants)) {
     variants = payload.variants.map((v: any): CachedVariant => {
       const id = toGid("ProductVariant", v?.admin_graphql_api_id ?? v?.id ?? "");
-      // REST: inventory_management null ⇒ inventory not tracked.
+      // REST: inventory_management null ⇒ inventory not tracked. When the
+      // field is absent (API 2024-07+ payloads) fall back to what the last
+      // full sync knew — see untrackedByVariantId above.
       const tracked =
-        v?.inventory_management !== undefined ? v.inventory_management != null : undefined;
+        v?.inventory_management !== undefined
+          ? v.inventory_management != null
+          : untrackedByVariantId.has(id)
+            ? false
+            : undefined;
       return {
         id,
         title: String(v?.title ?? ""),

@@ -1,9 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /api/offer-extended — polling endpoint for the below-CTA extended copy
-// sections of a post-purchase page issued with extendedPending: true. Body is
-// { referenceId, offerId }. Responds { ready: false } until the background
-// completion has patched the IssuedOffer meta (meta.extendedReady), then
-// { ready: true, paragraphs, proof, closer } for the extension to merge in.
+// POST /api/offer-extended — polling endpoint for copy that arrives AFTER a
+// post-purchase page was issued. Body is { referenceId, offerId }.
+//   • extendedPending pages: { ready: false } until the background completion
+//     patched the IssuedOffer meta (meta.extendedReady), then { ready: true,
+//     paragraphs, proof, closer }.
+//   • corePending pages (fallback copy shipped because the AI core copy ran
+//     out of ShouldRender budget): once the full background generation was
+//     patched in (meta.coreReady) the response also carries coreReady: true
+//     plus headline/body/bullets so the extension swaps the whole copy in.
 // Same auth + shop derivation as /api/events, same ownership rule as
 // /api/sign-changeset: the checkout that authenticated this request may only
 // read its own non-expired offer. Unknown/mismatch → { ready: false }.
@@ -11,7 +15,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
-import { authenticate } from "../shopify.server";
+import { authenticateCheckoutPublic } from "../lib/public-auth.server";
 import prisma from "../db.server";
 import { jparse } from "../lib/json";
 
@@ -20,7 +24,7 @@ const OFFER_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 
 /** Answers CORS preflight / GET probes. */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { cors } = await authenticate.public.checkout(request);
+  const { cors } = await authenticateCheckoutPublic(request, "api.offer-extended");
   return cors(json({ ok: true }));
 };
 
@@ -32,7 +36,7 @@ function stringArray(value: unknown): string[] {
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { cors, sessionToken } = await authenticate.public.checkout(request);
+  const { cors, sessionToken } = await authenticateCheckoutPublic(request, "api.offer-extended");
   try {
     const token = sessionToken as any;
     const inputData: any = token?.input_data ?? {};
@@ -85,13 +89,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     const meta = jparse<any>(row.offerMetaJson, null);
     const copy = meta?.page?.copy;
-    if (meta?.extendedReady === true && copy && typeof copy === "object") {
+    const coreReady = meta?.coreReady === true;
+    const extendedReady = meta?.extendedReady === true;
+    if ((coreReady || extendedReady) && copy && typeof copy === "object") {
       return cors(
         json({
           ready: true,
+          // Below-CTA sections (always present once anything is ready).
           paragraphs: stringArray(copy.paragraphs),
           proof: stringArray(copy.proof),
           closer: typeof copy.closer === "string" ? copy.closer : "",
+          // Core copy — only when the page shipped with fallback copy
+          // (corePending) and the background generation replaced it. The
+          // extension swaps headline/lead/bullets in at Render time.
+          coreReady,
+          ...(coreReady
+            ? {
+                headline: typeof copy.headline === "string" ? copy.headline : "",
+                body: typeof copy.body === "string" ? copy.body : "",
+                bullets: stringArray(copy.bullets),
+              }
+            : {}),
         }),
       );
     }

@@ -10,6 +10,14 @@
  *   3. Accepting an offer signs the changeset server-side, applies it with
  *      one click (charged to the card just used), then advances.
  *
+ * Timing: Shopify runs ShouldRender when the payment page loads (and again
+ * whenever the total / currency / country changes) and only takes the
+ * post-purchase detour if it has resolved by the time the order is processed
+ * — so the backend answers /api/offer within a fixed budget. Pages whose AI
+ * copy was not ready arrive with `corePending: true` and provisional fallback
+ * copy; Render (which happens after payment, seconds later) polls
+ * /api/offer-extended immediately and swaps the real copy in.
+ *
  * Analytics events (impression / accepted / declined / error) are strictly
  * fire-and-forget: they can never break or block the buyer's order.
  */
@@ -36,7 +44,16 @@ import {
   Spinner,
 } from "@shopify/post-purchase-ui-extensions-react";
 
-const APP_URL = "https://cellexia-upsell.onrender.com";
+// ════════════════════════════════════════════════════════════════════════════
+// ▸▸▸ TODO — REQUIRED BEFORE DEPLOY ◂◂◂
+//
+// Replace APP_URL with the public HTTPS URL of YOUR deployed app backend
+// (the Remix app that serves /api/offer, /api/sign-changeset, /api/events).
+// During `shopify app dev` this is the tunnel URL printed by the CLI; in
+// production it is your hosting URL, e.g. "https://cellexia-upsell.fly.dev".
+// NO trailing slash. See docs/IMPLEMENTATION_GUIDE.md.
+// ════════════════════════════════════════════════════════════════════════════
+const APP_URL = "https://REPLACE-WITH-YOUR-APP-URL.example.com";
 
 /** Inline English fallbacks — used only when the server strings are missing. */
 const FALLBACK_STRINGS = {
@@ -66,6 +83,17 @@ const FALLBACK_STRINGS = {
  */
 const EXTENDED_POLL_GAPS_MS = [1200, 1800, 3000, 5000, 8000, 10000];
 
+/**
+ * Pages issued with `corePending` shipped with deterministic fallback copy
+ * because the AI copy was not ready inside the ShouldRender budget; by the
+ * time Render runs (after payment — many seconds later) the real copy is
+ * almost always stored server-side. Poll for it IMMEDIATELY on mount and
+ * hold the first paint for at most this long so the buyer sees the real
+ * headline rather than a headline that swaps a moment later.
+ */
+const CORE_POLL_GAPS_MS = [0, 1200, 2500, 4000, 6000, 8000];
+const CORE_FIRST_PAINT_HOLD_MS = 900;
+
 // ── Small helpers ────────────────────────────────────────────────────────────
 
 /** Localized string lookup with English fallback and {var} interpolation. */
@@ -75,8 +103,11 @@ function t(strings, key, vars) {
     FALLBACK_STRINGS[key] ||
     key;
   if (vars) {
-    for (const [name, value] of Object.entries(vars)) {
-      template = template.split(`{${name}}`).join(String(value));
+    // Object.keys (ES5) rather than Object.entries — the post-purchase
+    // sandbox only guarantees ES2015 built-ins.
+    const names = Object.keys(vars);
+    for (let i = 0; i < names.length; i++) {
+      template = template.split(`{${names[i]}}`).join(String(vars[names[i]]));
     }
   }
   return template;
@@ -107,8 +138,9 @@ function formatMoney(amount, currency, locale) {
 /** Seconds → "mm:ss". */
 function formatClock(totalSeconds) {
   const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
-  const mm = String(Math.floor(s / 60)).padStart(2, "0");
-  const ss = String(s % 60).padStart(2, "0");
+  const pad2 = (n) => (n < 10 ? `0${n}` : String(n));
+  const mm = pad2(Math.floor(s / 60));
+  const ss = pad2(s % 60);
   return `${mm}:${ss}`;
 }
 
@@ -257,10 +289,14 @@ export function App() {
   processingRef.current = processing || justAccepted;
   const impressionsSentRef = useRef({});
   const advanceTimerRef = useRef(null);
-  // Late-arriving long-form copy (offerId → {paragraphs, proof, closer}).
+  // Late-arriving copy (offerId → {paragraphs, proof, closer} and, for pages
+  // issued with corePending, also {headline, body, bullets}).
   const [extendedByOfferId, setExtendedByOfferId] = useState({});
   const extendedTriesRef = useRef({});
   const extendedTimerRef = useRef(null);
+  // Brief first-paint hold for corePending pages (see CORE_FIRST_PAINT_HOLD_MS).
+  const [holdingCoreFor, setHoldingCoreFor] = useState(null);
+  const coreHoldTimerRef = useRef(null);
 
   /** done() exactly once, and never let it throw into the render tree. */
   function safeDone() {
@@ -385,9 +421,9 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     try {
-      if (!currentOfferId || !offer || offer.extendedPending !== true) {
-        return undefined;
-      }
+      if (!currentOfferId || !offer) return undefined;
+      const corePending = offer.corePending === true;
+      if (!corePending && offer.extendedPending !== true) return undefined;
       if (extendedByOfferId[currentOfferId]) return undefined; // already merged
       const inline = offer.copy || {};
       const hasBelowCta =
@@ -396,18 +432,36 @@ export function App() {
             (p) => typeof p === "string" && p.trim().length > 0,
           )) ||
         (Array.isArray(inline.proof) && inline.proof.length > 0);
-      if (hasBelowCta) return undefined; // server already sent the content
+      // Extended-only pages whose content already shipped need no poll; a
+      // corePending page always polls (its whole copy is provisional).
+      if (!corePending && hasBelowCta) return undefined;
 
       const offerId = currentOfferId;
+      const gaps = corePending ? CORE_POLL_GAPS_MS : EXTENDED_POLL_GAPS_MS;
+
+      // corePending: hold the first paint briefly so the real headline lands
+      // before the buyer reads the fallback one. Released by the first poll
+      // result (either way) or the timer, whichever comes first.
+      if (corePending) {
+        setHoldingCoreFor(offerId);
+        coreHoldTimerRef.current = setTimeout(() => {
+          coreHoldTimerRef.current = null;
+          if (!cancelled) setHoldingCoreFor(null);
+        }, CORE_FIRST_PAINT_HOLD_MS);
+      }
+      function releaseHold() {
+        if (coreHoldTimerRef.current) {
+          clearTimeout(coreHoldTimerRef.current);
+          coreHoldTimerRef.current = null;
+        }
+        setHoldingCoreFor((current) => (current === offerId ? null : current));
+      }
 
       function scheduleNext() {
         try {
           const used = extendedTriesRef.current[offerId] || 0;
-          if (cancelled || used >= EXTENDED_POLL_GAPS_MS.length) return;
-          extendedTimerRef.current = setTimeout(
-            attempt,
-            EXTENDED_POLL_GAPS_MS[used],
-          );
+          if (cancelled || used >= gaps.length) return;
+          extendedTimerRef.current = setTimeout(attempt, gaps[used]);
         } catch (error) {
           /* best-effort */
         }
@@ -416,7 +470,7 @@ export function App() {
       function attempt() {
         extendedTimerRef.current = null;
         const used = extendedTriesRef.current[offerId] || 0;
-        if (cancelled || used >= EXTENDED_POLL_GAPS_MS.length) return;
+        if (cancelled || used >= gaps.length) return;
         extendedTriesRef.current[offerId] = used + 1;
         (async () => {
           let ready = false;
@@ -432,7 +486,6 @@ export function App() {
             if (response.ok) {
               const data = await response.json();
               if (!cancelled && data && data.ready === true) {
-                ready = true;
                 // Fields may sit at the top level or under a nested object.
                 const src =
                   (data.extended && typeof data.extended === "object"
@@ -442,22 +495,41 @@ export function App() {
                     ? data.copy
                     : null) ||
                   data;
-                setExtendedByOfferId((prev) => ({
-                  ...prev,
-                  [offerId]: {
-                    paragraphs: Array.isArray(src.paragraphs)
-                      ? src.paragraphs
-                      : [],
-                    proof: Array.isArray(src.proof) ? src.proof : [],
-                    closer:
-                      typeof src.closer === "string" ? src.closer : null,
-                  },
-                }));
+                const coreReady =
+                  data.coreReady === true &&
+                  typeof src.headline === "string" &&
+                  src.headline.trim().length > 0;
+                // A corePending page keeps polling until the CORE is ready;
+                // extended-only pages are done as soon as anything is ready.
+                ready = corePending ? coreReady : true;
+                if (ready) {
+                  setExtendedByOfferId((prev) => ({
+                    ...prev,
+                    [offerId]: {
+                      paragraphs: Array.isArray(src.paragraphs)
+                        ? src.paragraphs
+                        : [],
+                      proof: Array.isArray(src.proof) ? src.proof : [],
+                      closer:
+                        typeof src.closer === "string" ? src.closer : null,
+                      ...(coreReady
+                        ? {
+                            headline: src.headline,
+                            body: typeof src.body === "string" ? src.body : "",
+                            bullets: Array.isArray(src.bullets)
+                              ? src.bullets
+                              : [],
+                          }
+                        : {}),
+                    },
+                  }));
+                }
               }
             }
           } catch (error) {
             /* best-effort — retry on the schedule until tries run out */
           }
+          if (corePending && !cancelled) releaseHold();
           if (!cancelled && !ready) scheduleNext();
         })();
       }
@@ -471,6 +543,10 @@ export function App() {
       if (extendedTimerRef.current) {
         clearTimeout(extendedTimerRef.current);
         extendedTimerRef.current = null;
+      }
+      if (coreHoldTimerRef.current) {
+        clearTimeout(coreHoldTimerRef.current);
+        coreHoldTimerRef.current = null;
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -610,9 +686,15 @@ export function App() {
 
   // ── Loading / empty states ─────────────────────────────────────────────────
 
-  if (loading || !hasOffers || !offer) {
-    // While loading (or after safeDone() on an empty result) show a quiet
-    // centered spinner — Shopify closes the page once done() resolves.
+  if (
+    loading ||
+    !hasOffers ||
+    !offer ||
+    (holdingCoreFor !== null && holdingCoreFor === currentOfferId)
+  ) {
+    // While loading (or after safeDone() on an empty result, or during the
+    // brief corePending first-paint hold) show a quiet centered spinner —
+    // Shopify closes the page once done() resolves.
     return (
       <BlockStack spacing="loose" alignment="center">
         <Spinner />
@@ -625,13 +707,32 @@ export function App() {
   const totalPages = offers.length;
   const pageNumber = safeIndex + 1;
   const products = offer.products;
-  const copy = offer.copy || { headline: "", body: "", bullets: [] };
-  const bullets = Array.isArray(copy.bullets) ? copy.bullets.filter(Boolean) : [];
   // Long-form copy (optional): deep-dive paragraphs + one-line closer.
   // When the server deferred it (extendedPending), the polled result stored
   // in extendedByOfferId fills the gap; inline copy always wins when present.
+  // For corePending pages the polled result ALSO carries the real
+  // headline/lead/bullets, which replace the provisional fallback copy.
   const extended =
     (currentOfferId && extendedByOfferId[currentOfferId]) || null;
+  const inlineCopy = offer.copy || { headline: "", body: "", bullets: [] };
+  const copy =
+    offer.corePending === true &&
+    extended &&
+    typeof extended.headline === "string" &&
+    extended.headline.trim().length > 0
+      ? {
+          ...inlineCopy,
+          headline: extended.headline,
+          body: extended.body || "",
+          bullets: Array.isArray(extended.bullets) ? extended.bullets : [],
+          // The real copy replaces the fallback wholesale — its own
+          // below-CTA sections (possibly empty) win over fallback text.
+          paragraphs: Array.isArray(extended.paragraphs) ? extended.paragraphs : [],
+          proof: Array.isArray(extended.proof) ? extended.proof : [],
+          closer: typeof extended.closer === "string" ? extended.closer : "",
+        }
+      : inlineCopy;
+  const bullets = Array.isArray(copy.bullets) ? copy.bullets.filter(Boolean) : [];
   const paragraphsSrc =
     Array.isArray(copy.paragraphs) &&
     copy.paragraphs.some((p) => typeof p === "string" && p.trim().length > 0)

@@ -497,10 +497,10 @@ export default function MarketsPage() {
               ) : null}
 
               {health.countryConflicts.length > 0 ? (
-                <CheckItem tone="critical" badge="Country conflicts">
-                  {`Countries claimed by multiple markets make buyer routing ambiguous: ${health.countryConflicts
+                <CheckItem tone="warning" badge="Country in several markets">
+                  {`Some countries are listed by more than one market: ${health.countryConflicts
                     .map((c) => `${c.country} (${c.markets.join(", ")})`)
-                    .join("; ")}.`}
+                    .join("; ")}. Buyers there follow the MOST SPECIFIC market (fewest countries), like Shopify — enable/disable that one to control the country.`}
                 </CheckItem>
               ) : data.markets.length > 0 ? (
                 <CheckItem tone="success" badge="Countries OK">
@@ -516,6 +516,17 @@ export default function MarketsPage() {
                 </CheckItem>
               )}
 
+              <Banner tone="warning" title="Markets that sell in a local currency never see the post-purchase page">
+                <p>
+                  Shopify only shows the one-click post-purchase page when
+                  the checkout was in the shop currency ({data.shopCurrency});
+                  a market whose base currency differs (see the currency
+                  badge on each row) is excluded by Shopify itself, however
+                  it is configured here — buyers there get the thank-you page
+                  offer instead. Enabling such a market below still governs
+                  its thank-you offers, discount and language overrides.
+                </p>
+              </Banner>
               <Banner tone="info">
                 <p>
                   Live buyers always see prices in the display currency of

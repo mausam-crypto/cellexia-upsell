@@ -7,19 +7,19 @@
 
 import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
 import prisma from "../db.server";
-import { authenticate } from "../shopify.server";
+import { authenticateCheckoutPublic } from "../lib/public-auth.server";
 import { jparse } from "../lib/json";
 import { signChangesetToken } from "../lib/changeset-token.server";
 import type { OfferChange } from "../types";
 
 /** Answers CORS preflight / GET probes. */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { cors } = await authenticate.public.checkout(request);
+  const { cors } = await authenticateCheckoutPublic(request, "api.sign-changeset");
   return cors(json({ ok: true }));
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { cors, sessionToken } = await authenticate.public.checkout(request);
+  const { cors, sessionToken } = await authenticateCheckoutPublic(request, "api.sign-changeset");
   try {
     let body: any = {};
     try {

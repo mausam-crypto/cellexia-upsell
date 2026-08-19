@@ -68,6 +68,14 @@ export interface AppSettings {
   frequencyCapDays: number;
   /** Don't offer products the customer bought within this many days. */
   suppressionDays: number;
+  /**
+   * Customer ids (numeric, as in the Shopify admin customer URL) that BYPASS
+   * the frequency cap and the purchase-suppression window — for the merchant's
+   * own repeated real-card tests, which would otherwise be silently blocked by
+   * their own history (every previous test order suppresses its products; a
+   * seen offer caps the account for 14 days). Never affects other buyers.
+   */
+  testCustomerIds: string[];
   /** Hide offers whose variant has tracked inventory below this. */
   minInventory: number;
   copyLength: CopyLength;
@@ -127,6 +135,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   frequencyCapDays: 14,
   suppressionDays: 60,
+  testCustomerIds: [],
   minInventory: 1,
   copyLength: "long",
   tone: "warm, expert, confident — never salesy, never implying the original purchase was incomplete",
@@ -253,6 +262,13 @@ export interface SelectionResult {
   displayMode: DisplayMode;
   matchedRuleId: string | null;
   copyLength: CopyLength;
+  /**
+   * When `offers` is empty: which engine step ended the selection and why
+   * (e.g. "step2: frequency cap — customer 123 saw an offer 2 days ago").
+   * Surfaced in the buyer-path request log and Debug traces so an empty
+   * live response is never a black box.
+   */
+  emptyReason?: string;
 }
 
 // ── Extension-facing payloads ───────────────────────────────────────────────
@@ -312,6 +328,16 @@ export interface OfferPage {
    * and merges them in when ready. Absent/false = copy is complete.
    */
   extendedPending?: boolean;
+  /**
+   * True when the page shipped with DETERMINISTIC fallback copy because the
+   * AI core copy did not arrive inside the ShouldRender time budget — the
+   * full copy (headline/lead/bullets/closer + paragraphs/proof) is being
+   * generated in the background and patched into the stored page. The
+   * extension polls /api/offer-extended (immediately on Render, which happens
+   * many seconds after ShouldRender) and swaps the whole copy in when ready.
+   * Absent/false = the core copy on the page is final.
+   */
+  corePending?: boolean;
 }
 
 export interface OfferResponse {

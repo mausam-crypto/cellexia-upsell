@@ -12,6 +12,7 @@ import type { AdminGraphql } from "../types";
 import { ensureShop, getSettings } from "./settings.server";
 import { syncCatalog, syncMarketsAndLocales } from "./catalog.server";
 import { ensurePromptTemplates, ensureUiStrings } from "./ai.server";
+import { resetOrderHistoryCache } from "./recommendation.server";
 
 /**
  * Seed shop row, prompt templates, locales/markets, UI strings, and catalog.
@@ -76,6 +77,14 @@ export async function redactCustomer(shop: string, customerId: string): Promise<
   await prisma.customerState.deleteMany({
     where: { shop, customerId: { in: candidates } },
   });
+  // v1.9 ShouldRender inquiry log keeps the customer id for 30 days (the
+  // engine reason text is stored already scrubbed of ids). Tolerate a
+  // deployment without the table.
+  await prisma.offerInquiry
+    .updateMany({ where: { shop, customerId: { in: candidates } }, data: { customerId: null } })
+    .catch((error) => {
+      if (!isMissingTableError(error)) throw error;
+    });
 
   // IssuedOffer.offerMetaJson denormalizes customerId — scrub matching rows.
   // (These rows expire within 2h anyway; the `contains` filter keeps the scan
@@ -99,10 +108,36 @@ export async function redactCustomer(shop: string, customerId: string): Promise<
   }
 }
 
+/** Prisma P2021 (table does not exist) / P2022 (column does not exist) or the raw driver text. */
+function isMissingTableError(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code;
+  if (code === "P2021" || code === "P2022") return true;
+  const msg = error instanceof Error ? error.message : String(error);
+  return /does not exist|no such table|no such column|Unknown column|has no column named/i.test(msg);
+}
+
 /** GDPR shop/redact: delete every row belonging to this shop. */
 export async function redactShop(shop: string): Promise<void> {
   if (!shop) return;
 
+  resetOrderHistoryCache(shop);
+  // Tables added after v1.6.x (DebugEvent, HealthCheckRun, OfferInquiry,
+  // GateSample, ContextualPriceCache) are wiped OUTSIDE the atomic batch,
+  // each tolerating "table does not exist": a deployment that skipped
+  // `prisma db push` must not turn the whole shop redaction into a no-op.
+  for (const del of [
+    () => prisma.offerInquiry.deleteMany({ where: { shop } }),
+    () => prisma.gateSample.deleteMany({ where: { shop } }),
+    () => prisma.debugEvent.deleteMany({ where: { shop } }),
+    () => prisma.healthCheckRun.deleteMany({ where: { shop } }),
+    () => prisma.contextualPriceCache.deleteMany({ where: { shop } }),
+  ]) {
+    try {
+      await del();
+    } catch (error) {
+      if (!isMissingTableError(error)) throw error;
+    }
+  }
   // Children first (explicit deletes — don't rely on DB-level cascades).
   await prisma.$transaction([
     prisma.offerEvent.deleteMany({ where: { shop } }),

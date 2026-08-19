@@ -15,6 +15,7 @@
 
 import prisma from "../db.server";
 import { jparse, gidToNumber, toGid } from "../lib/json";
+import { resolveMarketForCountry } from "../lib/market-resolve";
 import {
   getActiveProducts,
   getProductsByIds,
@@ -392,6 +393,75 @@ interface AffinityData {
   repeatShare: Map<string, number>;
 }
 
+/**
+ * The raw order history behind auto-pilot affinity, memoized per shop.
+ *
+ * ShouldRender runs on EVERY checkout page load (and again on each total /
+ * currency / country change) inside Shopify's ~2 s guidance, and on a store
+ * doing ~50 orders/hour the RECENT_ORDERS_CAP window (5,000 orders + their
+ * lines) is reached within days — re-reading it from the database on every
+ * inquiry is the single largest fixed cost of /api/offer. The rows change
+ * only when a webhook lands, and affinity is a statistic over thousands of
+ * orders, so a 5-minute-old snapshot is indistinguishable from a fresh one.
+ * Concurrent loaders share one in-flight promise; a failed load is not cached.
+ */
+const ORDER_HISTORY_TTL_MS = 5 * 60 * 1000;
+interface OrderHistorySnapshot {
+  loadedAt: number;
+  productsOfOrder: Map<string, Set<string>>;
+  customerByOrder: Map<string, string | null>;
+}
+const orderHistoryCache = new Map<string, OrderHistorySnapshot>();
+const orderHistoryInflight = new Map<string, Promise<OrderHistorySnapshot>>();
+
+async function loadOrderHistory(shop: string): Promise<OrderHistorySnapshot> {
+  const cached = orderHistoryCache.get(shop);
+  if (cached && Date.now() - cached.loadedAt < ORDER_HISTORY_TTL_MS) return cached;
+  const inflight = orderHistoryInflight.get(shop);
+  if (inflight) return inflight;
+  const load = (async () => {
+    const recent = await prisma.orderRecord.findMany({
+      where: { shop },
+      orderBy: { createdAt: "desc" },
+      take: RECENT_ORDERS_CAP,
+      select: { id: true, customerId: true },
+    });
+    const customerByOrder = new Map<string, string | null>(recent.map((r) => [r.id, r.customerId]));
+    const productsOfOrder = new Map<string, Set<string>>();
+    if (recent.length > 0) {
+      for (const batch of chunk(recent.map((r) => r.id), 500)) {
+        const rows = await prisma.orderLine.findMany({
+          where: { orderRecordId: { in: batch } },
+          select: { orderRecordId: true, productId: true },
+        });
+        for (const line of rows) {
+          let set = productsOfOrder.get(line.orderRecordId);
+          if (!set) {
+            set = new Set();
+            productsOfOrder.set(line.orderRecordId, set);
+          }
+          set.add(normId(line.productId));
+        }
+      }
+    }
+    const snapshot: OrderHistorySnapshot = { loadedAt: Date.now(), productsOfOrder, customerByOrder };
+    orderHistoryCache.set(shop, snapshot);
+    return snapshot;
+  })();
+  orderHistoryInflight.set(shop, load);
+  try {
+    return await load;
+  } finally {
+    orderHistoryInflight.delete(shop);
+  }
+}
+
+/** Drop the memoized order history (tests, uninstall). */
+export function resetOrderHistoryCache(shop?: string): void {
+  if (shop) orderHistoryCache.delete(shop);
+  else orderHistoryCache.clear();
+}
+
 async function loadOrderAffinity(shop: string, basketNormIds: string[]): Promise<AffinityData> {
   const ordersWith = new Map<string, number>();
   const coCount = new Map<string, Map<string, number>>();
@@ -401,33 +471,8 @@ async function loadOrderAffinity(shop: string, basketNormIds: string[]): Promise
   }
   const repeatShare = new Map<string, number>();
 
-  const recent = await prisma.orderRecord.findMany({
-    where: { shop },
-    orderBy: { createdAt: "desc" },
-    take: RECENT_ORDERS_CAP,
-    select: { id: true, customerId: true },
-  });
-  if (recent.length === 0) return { ordersWith, coCount, repeatShare };
-
-  const customerByOrder = new Map<string, string | null>(recent.map((r) => [r.id, r.customerId]));
-  const lines: Array<{ orderRecordId: string; productId: string }> = [];
-  for (const batch of chunk(recent.map((r) => r.id), 500)) {
-    const rows = await prisma.orderLine.findMany({
-      where: { orderRecordId: { in: batch } },
-      select: { orderRecordId: true, productId: true },
-    });
-    lines.push(...rows);
-  }
-
-  const productsOfOrder = new Map<string, Set<string>>();
-  for (const line of lines) {
-    let set = productsOfOrder.get(line.orderRecordId);
-    if (!set) {
-      set = new Set();
-      productsOfOrder.set(line.orderRecordId, set);
-    }
-    set.add(normId(line.productId));
-  }
+  const { productsOfOrder, customerByOrder } = await loadOrderHistory(shop);
+  if (productsOfOrder.size === 0) return { ordersWith, coCount, repeatShare };
 
   // Co-occurrence with each basket product A.
   for (const products of productsOfOrder.values()) {
@@ -548,22 +593,34 @@ export async function selectOffers(
   ctx: PurchaseContext,
   settings: AppSettings,
 ): Promise<SelectionResult> {
-  const empty = (matchedRuleId: string | null = null): SelectionResult => ({
+  const empty = (reason: string, matchedRuleId: string | null = null): SelectionResult => ({
     offers: [],
     displayMode: settings.defaultDisplayMode,
     matchedRuleId,
     copyLength: settings.copyLength,
+    emptyReason: reason,
   });
 
   try {
     // Step 1 — global kill switch.
     if (settings.enabled === false) {
       dbg("step1: app disabled — no offers");
-      return empty();
+      return empty("step1: app kill-switch is off (Settings → General)");
     }
 
+    // Test customers (Settings → Frequency & hygiene) bypass the frequency
+    // cap and the purchase-suppression window: a merchant testing with their
+    // own account/card would otherwise be blocked by their own test history
+    // and see "no offer" for reasons that never apply to a real buyer.
+    const isTestCustomer =
+      Boolean(ctx.customerId) &&
+      Array.isArray(settings.testCustomerIds) &&
+      settings.testCustomerIds.length > 0 &&
+      customerIdVariants(ctx.customerId as string).some((v) => settings.testCustomerIds.includes(v));
+    if (isTestCustomer) dbg("test customer", ctx.customerId, "— frequency cap and purchase suppression bypassed");
+
     // Step 2 — frequency cap (applies whenever we know the customer).
-    if (ctx.customerId && settings.frequencyCapDays > 0) {
+    if (ctx.customerId && settings.frequencyCapDays > 0 && !isTestCustomer) {
       const states = await prisma.customerState.findMany({
         where: { shop: ctx.shop, customerId: { in: customerIdVariants(ctx.customerId) } },
       });
@@ -573,7 +630,9 @@ export async function selectOffers(
       }
       if (lastOfferAt && Date.now() - lastOfferAt.getTime() < settings.frequencyCapDays * DAY_MS) {
         dbg("step2: frequency cap hit for customer", ctx.customerId, "last offer", lastOfferAt.toISOString());
-        return empty();
+        return empty(
+          `step2: frequency cap — customer ${ctx.customerId} last saw an offer ${lastOfferAt.toISOString()} (< ${settings.frequencyCapDays} days; any surface counts, incl. the thank-you page)`,
+        );
       }
     }
     dbg("step2: frequency cap passed");
@@ -587,13 +646,14 @@ export async function selectOffers(
     if (ctx.countryCode) {
       const cc = ctx.countryCode.trim().toUpperCase();
       const markets = await prisma.marketSetting.findMany({ where: { shop: ctx.shop } });
-      const hit = markets.find((m) =>
-        jparse<string[]>(m.countriesJson, []).some((c) => String(c).trim().toUpperCase() === cc),
-      );
+      // Deterministic: the most specific market listing the country governs
+      // it (a country can sit in two rows — its own market and a broader
+      // region, or a stale row for a market removed in Shopify).
+      const hit = resolveMarketForCountry(markets, cc);
       if (hit) {
         if (hit.enabled === false) {
           dbg("step3: market", hit.marketHandle, "disabled for", cc, "— no offers");
-          return empty();
+          return empty(`step3: market "${hit.marketHandle}" is disabled for ${cc} (Settings → Markets)`);
         }
         market = {
           enabled: hit.enabled,
@@ -613,12 +673,14 @@ export async function selectOffers(
     if (ctx.surface === "thank_you") maxOffers = Math.min(maxOffers, 1);
     maxOffers = Math.floor(maxOffers);
     dbg("step4: distinctProducts =", distinctProducts, "maxOffers =", maxOffers);
-    if (!Number.isFinite(maxOffers) || maxOffers < 1) return empty();
+    if (!Number.isFinite(maxOffers) || maxOffers < 1) {
+      return empty(`step4: max offers resolved to ${maxOffers} (single/multi-product offer counts or a market maxOffers override)`);
+    }
 
     // Step 5 — suppression set.
     const suppressed = new Set<string>();
     for (const li of ctx.lineItems) suppressed.add(normId(li.productId));
-    if (ctx.customerId && settings.suppressionDays > 0) {
+    if (ctx.customerId && settings.suppressionDays > 0 && !isTestCustomer) {
       const since = new Date(Date.now() - settings.suppressionDays * DAY_MS);
       const recentOrders = await prisma.orderRecord.findMany({
         where: {
@@ -685,7 +747,7 @@ export async function selectOffers(
     if (matchedRule) {
       matchedRuleId = matchedRule.id;
       if (matchedRule.maxOffers != null) maxOffers = Math.min(maxOffers, matchedRule.maxOffers);
-      if (maxOffers < 1) return empty(matchedRule.id);
+      if (maxOffers < 1) return empty(`step6: rule "${matchedRule.name}" caps offers at ${maxOffers}`, matchedRule.id);
       displayMode = resolveDisplayMode(matchedRule.displayMode, settings);
       copyLength = resolveCopyLength(matchedRule.copyLength, settings);
 
@@ -741,7 +803,11 @@ export async function selectOffers(
         pool.push({ product: p, variant: v });
       }
       dbg("step6b: auto-pilot pool size =", pool.length);
-      if (pool.length === 0) return empty();
+      if (pool.length === 0) {
+        return empty(
+          `step6b: auto-pilot pool is empty — ${active.length} ACTIVE cached products, all suppressed (in the basket, bought within ${settings.suppressionDays} days, excluded in Upsell products, price ≤ 0, or inventory < ${settings.minInventory}); with 0 cached products run Sync on the Dashboard`,
+        );
+      }
 
       const basketNormIds = [...new Set(ctx.lineItems.map((li) => normId(li.productId)))]
         .filter(Boolean)
@@ -823,7 +889,12 @@ export async function selectOffers(
     // Step 9 — never more than 3; empty candidates → empty result.
     if (picks.length === 0) {
       dbg("step9: no eligible picks — empty result");
-      return empty(matchedRuleId);
+      return empty(
+        matchedRule
+          ? `step6: rule "${matchedRule.name}" matched but every slot candidate is suppressed/ineligible (no auto-pilot fallback for matched rules)`
+          : "step9: no eligible picks",
+        matchedRuleId,
+      );
     }
 
     // Step 8 — display mode assembly (+ step 9 hard cap inside).
@@ -833,7 +904,7 @@ export async function selectOffers(
     return { offers, displayMode, matchedRuleId, copyLength };
   } catch (error) {
     console.error("[engine] selectOffers failed — degrading to empty result", error);
-    return empty();
+    return empty(`engine crashed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 

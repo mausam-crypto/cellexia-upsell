@@ -32,7 +32,8 @@ import {
 import { autoPickWinners } from "../services/recommendation.server";
 import { ensurePromptRulesFresh, ensureUiStringsFresh } from "../services/ai.server";
 import { syncCatalog, syncMarketsAndLocales } from "../services/catalog.server";
-import { getLatestHealthRun, maybeAutoRunHealthChecks } from "../services/health.server";
+import { getLatestHealthRun, maybeAutoRunHealthChecks, maybeSamplePostPurchaseGate } from "../services/health.server";
+import { inquiryStats } from "../services/inquiry-log.server";
 import type { AdminGraphql } from "../types";
 import { MiniChart } from "../components/MiniChart";
 
@@ -100,8 +101,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Keep the live health-check battery running on its 6h cadence whenever the
   // admin is used (fire-and-forget), and surface the latest verdict below.
   maybeAutoRunHealthChecks(shop);
+  maybeSamplePostPurchaseGate(shop);
 
-  const [stats, timeSeries, offerRows, shopRow, enabledRuleCount, healthRun] =
+  const [stats, timeSeries, offerRows, shopRow, enabledRuleCount, healthRun, inquiries24h] =
     await Promise.all([
       getDashboardStats(shop, DASHBOARD_DAYS),
       getTimeSeries(shop, DASHBOARD_DAYS),
@@ -109,9 +111,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       prisma.shop.findUnique({ where: { shop } }),
       prisma.offerRule.count({ where: { shop, enabled: true } }),
       getLatestHealthRun(shop),
+      // ShouldRender calls Shopify sent in the last 24 h (v1.9 inquiry log);
+      // null when the table is missing (deployment skipped `prisma db push`).
+      inquiryStats(shop, 24 * 3600 * 1000, { light: true }).catch(() => null),
     ]);
 
   return json({
+    inquiries24h: inquiries24h
+      ? { total: inquiries24h.total, withOffers: inquiries24h.withOffers, avgTookMs: inquiries24h.avgTookMs }
+      : null,
     health: healthRun
       ? {
           status: healthRun.status,
@@ -122,6 +130,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
             .filter((r) => r.status === "fail")
             .slice(0, 3)
             .map((r) => r.name),
+          // Shopify's own per-store gate for the post-purchase page — surfaced
+          // separately because when it is closed NOTHING else in this app can
+          // make an offer appear (the backend is never called).
+          postPurchaseAvailable: (() => {
+            const row = healthRun.results.find((r) => r.id === "shopify.post-purchase-availability");
+            if (!row) return null;
+            return row.status === "ok" ? true : row.status === "fail" ? false : null;
+          })(),
+          currencyEligibility: (() => {
+            const row = healthRun.results.find((r) => r.id === "flow.currency-eligibility");
+            return row && row.status !== "skip" ? row.summary : null;
+          })(),
         }
       : null,
     stats,
@@ -188,7 +208,8 @@ function formatPct(ratio: number): string {
 }
 
 export default function Dashboard() {
-  const { stats, series, topOffers, checklist, health } = useLoaderData<typeof loader>();
+  const data = useLoaderData<typeof loader>();
+  const { stats, series, topOffers, checklist, health } = data;
   const shopify = useAppBridge();
   const fetcher = useFetcher<typeof action>();
   const syncing = fetcher.state !== "idle";
@@ -227,7 +248,7 @@ export default function Dashboard() {
     key: string;
     done: boolean;
     badge: string;
-    tone: "success" | "attention" | "info";
+    tone: "success" | "attention" | "info" | "critical";
     text: string;
   }> = [
     {
@@ -275,10 +296,31 @@ export default function Dashboard() {
     },
     {
       key: "checkout",
-      done: false,
-      badge: "Verify",
-      tone: "info",
-      text: "In Shopify admin, open Settings → Checkout → Post-purchase page and select this app — offers cannot appear until it is selected there.",
+      done: health?.postPurchaseAvailable === true,
+      badge:
+        health?.postPurchaseAvailable === true
+          ? "Done"
+          : health?.postPurchaseAvailable === false
+            ? "Blocked"
+            : "Verify",
+      tone:
+        health?.postPurchaseAvailable === true
+          ? "success"
+          : health?.postPurchaseAvailable === false
+            ? "critical"
+            : "info",
+      text:
+        health?.postPurchaseAvailable === true
+          ? `Shopify exposes the post-purchase page for this store (health check verified the live checkout flag).${
+              data.inquiries24h
+                ? data.inquiries24h.total > 0
+                  ? ` Shopify sent ${data.inquiries24h.total} ShouldRender inquir${data.inquiries24h.total === 1 ? "y" : "ies"} in the last 24 h (${data.inquiries24h.withOffers} answered with an offer, avg ${data.inquiries24h.avgTookMs ?? "-"} ms) — details under Debug → Post-purchase inquiries.`
+                  : " No ShouldRender inquiry has reached this backend in the last 24 h yet — the gate may have opened only recently; any checkout opened in the shop currency shows up under Debug → Post-purchase inquiries within seconds of the checkout page loading (the payment method only decides later whether the page is shown)."
+                : ""
+            }`
+          : health?.postPurchaseAvailable === false
+            ? "Shopify does NOT currently expose the post-purchase page for this store — no buyer can see an offer until this is fixed. Needed: (1) Partner Dashboard → this app → API access → 'Access post-purchase extensions' (mandatory on live stores), (2) a released app version containing the post-purchase extension, (3) Settings → Checkout → Post-purchase page → select this app → Save. Details in Debug → Health checks."
+            : "Shopify must expose the post-purchase page for this store: your developer requests 'Access post-purchase extensions' in the Partner Dashboard (live stores only), releases the extension, and you select this app under Settings → Checkout → Post-purchase page. Run the health checks (Debug tab) to verify — offers cannot appear until that check is green.",
     },
   ];
 
@@ -422,15 +464,19 @@ export default function Dashboard() {
                   </InlineStack>
                 ))}
               </BlockStack>
-              <Banner tone="info" title="Payment methods">
+              <Banner tone="info" title="Who can see the post-purchase page (Shopify rules)">
                 <p>
                   Shopify shows the post-purchase page only for plain
-                  credit-card payments — never for Apple Pay, Google Pay,
-                  PayPal, installments or gift-card-only orders (a platform
-                  limitation). The thank-you page fallback offer
+                  credit-card payments checked out in the store&apos;s own
+                  currency — never for Apple Pay, Google Pay, PayPal,
+                  installments or gift-card-only orders, and never when the
+                  buyer paid in another currency (a Markets local currency)
+                  or the order carried duties. These are platform
+                  limitations. The thank-you page fallback offer
                   {checklist.thankYouEnabled
-                    ? " is enabled and covers those orders automatically."
-                    : " covers those orders — it is currently disabled under Settings → General."}
+                    ? " is enabled and covers all those orders automatically."
+                    : " covers all those orders — it is currently disabled under Settings → General."}
+                  {health?.currencyEligibility ? ` ${health.currencyEligibility}` : ""}
                 </p>
               </Banner>
             </BlockStack>

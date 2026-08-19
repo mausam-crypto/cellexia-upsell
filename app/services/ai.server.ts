@@ -63,7 +63,10 @@ import {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+// Overridable for local smoke tests / egress proxies only (never needed in
+// production): ANTHROPIC_API_URL=http://localhost:PORT/v1/messages.
+const ANTHROPIC_API_URL =
+  process.env.ANTHROPIC_API_URL || "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
 /** Generous timeout for background cache warming and previews. */
 const BACKGROUND_TIMEOUT_MS = 45_000;
@@ -1362,7 +1365,10 @@ async function upsertCopyCache(
  * is cached under the standard cacheKey. A core-only "long" result is NEVER
  * cached under the full cacheKey — only completeExtendedCopy writes the
  * merged copy. Timeout/error degrades to the deterministic fallback and warms
- * the full cache in the background, exactly like generateCopy. Never throws.
+ * the full cache in the background, exactly like generateCopy — and hands
+ * that background generation back to the caller (`background`) so the page
+ * already issued with fallback copy can be PATCHED with the real copy once it
+ * lands (the extension polls for it). Never throws.
  */
 export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
   copy: OfferCopy;
@@ -1375,6 +1381,12 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
    *  pass it to completeExtendedCopy so the background merge lands on the
    *  same row even if a grounding edit shifts the key in the meantime. */
   cacheKey: string;
+  /**
+   * Present only when `fallbackUsed` came from a timeout/error: the in-flight
+   * background FULL generation (core + extended, language-enforced, cached
+   * on success). Resolves to null when it fails — never rejects.
+   */
+  background?: Promise<{ copy: OfferCopy; discountSuggestion: number | null } | null>;
 }> {
   const template = await getPromptTemplate(args.shop, args.mode, args.settings);
   const cacheKey = await buildCacheKey(args, template.version);
@@ -1536,10 +1548,15 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
       `[ai] core copy generation failed for ${args.shop} (${args.mode}, ${args.language}):`,
       error,
     );
-    // Warm the FULL cache for the next buyer — fire and forget, generous timeout.
-    void generateAndCache(args, template, cacheKey, BACKGROUND_TIMEOUT_MS).catch(
-      (bgError) =>
-        console.error(`[ai] background cache warming failed for ${args.shop}:`, bgError),
+    // Warm the FULL cache for the next buyer — generous timeout, never awaited
+    // here. The promise is ALSO returned so the orchestrator can patch the
+    // page it is about to issue with fallback copy once the real copy lands
+    // (the extension polls /api/offer-extended for it at Render time).
+    const background = generateAndCache(args, template, cacheKey, BACKGROUND_TIMEOUT_MS).catch(
+      (bgError) => {
+        console.error(`[ai] background cache warming failed for ${args.shop}:`, bgError);
+        return null;
+      },
     );
     const strings = await safeGetUiStrings(args.shop, args.language);
     return {
@@ -1550,6 +1567,7 @@ export async function generateBuyerCopy(args: GenerateCopyArgs): Promise<{
       extendedPending: false,
       reason: "timeout_or_error",
       cacheKey,
+      background,
     };
   }
 }

@@ -497,6 +497,8 @@ export async function recordExtensionEvent(
               eventType === "accepted"
                 ? { hadUpsellOffer: true, acceptedUpsell: true }
                 : { hadUpsellOffer: true },
+            // read back nothing — survives a database without the v1.9 columns
+            select: { id: true },
           });
           if (eventType === "accepted") {
             await prisma.offerEvent.updateMany({
@@ -544,6 +546,24 @@ export async function recordExtensionEvent(
  * had an upsell offer; accepted events flip `acceptedUpsell`, mark matching
  * lines `isUpsell` (variant match) and get their `orderId` backfilled.
  */
+let warnedMissingOrderColumns = false;
+function warnMissingOrderColumnsOnce(error: unknown): void {
+  if (warnedMissingOrderColumns) return;
+  warnedMissingOrderColumns = true;
+  console.warn(
+    "[analytics] OrderRecord is missing the v1.9 columns (checkoutToken/gateway/presentment/sourceName) — orders are stored WITHOUT eligibility annotations until `npx prisma db push` runs on this deployment.",
+    error instanceof Error ? error.message : error,
+  );
+}
+
+/** Prisma P2022 (column does not exist) or the raw driver message for it. */
+function isMissingColumnError(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code;
+  if (code === "P2022" || code === "P2021") return true;
+  const msg = error instanceof Error ? error.message : String(error);
+  return /does not exist|no such column|Unknown column|has no column named/i.test(msg);
+}
+
 export async function recordOrderFromWebhook(shop: string, payload: any): Promise<void> {
   try {
     // Shopify test orders (test gateway / bogus payments) must not pollute
@@ -572,6 +592,24 @@ export async function recordOrderFromWebhook(shop: string, payload: any): Promis
       null;
     const createdAtRaw = payload?.created_at ? new Date(payload.created_at) : new Date();
     const createdAt = Number.isNaN(createdAtRaw.getTime()) ? new Date() : createdAtRaw;
+    // Post-purchase eligibility annotations (v1.9, see OrderRecord in schema).
+    const checkoutToken =
+      typeof payload?.checkout_token === "string" && payload.checkout_token
+        ? payload.checkout_token.slice(0, 64)
+        : null;
+    const gateway = Array.isArray(payload?.payment_gateway_names)
+      ? payload.payment_gateway_names.map((g: unknown) => String(g)).join(", ").slice(0, 120) || null
+      : typeof payload?.gateway === "string" && payload.gateway
+        ? String(payload.gateway).slice(0, 120)
+        : null;
+    const presentment =
+      typeof payload?.presentment_currency === "string" && payload.presentment_currency
+        ? payload.presentment_currency.slice(0, 8)
+        : null;
+    const sourceName =
+      typeof payload?.source_name === "string" && payload.source_name
+        ? payload.source_name.slice(0, 40)
+        : null;
 
     // Match offer events by orderId or by the numeric part of referenceId
     // (post-purchase referenceIds are the numeric order id; thank-you ones are
@@ -617,28 +655,43 @@ export async function recordOrderFromWebhook(shop: string, payload: any): Promis
         };
       });
 
-    const record = await prisma.orderRecord.upsert({
-      where: { shop_orderId: { shop, orderId } },
-      create: {
-        shop,
-        orderId,
-        customerId,
-        totalPrice,
-        currency,
-        country,
-        hadUpsellOffer,
-        acceptedUpsell,
-        createdAt,
-      },
-      update: {
-        customerId,
-        totalPrice,
-        currency,
-        country,
-        hadUpsellOffer,
-        acceptedUpsell,
-      },
-    });
+    const baseCreate = { shop, orderId, customerId, totalPrice, currency, country, hadUpsellOffer, acceptedUpsell, createdAt };
+    const baseUpdate = { customerId, totalPrice, currency, country, hadUpsellOffer, acceptedUpsell };
+    // v1.9 eligibility annotations. orders/updated redeliveries carry the same
+    // values; never blank a value we already have with a null from a partial
+    // payload.
+    const annotationsCreate = { checkoutToken, gateway, presentment, sourceName };
+    const annotationsUpdate = {
+      ...(checkoutToken ? { checkoutToken } : {}),
+      ...(gateway ? { gateway } : {}),
+      ...(presentment ? { presentment } : {}),
+      ...(sourceName ? { sourceName } : {}),
+    };
+    // `select: { id }` on BOTH writes: Prisma reads back every scalar of the
+    // model after a write, so without it even the fallback below would fail
+    // with P2022 on a database that lacks the v1.9 columns (verified against a
+    // v1.8-shaped SQLite file). Only the id is used afterwards.
+    let record: { id: string };
+    try {
+      record = await prisma.orderRecord.upsert({
+        where: { shop_orderId: { shop, orderId } },
+        create: { ...baseCreate, ...annotationsCreate },
+        update: { ...baseUpdate, ...annotationsUpdate },
+        select: { id: true },
+      });
+    } catch (error) {
+      // A deployment that skipped `prisma db push` has no v1.9 columns yet:
+      // an order must NEVER be dropped because of diagnostics columns — store
+      // it without them and let the env.database health check shout.
+      if (!isMissingColumnError(error)) throw error;
+      warnMissingOrderColumnsOnce(error);
+      record = await prisma.orderRecord.upsert({
+        where: { shop_orderId: { shop, orderId } },
+        create: baseCreate,
+        update: baseUpdate,
+        select: { id: true },
+      });
+    }
 
     // Replace lines idempotently (webhooks may be redelivered).
     await prisma.orderLine.deleteMany({ where: { orderRecordId: record.id } });

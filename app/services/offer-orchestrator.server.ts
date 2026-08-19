@@ -10,6 +10,7 @@
 import { Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import { gidToNumber, jparse, jstr } from "../lib/json";
+import { resolveMarketForCountry } from "../lib/market-resolve";
 import {
   DEFAULT_UI_STRINGS_EN,
   type AdminGraphql,
@@ -66,6 +67,50 @@ import {
 /** Issued offers can be signed for up to 2 hours after they were assembled. */
 const OFFER_TTL_MS = 2 * 60 * 60 * 1000;
 
+/**
+ * Buyer-path budget for the whole /api/offer assembly, measured from the
+ * moment the request is authenticated. Shopify's checkout runs ShouldRender
+ * when the payment page loads and RE-RUNS it on every total / currency /
+ * country change (its inquiry status resets to "timeout" each time); the
+ * post-purchase detour is only taken when the inquiry has resolved "success"
+ * by the time the order is processed. Shopify's UX guidance is "network calls
+ * must complete in two seconds or less". Everything the buyer sees is
+ * unaffected by this cap: pages whose AI copy is not ready ship with fallback
+ * copy and are patched in the background; the extension swaps the real copy
+ * in at Render time (which happens many seconds later).
+ */
+export const POST_PURCHASE_ASSEMBLY_BUDGET_MS = 1800;
+
+/** Never give the core copy call less than this, even right at the deadline. */
+const MIN_BUYER_COPY_WAIT_MS = 250;
+
+/**
+ * Await `promise`, but no longer than the request deadline allows; past the
+ * deadline resolve `fallback` and let the original promise finish on its own.
+ */
+function raceDeadline<T>(
+  promise: Promise<T>,
+  deadlineAt: number | undefined,
+  fallback: T,
+): Promise<T> {
+  if (typeof deadlineAt !== "number") return promise;
+  const remaining = deadlineAt - Date.now();
+  if (remaining <= 0) return Promise.resolve(fallback);
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), remaining);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
 /** Where each page's copy actually came from — surfaced in admin previews. */
 export interface PageCopyDiagnostic {
   position: number;
@@ -81,6 +126,19 @@ export interface PageCopyDiagnostic {
  */
 export interface AssembleOfferOptions {
   copyTimeoutMs?: number;
+  /**
+   * Buyer-path request deadline (epoch ms). Shopify's checkout only takes the
+   * post-purchase detour when ShouldRender has ALREADY resolved by the moment
+   * the order is processed, and it restarts the inquiry every time the total /
+   * currency / country changes — so /api/offer must answer fast and
+   * deterministically. Past this instant the AI copy call is capped to the
+   * remaining budget (fallback copy + background generation + Render-time
+   * swap when it runs out) and the contextual-pricing wait is cut short.
+   * Absent = no deadline (admin previews).
+   */
+  deadlineAt?: number;
+  /** Out-param: why the response carries no offers (buyer-path logging). */
+  emptyReason?: string;
   diagnostics?: PageCopyDiagnostic[];
   /** Out-param: how the response language was chosen (admin preview trace). */
   languageResolution?: { language: string; source: LanguageSource };
@@ -278,14 +336,8 @@ async function findMarketForCountry(shop: string, countryCode: string | null) {
   if (!countryCode) return null;
   try {
     const rows = await prisma.marketSetting.findMany({ where: { shop } });
-    const cc = countryCode.trim().toUpperCase();
-    return (
-      rows.find((m) =>
-        jparse<string[]>(m.countriesJson, []).some(
-          (c) => String(c).trim().toUpperCase() === cc,
-        ),
-      ) ?? null
-    );
+    // Same deterministic most-specific-market rule as the engine's gating.
+    return resolveMarketForCountry(rows, countryCode);
   } catch (error) {
     console.error(`[orchestrator] market lookup failed for ${shop}`, error);
     return null;
@@ -510,6 +562,61 @@ async function patchExtendedCopy(args: {
   }
 }
 
+/**
+ * Background stage for pages issued with corePending (deterministic fallback
+ * copy because the AI core call ran out of ShouldRender budget): once the
+ * full background generation lands, replace the stored page's copy wholesale
+ * (headline/lead/bullets/closer + paragraphs/proof) so /api/offer-extended
+ * — polled by the extension at Render time — and any stored-page reuse serve
+ * the real copy. Read-modify-write in ONE transaction, touching only the copy
+ * and the pending/ready flags. Never throws; a failure simply leaves the
+ * page on its (complete-in-itself) fallback copy.
+ */
+async function patchFullCopy(args: {
+  shop: string;
+  referenceId: string;
+  offerId: string;
+  copy: OfferCopy;
+}): Promise<void> {
+  try {
+    await prisma.$transaction(async (tx) => {
+      const row = await tx.issuedOffer.findUnique({
+        where: {
+          referenceId_offerId: { referenceId: args.referenceId, offerId: args.offerId },
+        },
+      });
+      if (!row || row.shop !== args.shop) return;
+      const meta = jparse<any>(row.offerMetaJson, null);
+      if (!meta || typeof meta !== "object") return;
+      const page = meta.page;
+      if (!page || typeof page !== "object") return;
+      page.copy = {
+        headline: args.copy.headline,
+        body: args.copy.body,
+        bullets: Array.isArray(args.copy.bullets) ? args.copy.bullets : [],
+        paragraphs: Array.isArray(args.copy.paragraphs) ? args.copy.paragraphs : [],
+        proof: Array.isArray(args.copy.proof) ? args.copy.proof : [],
+        closer: typeof args.copy.closer === "string" ? args.copy.closer : "",
+      };
+      page.corePending = false;
+      page.extendedPending = false;
+      meta.coreReady = true;
+      meta.extendedReady = true;
+      await tx.issuedOffer.update({
+        where: {
+          referenceId_offerId: { referenceId: args.referenceId, offerId: args.offerId },
+        },
+        data: { offerMetaJson: jstr(meta) },
+      });
+    });
+  } catch (error) {
+    console.error(
+      `[orchestrator] full copy patch failed for ${args.shop} ${args.referenceId}/${args.offerId}`,
+      error,
+    );
+  }
+}
+
 // ── Post-purchase offer assembly ─────────────────────────────────────────────
 
 async function buildOfferPage(args: {
@@ -602,6 +709,11 @@ async function buildOfferPage(args: {
   let discountSuggestion: number | null = null;
   let extendedPending = false;
   let coreCacheKey: string | undefined;
+  // Buyer path only: the background FULL generation to patch into the stored
+  // page when the core call ran out of ShouldRender budget.
+  let corePendingBackground:
+    | Promise<{ copy: OfferCopy; discountSuggestion: number | null } | null>
+    | null = null;
   // The working discount for EVERYTHING on this page — prompt, prices,
   // changes, title. INVARIANT: this pct always equals the pct the copy was
   // generated with; copy and charge can never disagree.
@@ -659,12 +771,26 @@ async function buildOfferPage(args: {
       // Buyer path (hard ShouldRender time budget): fast CORE copy now; for
       // long copyLength the below-CTA sections (paragraphs/proof) complete in
       // the background and the extension polls /api/offer-extended for them.
+      // The wait is capped by the request deadline: when the budget runs out
+      // the page ships with deterministic fallback copy (corePending) and the
+      // background full generation is patched into the stored page for the
+      // extension to swap in at Render time.
       try {
+        if (typeof options?.deadlineAt === "number") {
+          const remaining = options.deadlineAt - Date.now();
+          copyArgs.timeoutMs = Math.max(
+            MIN_BUYER_COPY_WAIT_MS,
+            Math.min(settings.aiTimeoutMs, remaining),
+          );
+        }
         const generated = await generateBuyerCopy(copyArgs);
         copy = generated.copy;
         discountSuggestion = generated.discountSuggestion;
         extendedPending = generated.extendedPending;
         coreCacheKey = generated.cacheKey;
+        if (generated.fallbackUsed && generated.background) {
+          corePendingBackground = generated.background;
+        }
         options?.diagnostics?.push({
           position: offer.position,
           source: generated.cached ? "cache" : generated.fallbackUsed ? "fallback" : "ai",
@@ -709,7 +835,10 @@ async function buildOfferPage(args: {
   // (with its final prices) is persisted in the meta below, so stored-page
   // reuse displays identically without re-deriving anything. Awaited here —
   // after the copy call above — so the pricing round-trip cost overlapped it.
-  const ctxPricing = await ctxPricingPromise;
+  // On the buyer path the wait is bounded by the request deadline (a slow
+  // Shopify round-trip degrades to FX/shop-currency prices, never to a late
+  // ShouldRender).
+  const ctxPricing = await raceDeadline(ctxPricingPromise, options?.deadlineAt, null);
   const fx = ctxPricing ? null : displayFxFromContext(ctx);
   const page: OfferPage = {
     offerId,
@@ -725,6 +854,7 @@ async function buildOfferPage(args: {
     position: offer.position,
     // Only set when true — absent/false means the copy is complete.
     ...(extendedPending ? { extendedPending: true } : {}),
+    ...(corePendingBackground ? { corePending: true } : {}),
   };
   await persistIssuedOffer({
     ctx,
@@ -756,7 +886,20 @@ async function buildOfferPage(args: {
     },
   });
 
-  if (extendedPending) {
+  if (corePendingBackground) {
+    // Only AFTER the row exists: when the background full generation lands,
+    // replace the fallback copy on the stored page. Fire-and-forget.
+    const background = corePendingBackground;
+    void background
+      .then((result) =>
+        result
+          ? patchFullCopy({ shop: ctx.shop, referenceId: ctx.referenceId, offerId, copy: result.copy })
+          : undefined,
+      )
+      .catch((error) =>
+        console.error(`[orchestrator] core copy background task failed for ${ctx.shop}`, error),
+      );
+  } else if (extendedPending) {
     // Only AFTER the row exists: complete the extended sections in the
     // background and patch the stored meta. Fire-and-forget — the buyer-
     // blocking request path must never wait on (or fail because of) this.
@@ -787,9 +930,11 @@ async function buildOfferPage(args: {
  * credited to A, accepts to B) and regenerate copy. Returns null when nothing
  * reusable exists (then normal selection runs); never throws.
  */
-async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferResponse | null> {
+async function findStoredOfferResponse(
+  ctx: PurchaseContext,
+): Promise<{ response: OfferResponse | null; stale: string[] } | null> {
   try {
-    const rows = await prisma.issuedOffer.findMany({
+    const allRows = await prisma.issuedOffer.findMany({
       where: {
         shop: ctx.shop,
         referenceId: ctx.referenceId,
@@ -797,7 +942,37 @@ async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferRespo
       },
       orderBy: { createdAt: "asc" },
     });
-    if (rows.length === 0) return null;
+    if (allRows.length === 0) return null;
+
+    // Context fidelity (v1.9, observed live): Shopify runs the FIRST
+    // ShouldRender at checkout mount with destinationCountryCode = null and
+    // re-runs it once the buyer's address / currency is known. Pages issued
+    // for the country-less inquiry were selected without market gating,
+    // market discount/language overrides or per-country pricing — serving
+    // them verbatim to every later inquiry would lock a wrong market decision
+    // into the checkout (a disabled market would still get offers). So the
+    // stored pages are reused only while the destination country they were
+    // issued for is still the destination country; when the country becomes
+    // known or changes, the pre-address rows are retired and selection runs
+    // again for the real context. Nothing has been shown or accepted before
+    // payment, so retiring ShouldRender-only rows is safe; the Render-time
+    // (Shop Pay) re-fetch carries the final country and therefore reuses the
+    // pages the last ShouldRender issued.
+    // Only rows issued for another country are retired; rows that already
+    // match the live country are kept and reused (a late-landing country-less
+    // response racing a country-aware one must never delete the pages the
+    // extension's storage — and a later sign-changeset — refer to).
+    const liveCountry = ctx.countryCode ? ctx.countryCode.trim().toUpperCase() : null;
+    const stale: string[] = [];
+    const rows = allRows.filter((row) => {
+      const meta = jparse<any>(row.offerMetaJson, null);
+      if (!meta || meta.surface !== "post_purchase") return true; // not ours to judge here
+      if (!liveCountry) return true;
+      const c = typeof meta.country === "string" && meta.country ? meta.country.trim().toUpperCase() : null;
+      if (c === liveCountry) return true;
+      stale.push(row.id);
+      return false;
+    });
 
     const pages: OfferPage[] = [];
     let language = "en";
@@ -827,7 +1002,7 @@ async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferRespo
         presentmentCurrency = meta.presentmentCurrency;
       }
     }
-    if (pages.length === 0) return null;
+    if (pages.length === 0) return stale.length > 0 ? { response: null, stale } : null;
     pages.sort((a, b) => a.position - b.position);
 
     let settings: AppSettings | null = null;
@@ -838,18 +1013,21 @@ async function findStoredOfferResponse(ctx: PurchaseContext): Promise<OfferRespo
     }
     const strings = await safeGetUiStrings(ctx.shop, language);
     return {
-      offers: pages,
-      displayMode: displayMode ?? settings?.defaultDisplayMode ?? "sequential",
-      // Stored views keep the prices they were issued with — label them with
-      // the stored display currency, never the (possibly different) live one.
-      currency: presentmentCurrency ?? ctx.currency,
-      language,
-      strings,
-      ui: {
-        showCountdown: settings?.countdown?.enabled ?? false,
-        countdownMinutes: settings?.countdown?.minutes ?? 10,
-        copyLength: settings?.copyLength ?? "short",
-        showComparePrice: settings?.showComparePrice ?? true,
+      stale,
+      response: {
+        offers: pages,
+        displayMode: displayMode ?? settings?.defaultDisplayMode ?? "sequential",
+        // Stored views keep the prices they were issued with — label them with
+        // the stored display currency, never the (possibly different) live one.
+        currency: presentmentCurrency ?? ctx.currency,
+        language,
+        strings,
+        ui: {
+          showCountdown: settings?.countdown?.enabled ?? false,
+          countdownMinutes: settings?.countdown?.minutes ?? 10,
+          copyLength: settings?.copyLength ?? "short",
+          showComparePrice: settings?.showComparePrice ?? true,
+        },
       },
     };
   } catch (error) {
@@ -864,8 +1042,22 @@ export async function assembleOfferResponse(
 ): Promise<OfferResponse> {
   options = options ?? {};
   // Idempotency first: a re-fetch for a referenceId we already issued offers
-  // for returns the stored pages — no new selection, no new rows.
-  const stored = await findStoredOfferResponse(ctx);
+  // for returns the stored pages — no new selection, no new rows — unless
+  // those pages were issued for a different destination country (see
+  // findStoredOfferResponse), in which case they are retired here and a
+  // fresh selection runs below.
+  const found = await findStoredOfferResponse(ctx);
+  if (found && found.stale.length > 0) {
+    await prisma.issuedOffer.deleteMany({ where: { id: { in: found.stale } } }).catch((error) => {
+      console.error(`[orchestrator] retiring stale pre-address pages failed for ${ctx.shop}`, error);
+    });
+    debugAdd(options.debug, "stored-retired", {
+      note: "live IssuedOffer rows for this referenceId were issued for another destination country (typically the country-less first ShouldRender) — retired; matching rows (if any) are reused, otherwise selection re-runs for the real context",
+      retiredRows: found.stale.length,
+      country: ctx.countryCode,
+    });
+  }
+  const stored = found?.response ?? null;
   if (stored) {
     for (const page of stored.offers) {
       options?.diagnostics?.push({ position: page.position, source: "reused" });
@@ -1045,13 +1237,14 @@ export async function assembleOfferResponse(
   if (!settings || !selection || selection.offers.length === 0) {
     const fx = displayFxFromContext(ctx);
     response.currency = fx?.currency ?? ctx.currency;
-    debugAdd(options.debug, "empty-result", {
-      reason: !settings
-        ? "settings unavailable"
-        : !selection
-          ? "selection failed"
-          : "engine returned no offers (kill switch, market gating, or no eligible candidates — see the [engine] server logs)",
-    });
+    const emptyReason = !settings
+      ? "settings unavailable"
+      : !selection
+        ? "selection failed"
+        : selection.emptyReason ??
+          "engine returned no offers (kill switch, market gating, or no eligible candidates — see the [engine] server logs)";
+    options.emptyReason = emptyReason;
+    debugAdd(options.debug, "empty-result", { reason: emptyReason });
     finalizeDebug({
       trace: options.debug,
       ctx,
@@ -1142,30 +1335,37 @@ export async function assembleOfferResponse(
   }
   const totalOffers = selection.offers.length;
 
-  for (const offer of selection.offers) {
-    try {
-      const page = await buildOfferPage({
-        ctx,
-        settings,
-        selection,
-        offer,
-        totalOffers,
-        language,
-        strings,
-        basket,
-        catalogById,
-        marketHandle,
-        ctxPricingPromise,
-        options,
-      });
-      if (page) response.offers.push(page);
-    } catch (error) {
-      console.error(
-        `[orchestrator] failed to build offer page ${offer.position} for ${ctx.shop}`,
-        error,
-      );
-    }
-  }
+  // Pages are built CONCURRENTLY — each page's copy call is independent, so a
+  // 3-page response costs one copy round-trip, not three in a row (the
+  // buyer-path deadline is per request, not per page). Position order is
+  // preserved by index; a failed page is dropped, never the whole response.
+  const settled = await Promise.all(
+    selection.offers.map(async (offer) => {
+      try {
+        return await buildOfferPage({
+          ctx,
+          settings: settings as AppSettings,
+          selection: selection as SelectionResult,
+          offer,
+          totalOffers,
+          language,
+          strings,
+          basket,
+          catalogById,
+          marketHandle,
+          ctxPricingPromise,
+          options,
+        });
+      } catch (error) {
+        console.error(
+          `[orchestrator] failed to build offer page ${offer.position} for ${ctx.shop}`,
+          error,
+        );
+        return null;
+      }
+    }),
+  );
+  for (const page of settled) if (page) response.offers.push(page);
 
   // Already resolved — the page loop above awaited it (or the selection was
   // empty and it resolved to null without any Shopify call).

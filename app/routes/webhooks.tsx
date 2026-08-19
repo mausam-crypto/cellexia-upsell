@@ -24,6 +24,7 @@ import {
 } from "../services/catalog.server";
 import { getSettings } from "../services/settings.server";
 import { redactCustomer, redactShop } from "../services/bootstrap.server";
+import { resetOrderHistoryCache } from "../services/recommendation.server";
 
 /** Webhooks are POST-only. Answer GET (and anything else) with a 405. */
 export const loader = async () =>
@@ -118,6 +119,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     case "APP_UNINSTALLED": {
       // Remove sessions so tokens are invalidated, but KEEP shop data
       // (settings, rules, analytics) so a reinstall picks up where it left off.
+      // Also drop the in-memory order-history snapshot for the shop.
+      resetOrderHistoryCache(shop);
       await safely(`APP_UNINSTALLED (${shop})`, () =>
         prisma.session.deleteMany({ where: { shop } }),
       );

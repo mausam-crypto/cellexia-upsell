@@ -92,6 +92,35 @@ right after checkout:
 - Post-purchase page shows ONLY for plain credit-card payments (Shopify
   Payments + a few gateways). Never for wallets (Apple Pay, Google Pay),
   PayPal, installments, gift-card-only, orders < $0.50, local delivery.
+- **Verified live on cellexialabs.com, 2026-08-18 (checkout-web build
+  300aebf7):** the checkout mounts `PostPurchaseShouldRender` only when the
+  serialized shop config has `postPurchaseExtensionAvailable: true` — a
+  shop-level, LIVE flag (it was `false` for every market on 08-16 and at
+  14:22 UTC 08-18, `true` for every market ~14:49–15:03 UTC, and `false` again
+  from ~15:03 UTC, moving in lockstep with `app { isPostPurchaseAppInUse }`,
+  with no deploy in between). Before loading
+  the extension the checkout asks Shopify's own server
+  (`PostPurchaseData(forShouldRender)`): a non-shop-currency checkout gets
+  `PostPurchaseDataFailed { code: "MULTI_CURRENCY" }` and NO ShouldRender ever
+  runs (observed on the NOK market; expected for every non-EUR presentment
+  currency per Shopify's multiple-currencies limitation), with the gate closed
+  the same query answers `code: "EXTENSION_NOT_FOUND"`; a shop-currency (EUR)
+  checkout with the gate open gets `PostPurchaseDataSuccess { appId,
+  scriptUrl, inputData }` — `appId` = this app (406851944449), `scriptUrl` =
+  the released extension bundle on cdn.shopify.com (version 11, `APP_URL`
+  baked in), `inputData.initialPurchase.referenceId` is a 32-hex checkout token
+  (expected to equal `orders/create.checkout_token`, format + Shopify's
+  checkout-token conventions; the Debug tab join relies on it and reports
+  when zero recent orders match), and the EARLY inquiries
+  carry `totalPriceSet = 0.0` while line items carry their totals (the
+  backend sums lines when the total is not positive). The inquiry starts as
+  "timeout", re-runs on every running-total / currency / shipping-country
+  change, and Shopify takes the post-purchase detour only if the last run
+  resolved `render: true` before Pay AND the receipt reports
+  `postPurchasePageRequested`, `postPurchaseVaultedPaymentMethodStatus: READY`
+  and the order created. Every `/api/offer` call is logged to `OfferInquiry`
+  (Debug → Post-purchase inquiries) — that table, not the thank-you page, is
+  where "did it show / why not" is answered.
 - Thank-you extension: `@shopify/ui-extensions-react@^2025.7.0` (react 18 ok),
   toml `api_version = "2025-07"`, `type = "ui_extension"`, target
   `purchase.thank-you.block.render`, `[extensions.capabilities] network_access = true`,
@@ -153,6 +182,7 @@ right after checkout:
 | L docs | `README.md`, `docs/IMPLEMENTATION_GUIDE.md`, `docs/MERCHANT_GUIDE.md`, `docs/ARCHITECTURE.md` |
 | M products UI | `app/routes/app.products.tsx` |
 | N preview UI | `app/routes/app.preview.tsx`, `app/components/PostPurchasePreview.tsx` |
+| O diagnostics | `app/services/health.server.ts`, `app/services/debug.server.ts`, `app/services/inquiry-log.server.ts`, `app/lib/version.ts`, `app/routes/app.debug.tsx`, `app/routes/api.health.tsx` |
 
 Admin nav (`app/routes/app.tsx`): Dashboard, Offer rules, Products,
 AI & Prompts, Preview, Translations, Analytics, Settings.

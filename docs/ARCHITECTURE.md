@@ -88,7 +88,10 @@ app/
     health.server.ts               runHealthChecks — the live health-check
                                    battery (Debug tab); maybeAutoRunHealthChecks
                                    (6h cadence from admin loaders),
-                                   healthMonitorToken (see §10)
+                                   healthMonitorToken (see §10);
+                                   postPurchasePlatformGate / isNonCardGateway
+    inquiry-log.server.ts          recordOfferInquiry (fire-and-forget per
+                                   /api/offer call), inquiryStats, recentInquiries
   routes/
     app.tsx                        Embedded app frame + nav
     app._index.tsx                 Dashboard (KPIs, chart, checklist, sync;
@@ -149,8 +152,23 @@ shopify.web.toml                   CLI: predev ensure-env + prisma, dev remix
 
 ### 3.1 Post-purchase offer (happy path)
 
+Before any of this runs, Shopify's checkout decides per store whether a
+post-purchase extension exists at all (`postPurchaseExtensionAvailable` in the
+checkout page's serialized shop config — true only when the app has been
+granted "Access post-purchase extensions" in the Partner Dashboard [live
+stores], a released version contains the extension, and the app is selected
+under Settings → Checkout → Post-purchase page) and per checkout whether the
+page may show (card payment, shop currency, no duties, Online Store channel…).
+Only then does the checkout load the extension bundle and run ShouldRender —
+when the payment page loads, and again whenever the total / currency /
+shipping country changes; the post-purchase detour is taken only if that
+inquiry has resolved `render: true` by the moment the order is processed.
+That is why `/api/offer` is time-boxed (`POST_PURCHASE_ASSEMBLY_BUDGET_MS`,
+1.8 s): pages whose AI copy is not ready ship with fallback copy and
+`corePending: true`, and the extension swaps the real copy in at Render time.
+
 ```
-Buyer pays by card
+Buyer pays by card (shop currency)
         │
         ▼
 Checkout::PostPurchase::ShouldRender            extensions/post-purchase-upsell/src/index.jsx
@@ -172,16 +190,22 @@ Checkout::PostPurchase::ShouldRender            extensions/post-purchase-upsell/
                                           ├─ language resolution (buyer locale →
                                           │    market override → store default)
                                           ├─ ai.getUiStrings(shop, language)
-                                          ├─ ai.generateCopy(...)  two-stage:
+                                          ├─ pages built CONCURRENTLY, each:
+                                          │  ai.generateBuyerCopy(...)  two-stage:
                                           │    CopyCache hit → full copy instantly
-                                          │    miss → blocking CORE call
-                                          │      (settings.coreCopyModel, ≈2s):
+                                          │    miss → CORE call capped to the
+                                          │      remaining request budget
+                                          │      (settings.coreCopyModel):
                                           │      headline/lead/bullets/closer;
                                           │      paragraphs/proof generated in the
                                           │      background with the template's
                                           │      model → page flagged
                                           │      extendedPending
-                                          │    error/timeout → fallback copy
+                                          │    budget exhausted / error →
+                                          │      fallback copy NOW, page flagged
+                                          │      corePending; the full background
+                                          │      generation patches the stored
+                                          │      page (patchFullCopy → coreReady)
                                           └─ persist IssuedOffer (changesJson,
                                                offerMetaJson, expiresAt = now+2h)
                                                         │
@@ -196,6 +220,8 @@ Render app (per offer page)
             {referenceId, offerId}  ──▶  api.offer-extended.tsx
             until paragraphs/proof are ready, then merge them in
             below the CTA (above-the-fold layout never shifts)
+        → if corePending: poll immediately (first paint held ≤ 0.9 s),
+            swap headline/lead/bullets + sections once coreReady
   accept → POST /api/sign-changeset {referenceId, offerId}
               └▶ api.sign-changeset.tsx: load *non-expired* IssuedOffer,
                  jwt.sign({iss: API_KEY, jti, sub: referenceId,
@@ -324,7 +350,10 @@ always read/write them with `jparse`/`jstr` from `app/lib/json.ts`.
 | `IssuedOffer` | **Security-critical.** The server-side source of truth for what may be added to a checkout: `changesJson` (the exact changeset), `offerMetaJson` (denormalized context for analytics), `expiresAt` (now + 2h). `/api/sign-changeset` signs *only* what is stored here — never client input. Unique on `(referenceId, offerId)`. |
 | `OfferEvent` | Append-only analytics stream: impression/accepted/declined/error with denormalized rule/candidate/product/price/discount/market/country/language/surface. Everything in Analytics is computed from this table (+ OrderRecord). |
 | `EventDedup` | Race-proof replay guard for extension events: one claim per offer page and event type, unique on `(shop, referenceId, position, eventType)`, inserted in the **same transaction** as the `OfferEvent` rows — concurrent duplicates lose the insert and are dropped, and a failed write releases the claim instead of losing the event. Claims older than 7 days are pruned from the dashboard loader (replay protection only needs to outlive the offer TTL). |
-| `OrderRecord` / `OrderLine` | Order history from `orders/create`: totals, currency, country, customer id, per-line product/variant/qty/price, `isUpsell` marking, `hadUpsellOffer`/`acceptedUpsell` flags. Powers co-purchase affinity, suppression, repeat-purchase rates and CLV cohorts. |
+| `OrderRecord` / `OrderLine` | Order history from `orders/create`: totals, currency, country, customer id, per-line product/variant/qty/price, `isUpsell` marking, `hadUpsellOffer`/`acceptedUpsell` flags. Powers co-purchase affinity, suppression, repeat-purchase rates and CLV cohorts. v1.9 adds the post-purchase eligibility annotations `checkoutToken` (= the ShouldRender `initialPurchase.referenceId`, joins an order to its `OfferInquiry` rows), `gateway` (payment_gateway_names), `presentment` (presentment currency) and `sourceName` (sales channel) so the Debug tab can state Shopify's own rule for an order. |
+| `GateSample` | Timestamped samples of Shopify's post-purchase gate (storefront `postPurchaseExtensionAvailable` + `app { isPostPurchaseAppInUse }`) with source (health / auto / manual / external) and the check summary; 14-day retention. Written by every health run, by admin loaders (10-min throttle), the Debug "Sample now" button and `/api/health?…&gate=1`. Exists because the gate flipped off → on → off within an hour on the live store (2026-08-18). |
+| (reuse rule) | `findStoredOfferResponse` reuses a referenceId's live pages only while `offerMetaJson.country` equals the live destination country; rows issued for another country (the address-less first inquiry) are retired and selection re-runs; matching rows are always kept. |
+| `OfferInquiry` | One row per ShouldRender call that reached `/api/offer` (v1.9): country, shop/presentment currency, customer/guest, lines, total (+ whether it was summed from lines because Shopify's early inquiries carry `totalPriceSet = 0`), offers issued, `corePending`, the engine's `emptyReason`, `tookMs`, backend version. Written fire-and-forget after the response, 30-day retention. The authoritative "does Shopify call us, and what do we answer" record behind Debug → Post-purchase inquiries and the extension-traffic health check. |
 | `CustomerState` | Per-customer frequency capping: `lastOfferAt`, counters. Only exists for logged-in customers (guests can't be capped). |
 | `MarketSetting` | Per-Shopify-Market overrides: enabled, discount %, language, max offers, `countriesJson`, plus `currency` (market base currency, synced from the Markets API) and `previewFxRate` (admin-set FX rate used ONLY to simulate the market on the Preview page — never read on live-buyer paths; live buyers get the rate implied by their own order, see §6.4). Seeded from the Markets API; re-sync never overwrites admin-set overrides (incl. `previewFxRate`). |
 | `ContextualPriceCache` | Per-(shop, variantId, country) cache of Shopify's `contextualPricing` — the REAL price a buyer in that country pays (market adjustments and price lists included) in the market's currency. Written on demand by `market-pricing.server` with a 6h TTL; stale rows are served when the Admin API is unreachable. `price` null = cached known-miss. Only ever a cache — safe to truncate. |
@@ -736,7 +765,26 @@ deep-only live translation probe), AI (templates, live ping of every
 configured model id, fallback-share audit over recent traces + CopyCache
 writes), Thank-you surface (traffic proxy, hourly cap, deep-only discount
 code create+delete), Order & event flow (local OrderRecord vs live
-ordersCount, extension-traffic proxy, analytics integrity).
+ordersCount, extension-traffic funnel, analytics integrity).
+
+Post-purchase-specific rows (v1.8–v1.9), in the order a merchant should read
+them: *Shopify checkout: post-purchase extension available* (Admin API
+`app { id handle apiKey isPostPurchaseAppInUse }` with the app's own token +
+the storefront's `postPurchaseExtensionAvailable` flag read from a real cart-
+permalink checkout — a live gate that can flip either way without a deploy);
+*Orders eligible for the post-purchase page* (last 50 orders: presentment
+currency ≠ shop currency → Shopify answers `PostPurchaseDataFailed
+MULTI_CURRENCY` before loading the extension; non-card gateway; non-Online-
+Store channel); *Post-purchase extension traffic* (three-stage funnel from
+`OfferInquiry` → issued → rendered impressions, with a distinct verdict for
+"nobody calls us", "we always decline" and "we issue but Shopify skips");
+*Last real orders* (per order: Shopify platform gate + the actual inquiries
+joined on checkout token + an engine replay, with the as-of-now caveat).
+The gate is additionally SAMPLED over time (`GateSample`, see §4) — every
+full run, admin loaders every 10 min (`maybeSamplePostPurchaseGate`), the
+Debug tab's Sample now (`samplePostPurchaseGate`) and the external
+`?gate=1` probe (200/503) — because a single reading of a flag that flips
+within the hour is not evidence about the moment a test order was placed.
 
 Mechanics: every check runs under a 12 s timeout with its own try/catch — a
 crashed check IS a "fail" finding, the runner never throws. Results persist

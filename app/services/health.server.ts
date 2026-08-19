@@ -25,6 +25,7 @@
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import https from "node:https";
 import path from "node:path";
 import prisma from "../db.server";
 import { jparse, jstr, gidToNumber } from "../lib/json";
@@ -47,6 +48,8 @@ import {
   type OfferChange,
   type PurchaseContext,
 } from "../types";
+import { inquiryStats, scrubReason } from "./inquiry-log.server";
+import { APP_VERSION } from "../lib/version";
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -268,6 +271,161 @@ function baseLang(lang: string): string {
   return lang.split("-")[0].toLowerCase();
 }
 
+/** One plain HTTPS GET (no auto-headers, no redirect following, no gzip). */
+function httpsGet(
+  url: string,
+  cookie: string,
+  timeoutMs: number,
+): Promise<{ status: number; location: string | null; setCookies: string[]; body: string }> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        path: `${u.pathname}${u.search}`,
+        method: "GET",
+        headers: {
+          // Shopify's checkout serves the full page only to browser-like
+          // clients — and refuses undici/fetch, which stamps
+          // `sec-fetch-mode: cors` on every request (403 "Request Forbidden").
+          // A plain node:https GET with browser-like headers is accepted.
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml",
+          "Accept-Language": "en",
+          "Accept-Encoding": "identity",
+          ...(cookie ? { Cookie: cookie } : {}),
+        },
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => {
+          // The checkout HTML is ~400 KB; cap defensively.
+          if (body.length < 2_000_000) body += chunk;
+        });
+        res.on("end", () => {
+          const sc = res.headers["set-cookie"];
+          resolve({
+            status: res.statusCode ?? 0,
+            location: typeof res.headers.location === "string" ? res.headers.location : null,
+            setCookies: Array.isArray(sc) ? sc : sc ? [sc] : [],
+            body,
+          });
+        });
+      },
+    );
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`storefront request timed out after ${timeoutMs}ms`)));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/**
+ * Fetch a storefront page the way a browser would: follow redirects by hand
+ * and carry the cookies each host sets. A cart permalink (/cart/<variant>:1)
+ * redirects (via shop.app) to the checkout page, which answers 403 unless the
+ * cart cookies from the first hop are presented — so cookies are kept per
+ * host across hops. Bounded to 6 hops and ~9s total.
+ */
+async function fetchStorefrontPage(
+  startUrl: string,
+  deadlineAt: number = Date.now() + 9000,
+): Promise<{ finalUrl: string; status: number; html: string }> {
+  const deadline = deadlineAt;
+  const jar = new Map<string, Map<string, string>>();
+  let url = startUrl;
+  for (let hop = 0; hop < 6; hop++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("storefront fetch timed out");
+    const host = new URL(url).host;
+    const cookies = jar.get(host) ?? new Map<string, string>();
+    jar.set(host, cookies);
+    const cookieHeader = [...cookies.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+    const response = await httpsGet(url, cookieHeader, remaining);
+    for (const raw of response.setCookies) {
+      const pair = raw.split(";")[0];
+      const eq = pair.indexOf("=");
+      if (eq > 0) cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+    if (response.status >= 300 && response.status < 400) {
+      if (!response.location) return { finalUrl: url, status: response.status, html: "" };
+      url = new URL(response.location, url).toString();
+      continue;
+    }
+    return { finalUrl: url, status: response.status, html: response.body };
+  }
+  throw new Error("too many redirects");
+}
+
+/**
+ * Shopify never surfaces the post-purchase page for wallets, installment
+ * services, PayPal, gift cards, bank transfers or COD ("any payment method
+ * other than a credit card"). Gateway names as they appear in
+ * Order.paymentGatewayNames / the orders webhook payment_gateway_names.
+ * `shopify_payments` covers cards AND Shop Pay (eligible) — wallets paid
+ * through Shopify Payments show up as separate names (apple_pay/google_pay)
+ * only on some payloads, so this is a best-effort classification: it never
+ * flags a card as ineligible; it may miss a wallet hidden behind
+ * shopify_payments.
+ */
+export function isNonCardGateway(gateway: string): boolean {
+  const g = gateway.toLowerCase();
+  return /paypal|klarna|afterpay|clearpay|affirm|sezzle|installment|apple[_ ]?pay|google[_ ]?pay|android[_ ]?pay|amazon|ideal|bancontact|sofort|giropay|\beps\b|przelewy|\bp24\b|blik|mobilepay|vipps|swish|twint|bank[_ ]?deposit|bank[_ ]?transfer|money[_ ]?order|\bcash\b|\bcod\b|manual|gift[_ ]?card|bogus|\btest\b/.test(g);
+}
+
+/**
+ * Why Shopify itself would never show the post-purchase page for an order,
+ * from the facts the orders webhook gives us. Returns null when no platform
+ * gate is known to apply (the page may still be skipped for reasons only
+ * Shopify sees: card vaulting / 3-D Secure, duties, local delivery, order-
+ * creation delay). Verified on the live store 2026-08-18: non-shop-currency
+ * checkouts get `PostPurchaseDataFailed { code: MULTI_CURRENCY }` before any
+ * ShouldRender runs.
+ */
+export function postPurchasePlatformGate(
+  gateway: string | null | undefined,
+  presentment: string | null | undefined,
+  sourceName: string | null | undefined,
+  shopCurrency: string,
+): string | null {
+  const gates: string[] = [];
+  if (presentment && shopCurrency && presentment !== shopCurrency) {
+    gates.push(`paid in ${presentment} ≠ shop currency ${shopCurrency} (Shopify: MULTI_CURRENCY)`);
+  }
+  if (gateway) {
+    const bad = gateway.split(",").map((g) => g.trim()).filter((g) => g && isNonCardGateway(g));
+    if (bad.length > 0) gates.push(`payment method ${bad.join("/")} (Shopify: cards only)`);
+  }
+  if (sourceName && sourceName !== "web") {
+    gates.push(`sales channel "${sourceName}" (Shopify: Online Store only)`);
+  }
+  return gates.length > 0 ? gates.join("; ") : null;
+}
+
+/**
+ * Card-only rule from Shopify's transaction paymentDetails (precise: wallets
+ * paid THROUGH Shopify Payments still show gateway "shopify_payments" but a
+ * CardPaymentDetails.wallet of APPLE_PAY/GOOGLE_PAY/ANDROID_PAY; PayPal, local
+ * methods and Shop Pay Installments carry their own paymentDetails types).
+ * SHOPIFY_PAY (Shop Pay) stays eligible per Shopify's docs. Returns null when
+ * nothing is known (no transactions readable) so callers fall back to the
+ * gateway-name heuristic.
+ */
+export function nonCardFromTransactions(
+  transactions: Array<{ gateway?: string | null; paymentDetails?: { __typename?: string; wallet?: string | null } | null }> | null | undefined,
+): string | null {
+  if (!transactions || transactions.length === 0) return null;
+  for (const t of transactions) {
+    const pd = t.paymentDetails;
+    if (!pd || !pd.__typename) continue;
+    if (pd.__typename !== "CardPaymentDetails") return pd.__typename.replace(/PaymentDetails$/, "") || pd.__typename;
+    const wallet = (pd.wallet ?? "").toUpperCase();
+    if (wallet && wallet !== "SHOPIFY_PAY") return wallet;
+  }
+  return null;
+}
+
 /** Offer-eligible products exactly as the engine's suppression sees them. */
 function offerablePool(products: CatalogProduct[], settings: AppSettings) {
   const gates = { notEligible: 0, noVariant: 0, zeroPrice: 0, lowInventory: 0 };
@@ -431,10 +589,19 @@ const CHECKS: CheckDef[] = [
         await prisma.eventDedup.count({ where: { shop: ctx.shop } });
         await prisma.debugEvent.count({ where: { shop: ctx.shop } });
         await prisma.healthCheckRun.count({ where: { shop: ctx.shop } });
+        // v1.9: the ShouldRender inquiry log, the gate timeline and the order
+        // eligibility columns (the orders webhook falls back to storing orders
+        // without the annotations, but every v1.9 diagnostic stays blind).
+        await prisma.offerInquiry.count({ where: { shop: ctx.shop } });
+        await prisma.gateSample.count({ where: { shop: ctx.shop } });
+        await prisma.orderRecord.findFirst({
+          where: { shop: ctx.shop },
+          select: { checkoutToken: true, gateway: true, presentment: true, sourceName: true },
+        });
       } catch (error) {
         return fail(
-          "Database schema is missing columns/tables this app version needs.",
-          "Run `npx prisma db push` against the production database (add it as a pre-deploy command) and redeploy.",
+          "Database schema is missing columns/tables this app version needs (v1.9 adds the OfferInquiry and GateSample tables and four OrderRecord columns). Orders are still stored, but without their post-purchase eligibility annotations, the ShouldRender inquiry log and the gate timeline cannot be written, and Debug → Post-purchase inquiries stays empty.",
+          "Run `npx prisma db push` against the production database (Render: Pre-Deploy command) and redeploy.",
           { error: error instanceof Error ? error.message : String(error) },
         );
       }
@@ -734,6 +901,193 @@ const CHECKS: CheckDef[] = [
       }
       return ok(
         `${locales.filter((l) => l.published).length} published locales all covered by enabled languages${deliberate.length > 0 ? ` (${deliberate.map((l) => l.locale).join(", ")} deliberately disabled)` : ""}.`,
+        detail,
+      );
+    },
+  },
+  {
+    id: "shopify.post-purchase-availability",
+    group: "Shopify connection",
+    name: "Shopify checkout: post-purchase extension available",
+    run: async (ctx) => {
+      // THE gate every other post-purchase check sits behind. Shopify's checkout
+      // decides per store whether ANY post-purchase extension exists before it
+      // ever loads a ShouldRender script: the checkout page's serialized shop
+      // configuration carries `postPurchaseExtensionAvailable`. When it is
+      // false, no ShouldRender runs, /api/offer is never called and every
+      // buyer goes straight to the thank-you page — regardless of currency,
+      // language, market or payment method. Nothing inside this app can
+      // change that flag; only (a) the Partner Dashboard "Access post-purchase
+      // extensions" approval (required on live stores; dev stores are exempt),
+      // (b) a RELEASED app version that contains the post-purchase extension
+      // and (c) selecting this app under Settings → Checkout → Post-purchase
+      // page. The flag is public: a cart permalink for any active variant
+      // redirects to a checkout page whose HTML embeds it — read it exactly
+      // the way a buyer's browser would.
+      // Shopify's own answer to "is THIS app the selected post-purchase app":
+      // App.isPostPurchaseAppInUse (Admin API, queried with the app's own
+      // token, so it is unambiguous even when several apps carry similar
+      // names). Combined with the storefront flag below it separates
+      // "not selected / selection reset" from "selected but Shopify has no
+      // usable extension for it".
+      const checkStart = Date.now();
+      let inUse: boolean | null = null;
+      let appTitle = "";
+      let appHandle = "";
+      let appGid = "";
+      let appApiKey = "";
+      if (ctx.graphql) {
+        // apiKey (= client_id) and the numeric app id are the two values the
+        // developer must match against the Partner Dashboard app that holds
+        // the post-purchase approval and the released extension — several
+        // apps can share the display name. Each attempt is bounded (3 s) so
+        // the storefront probe below always keeps its share of the 12 s
+        // check budget; the apiKey-less retry only runs for a schema error.
+        for (const fields of ["id title handle apiKey isPostPurchaseAppInUse", "id title handle isPostPurchaseAppInUse"]) {
+          try {
+            const { data } = await Promise.race([
+              gql(
+                ctx.graphql,
+                `#graphql
+                query cellexiaHealthPostPurchaseApp { app { ${fields} } }`,
+              ),
+              new Promise<never>((_, reject) => {
+                setTimeout(() => reject(new Error("app query timed out (3s)")), 3000).unref?.();
+              }),
+            ]);
+            if (typeof data?.app?.isPostPurchaseAppInUse === "boolean") inUse = data.app.isPostPurchaseAppInUse;
+            appTitle = String(data?.app?.title ?? "");
+            appHandle = String(data?.app?.handle ?? "");
+            appGid = String(data?.app?.id ?? "");
+            appApiKey = String(data?.app?.apiKey ?? "");
+            break;
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            if (fields.includes("apiKey") && /apiKey|Field|doesn't exist|does not exist/i.test(msg)) continue; // older API version without App.apiKey
+            console.error(`[health] isPostPurchaseAppInUse query failed for ${ctx.shop}`, error);
+            break;
+          }
+        }
+      }
+
+      const products = await getActiveProducts(ctx.shop);
+      const { eligible } = offerablePool(products, ctx.settings);
+      // Offerable variants first (they are what a buyer would check out with),
+      // then any cached variant; a stale cache row (deleted product → 404/410)
+      // must not fail the probe, so up to three candidates are tried.
+      const candidates: number[] = [];
+      for (const v of [
+        ...eligible.map((e) => e.variant),
+        ...products.map((p) => pickPrimaryVariant(p)),
+      ]) {
+        const n = v ? gidToNumber(v.id) : Number.NaN;
+        if (Number.isFinite(n) && !candidates.includes(n)) candidates.push(n);
+        if (candidates.length >= 3) break;
+      }
+      if (candidates.length === 0) {
+        return skip("No cached product variant to open a checkout with — run Sync on the Dashboard first.");
+      }
+      const host = ctx.shopInfo?.primaryDomainHost || ctx.shop;
+      const attempts: Array<{ permalink: string; finalUrl: string; status: number; htmlBytes: number; error?: string }> = [];
+      let match: RegExpMatchArray | null = null;
+      // One deadline shared by all candidates so the whole check stays inside
+      // the runner's 12 s budget even when the first stale variant hangs or
+      // the Admin API calls above were slow.
+      const probeDeadline = Math.min(checkStart + 10_500, Date.now() + 9000);
+      for (const variantNumeric of candidates) {
+        if (Date.now() >= probeDeadline) break;
+        const permalink = `https://${host}/cart/${variantNumeric}:1`;
+        try {
+          const page = await fetchStorefrontPage(permalink, probeDeadline);
+          attempts.push({ permalink, finalUrl: page.finalUrl, status: page.status, htmlBytes: page.html.length });
+          match = page.html.match(/postPurchaseExtensionAvailable(?:&quot;|")\s*:\s*(true|false)/);
+          if (match) break;
+          // Rate-limited / bot-blocked: stop hammering — more candidates only
+          // make the block last longer (a 404/410 still advances to the next).
+          if (page.status === 429 || page.status === 403) break;
+        } catch (error) {
+          attempts.push({ permalink, finalUrl: permalink, status: 0, htmlBytes: 0, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (attempts.every((a) => a.status === 0)) {
+        return warn(
+          "Could not open a storefront checkout to read Shopify's post-purchase availability flag.",
+          "Transient network issue or the storefront is password-protected — re-run later, or verify manually: open any checkout page on the store, view source, and search for postPurchaseExtensionAvailable.",
+          { attempts },
+        );
+      }
+      const last = attempts[attempts.length - 1];
+      const flag: "true" | "false" | null = match ? (match[1] as "true" | "false") : null;
+      const detail = {
+        checkedAt: new Date().toISOString(),
+        backendVersion: APP_VERSION,
+        // Shopify Admin API: is THIS app the shop's selected post-purchase app?
+        isPostPurchaseAppInUse: inUse,
+        // Identity of THIS app as Shopify sees it — match these against the
+        // Partner Dashboard app that shows the post-purchase approval and the
+        // released extension (client id = apiKey; several apps can share a name).
+        appTitle: appTitle || null,
+        appHandle: appHandle || null,
+        appId: appGid || null,
+        appClientId: appApiKey || process.env.SHOPIFY_API_KEY || null,
+        // Shopify checkout: does the store expose ANY post-purchase extension?
+        storefrontFlag: flag,
+        attempts,
+        finalUrl: last.finalUrl,
+      };
+      // inUse === false is decisive on its own (handled below as a fail);
+      // the storefront-probe outcomes only matter when Shopify says we ARE
+      // the selected app or could not tell us.
+      if (!match && inUse !== false && attempts.some((a) => a.status === 429 || a.status === 403)) {
+        return warn(
+          `Shopify ${attempts.some((a) => a.status === 429) ? "rate-limited (HTTP 429)" : "blocked (HTTP 403)"} the storefront probe — the flag could not be read this time.${inUse === true ? " Shopify does report this app as the selected post-purchase app." : ""}`,
+          "Transient: re-run checks in a few minutes (repeated probes from one server can trip Shopify's storefront rate limit). Or verify by hand: open a checkout page, view source, search for postPurchaseExtensionAvailable — it must read true.",
+          detail,
+        );
+      }
+      if (!match && inUse !== false && attempts.length > 0 && attempts.every((a) => a.status === 404 || a.status === 410)) {
+        return warn(
+          `Every cached variant tried (${attempts.length}) returned ${attempts[0].status} from the storefront — the catalog cache is stale, so no checkout could be opened to read the flag.`,
+          "Run Sync on the Dashboard, then re-run checks.",
+          detail,
+        );
+      }
+      if (inUse === false) {
+        return fail(
+          `Shopify reports that this app ("${appTitle || "this app"}") is NOT the store's selected post-purchase app — no ShouldRender of ours can run.`,
+          "Shopify admin → Settings → Checkout → Post-purchase page: select this app and click SAVE, then re-run this check. NOTE: the selection is silently cleared whenever the app is uninstalled/reinstalled (e.g. to re-approve new scopes) and can drop when a released app version no longer contains the post-purchase extension — re-select after any of those. If several apps carry a similar name (a `shopify app dev` development app next to the production app), make sure the PRODUCTION app is the one selected: a dev app's extension only exists while `shopify app dev` is running.",
+          detail,
+        );
+      }
+      if (!match) {
+        return warn(
+          `Opened ${last.finalUrl.split("?")[0]} (HTTP ${last.status}) but the page carried no postPurchaseExtensionAvailable flag — the store may be password-protected or Shopify changed the checkout markup.${inUse === true ? " Shopify does report this app as the selected post-purchase app." : ""}`,
+          "Verify manually: open a checkout page in a browser, view source, search for postPurchaseExtensionAvailable — it must read true. If the storefront is password-protected, disable the password or test after launch.",
+          detail,
+        );
+      }
+      if (flag === "false") {
+        if (inUse === true) {
+          return fail(
+            "Shopify has this app selected as the post-purchase app, yet its checkout still reports NO post-purchase extension available for the store — Shopify has no usable post-purchase extension to serve for this app, so ShouldRender never runs and buyers can NEVER see the page (any currency, language or payment method).",
+            "This is decided by Shopify, not by this app. Check, in order: (1) Partner Dashboard → this app → Versions: the ACTIVE (released) version must list the post-purchase extension 'Cellexia Post-Purchase Upsell' (type checkout_post_purchase) — a `shopify app deploy` run from a copy without extensions/post-purchase-upsell (or with `--no-release`) drops it; redeploy from the full repo with APP_URL set and confirm the release; (2) Partner Dashboard → this app → API access → 'Access post-purchase extensions' must show as granted (required on live stores; dev stores work without it); (3) after fixing, re-save Settings → Checkout → Post-purchase page and re-run this check — the storefront flag must read true; if it still reads false with all three in place, open a Shopify Partner support ticket quoting: shop domain, app client id, active version id, and 'postPurchaseExtensionAvailable is false in the checkout shop configuration'.",
+            detail,
+          );
+        }
+        return fail(
+          "Shopify's checkout reports NO post-purchase extension available for this store — ShouldRender never runs, so buyers can NEVER see the post-purchase page (any currency, language or payment method).",
+          "This is decided by Shopify, not by this app. In order: (1) Partner Dashboard → Apps → this app → API access → 'Access post-purchase extensions' → Request access — REQUIRED on live stores (dev stores are exempt), approval can take up to 7 days; (2) make sure the RELEASED app version includes the post-purchase extension (`shopify app deploy` from a clean checkout of this repo, then check the version's extensions in the Partner Dashboard); (3) Shopify admin → Settings → Checkout → Post-purchase page → select this app → Save; (4) re-run this check — the flag must read true before any test order can show an offer.",
+          detail,
+        );
+      }
+      if (inUse === null) {
+        return ok(
+          "Shopify's checkout reports a post-purchase extension as available for this store (could not confirm via the Admin API that it is THIS app — verify Settings → Checkout → Post-purchase page).",
+          detail,
+        );
+      }
+      return ok(
+        "Shopify has this app selected as the post-purchase app AND its checkout reports the post-purchase extension as available — ShouldRender will run for eligible (card, shop-currency) checkouts.",
         detail,
       );
     },
@@ -1127,6 +1481,130 @@ const CHECKS: CheckDef[] = [
           offers: result.offers.map((o) => ({ position: o.position, products: o.products.map((p) => p.title), discountPct: o.discountPct })),
         },
       );
+    },
+  },
+  {
+    id: "engine.recent-orders-replay",
+    group: "Offer engine & catalog",
+    name: "Last real orders: what happened vs what the engine would offer",
+    run: async (ctx) => {
+      // Two views per recent order, side by side:
+      //   ACTUAL — the ShouldRender inquiries Shopify really sent for that
+      //            checkout (OfferInquiry joined on checkout token, v1.9) plus
+      //            the platform gates that decide whether Shopify would ever
+      //            show the page (payment method, presentment currency, sales
+      //            channel — from the orders webhook, v1.9 columns);
+      //   REPLAY — the engine run again NOW with the same customer/country/
+      //            basket. Read-only (selectOffers never writes). Caveat: the
+      //            replay is "as of now" — the order's own thank-you impression
+      //            or later purchases can make it report a frequency cap /
+      //            suppression that did not exist at checkout time; the ACTUAL
+      //            column is authoritative when present.
+      if (!ctx.settings.enabled) return warn("App kill-switch is OFF — nothing would be offered by design.", "Enable in Settings → General when you want offers live, then re-run checks.", {});
+      const orders = await prisma.orderRecord.findMany({
+        where: { shop: ctx.shop },
+        orderBy: { createdAt: "desc" },
+        take: 5,
+        include: { lines: true },
+      });
+      const withLines = orders.filter((o) => o.lines.length > 0);
+      if (withLines.length === 0) return skip("No real orders with line items recorded yet.");
+      const tokens = withLines.map((o) => o.checkoutToken).filter((t): t is string => Boolean(t));
+      const inquiries = tokens.length
+        ? await prisma.offerInquiry.findMany({ where: { shop: ctx.shop, referenceId: { in: tokens } }, orderBy: { createdAt: "asc" } }).catch(() => [])
+        : [];
+      const shopCurrency = ctx.shopInfo?.currencyCode || "";
+      const rows: Array<{
+        orderId: string;
+        createdAt: string;
+        customer: string;
+        country: string | null;
+        gateway: string | null;
+        presentment: string | null;
+        platformGate: string | null;
+        actualInquiries: number;
+        actualLast: string | null;
+        replayOffers: number;
+        replayReason: string | null;
+      }> = [];
+      for (const order of withLines) {
+        const gate = postPurchasePlatformGate(order.gateway, order.presentment, order.sourceName, shopCurrency || order.currency);
+        const mine = order.checkoutToken ? inquiries.filter((i) => i.referenceId === order.checkoutToken) : [];
+        const last = mine.length ? mine[mine.length - 1] : null;
+        const base = {
+          orderId: order.orderId,
+          createdAt: order.createdAt.toISOString(),
+          customer: order.customerId ? "yes" : "guest",
+          country: order.country ?? null,
+          gateway: order.gateway ?? null,
+          presentment: order.presentment ?? null,
+          platformGate: gate,
+          actualInquiries: mine.length,
+          actualLast: last
+            ? `${last.offers > 0 ? `${last.offers} offer(s) issued` : `no offer — ${scrubReason(last.emptyReason) ?? "no reason"}`} (${last.tookMs} ms, ${last.createdAt.toISOString()})`
+            : order.checkoutToken
+              ? "no ShouldRender inquiry reached this backend for this checkout (or the inquiry log did not exist yet / was pruned)"
+              : "no checkout token stored (order predates v1.9, the deployment had not run db push yet, or the order was not created from a web checkout) — cannot join",
+        };
+        const replayCtx: PurchaseContext = {
+          shop: ctx.shop,
+          referenceId: `health:replay:${crypto.randomUUID()}`,
+          customerId: order.customerId ?? null,
+          countryCode: order.country ?? null,
+          locale: ctx.settings.defaultLanguage,
+          currency: order.currency || ctx.shopInfo?.currencyCode || "EUR",
+          totalAmount: order.totalPrice,
+          lineItems: order.lines.map((l) => ({
+            productId: l.productId,
+            variantId: l.variantId,
+            quantity: l.quantity,
+            priceAmount: l.price,
+          })),
+          surface: "post_purchase",
+        };
+        try {
+          const result = await selectOffers(replayCtx, ctx.settings);
+          rows.push({
+            ...base,
+            replayOffers: result.offers.length,
+            replayReason: result.offers.length === 0 ? scrubReason(result.emptyReason) ?? "unknown" : null,
+          });
+        } catch (error) {
+          rows.push({
+            ...base,
+            replayOffers: 0,
+            replayReason: `engine crashed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      }
+      const detail = {
+        note: "ACTUAL = ShouldRender inquiries Shopify sent for that checkout (joined on checkout token) + Shopify platform gate from payment method / currency / channel; REPLAY = engine run now (as-of-now caveat: later impressions/purchases can add a cap or suppression that did not apply at checkout time).",
+        rows,
+      };
+      const gated = rows.filter((r) => r.platformGate);
+      const called = rows.filter((r) => r.actualInquiries > 0);
+      const issued = called.filter((r) => /offer\(s\) issued/.test(r.actualLast ?? ""));
+      const replayEmpty = rows.filter((r) => r.replayOffers === 0);
+      const summaryBits: string[] = [];
+      summaryBits.push(`${gated.length}/${rows.length} ineligible by Shopify's rules (${[...new Set(gated.map((g) => g.platformGate))].join("; ") || "-"})`);
+      summaryBits.push(`${called.length}/${rows.length} received a ShouldRender inquiry, ${issued.length} got a page issued`);
+      summaryBits.push(`replay: ${rows.length - replayEmpty.length}/${rows.length} would get offers now`);
+      const eligibleNotCalled = rows.filter((r) => !r.platformGate && r.actualInquiries === 0 && !/predates/.test(r.actualLast ?? ""));
+      if (eligibleNotCalled.length > 0 && eligibleNotCalled.length === rows.filter((r) => !r.platformGate && !/predates/.test(r.actualLast ?? "")).length) {
+        return warn(
+          `Every eligible recent order (${eligibleNotCalled.length}) was placed WITHOUT Shopify calling this backend's ShouldRender — the Shopify-side gate was closed for them (see the availability check). ${summaryBits.join("; ")}.`,
+          "If the availability row is green NOW, the gate opened after those orders — place a fresh card order in the shop currency and re-run. If it is red, fix it first.",
+          detail,
+        );
+      }
+      if (replayEmpty.length === rows.length) {
+        return warn(
+          `None of the last ${rows.length} real orders would get an offer from the engine — reasons: ${[...new Set(replayEmpty.map((r) => (r.replayReason ?? "").split(" — ")[0]))].join("; ")}. ${summaryBits.join("; ")}.`,
+          "Each row's replay reason names the engine step. 'step2: frequency cap' on your own test orders means the customer account already saw an offer (a thank-you-page offer counts) — test as guest or set the cap to 0 while testing; 'step6b: auto-pilot pool is empty' means suppression/allowlist emptied the catalog for that buyer.",
+          detail,
+        );
+      }
+      return ok(`${summaryBits.join("; ")}.`, detail);
     },
   },
   {
@@ -1673,29 +2151,249 @@ const CHECKS: CheckDef[] = [
   {
     id: "flow.extension-traffic",
     group: "Order & event flow",
-    name: "Post-purchase extension traffic",
+    name: "Post-purchase extension traffic (ShouldRender → this backend)",
     run: async (ctx) => {
-      const since = new Date(Date.now() - 7 * DAY_MS);
-      const [orders7d, ppImpressions7d, lastImpression] = await Promise.all([
-        prisma.orderRecord.count({ where: { shop: ctx.shop, createdAt: { gte: since } } }),
-        prisma.offerEvent.count({ where: { shop: ctx.shop, surface: "post_purchase", eventType: "impression", createdAt: { gte: since } } }),
+      // Three-stage funnel, each stage answering one question a merchant
+      // cannot answer from the thank-you page:
+      //   inquiries  = ShouldRender calls that reached /api/offer (OfferInquiry,
+      //                v1.9) → "does Shopify call us at all?"
+      //   issued     = inquiries answered with ≥1 offer → "do we say yes?"
+      //   impressions= post-purchase pages actually rendered (OfferEvent from
+      //                the Render step) → "does Shopify then show the page?"
+      // Zero inquiries while orders flow = the Shopify-side gate (see the
+      // availability check); inquiries but zero issued = engine reasons
+      // (listed); issued but zero impressions = Shopify's receipt-side rules
+      // (card vaulting / wallet / 3-D Secure / multi-currency) or a stale
+      // extension bundle.
+      const since24h = new Date(Date.now() - DAY_MS);
+      const since7d = new Date(Date.now() - 7 * DAY_MS);
+      const shopCurrency = ctx.shopInfo?.currencyCode || "";
+      // Stage-1 denominator = orders that COULD have produced an inquiry: web
+      // checkouts in the shop currency, recorded with a checkout token (i.e.
+      // after v1.9 was live). Non-shop-currency orders never reach ShouldRender
+      // (MULTI_CURRENCY) and must not count against the app.
+      const eligibleWhere = {
+        shop: ctx.shop,
+        checkoutToken: { not: null },
+        ...(shopCurrency ? { OR: [{ presentment: shopCurrency }, { presentment: null }] } : {}),
+        AND: [{ OR: [{ sourceName: "web" }, { sourceName: null }] }],
+      };
+      const [orders24h, orders7d, eligible7d, ppImpressions7d, ppImpressions24h, lastImpression, stats24h, stats7d, convertedTokens] = await Promise.all([
+        prisma.orderRecord.count({ where: { shop: ctx.shop, createdAt: { gte: since24h } } }),
+        prisma.orderRecord.count({ where: { shop: ctx.shop, createdAt: { gte: since7d } } }),
+        prisma.orderRecord.count({ where: { ...eligibleWhere, createdAt: { gte: since7d } } }).catch(() => -1),
+        prisma.offerEvent.count({ where: { shop: ctx.shop, surface: "post_purchase", eventType: "impression", createdAt: { gte: since7d } } }),
+        prisma.offerEvent.count({ where: { shop: ctx.shop, surface: "post_purchase", eventType: "impression", createdAt: { gte: since24h } } }),
         prisma.offerEvent.findFirst({ where: { shop: ctx.shop, surface: "post_purchase" }, orderBy: { createdAt: "desc" }, select: { createdAt: true } }),
+        inquiryStats(ctx.shop, DAY_MS).catch(() => null),
+        inquiryStats(ctx.shop, 7 * DAY_MS).catch(() => null),
+        // Converted checkouts this week (orders with a token) — Stage 3 compares
+        // pages issued for THESE with rendered impressions; abandoned checkouts
+        // that re-ran ShouldRender five times must not read as "Shopify skipped".
+        prisma.orderRecord
+          .findMany({ where: { shop: ctx.shop, createdAt: { gte: since7d }, checkoutToken: { not: null } }, select: { checkoutToken: true } })
+          .then((rows) => rows.map((r) => r.checkoutToken).filter((t): t is string => Boolean(t)))
+          .catch(() => [] as string[]),
       ]);
-      const detail = { orders7d, postPurchaseImpressions7d: ppImpressions7d, lastImpressionAt: lastImpression?.createdAt ?? null };
+      const issuedForConverted7d =
+        convertedTokens.length > 0
+          ? await prisma.offerInquiry
+              .findMany({ where: { shop: ctx.shop, referenceId: { in: convertedTokens }, offers: { gt: 0 } }, select: { referenceId: true }, distinct: ["referenceId"] })
+              .then((rows) => rows.length)
+              .catch(() => 0)
+          : 0;
+      const detail = {
+        orders24h,
+        orders7d,
+        eligibleOrders7d: eligible7d < 0 ? null : eligible7d,
+        inquiries24h: stats24h?.total ?? null,
+        inquiriesWithOffers24h: stats24h?.withOffers ?? null,
+        inquiries7d: stats7d?.total ?? null,
+        inquiriesWithOffers7d: stats7d?.withOffers ?? null,
+        checkouts7d: stats7d?.checkouts ?? null,
+        checkoutsWithOffers7d: stats7d?.checkoutsWithOffers ?? null,
+        convertedCheckouts7d: convertedTokens.length,
+        convertedCheckoutsWithPageIssued7d: issuedForConverted7d,
+        avgInquiryMs24h: stats24h?.avgTookMs ?? null,
+        slowInquiries24h: stats24h?.slowCount ?? null,
+        topEmptyReasons7d: stats7d?.topEmptyReasons ?? null,
+        inquiriesByCurrency7d: stats7d?.byCurrency ?? null,
+        lastInquiryAt: stats7d?.lastAt ?? null,
+        postPurchaseImpressions24h: ppImpressions24h,
+        postPurchaseImpressions7d: ppImpressions7d,
+        lastImpressionAt: lastImpression?.createdAt ?? null,
+      };
       if (!ctx.settings.enabled) return warn("The app kill-switch is OFF — no offers anywhere.", "Enable in Settings → General.", detail);
-      if (orders7d >= 5 && ppImpressions7d === 0) {
-        return fail(
-          `${orders7d} orders this week but ZERO post-purchase impressions — the extension never reaches this backend.`,
-          "Check in order: (1) Settings → Checkout → Post-purchase page has THIS app selected (only one app can), (2) the deployed extension's APP_URL (see App URL check), (3) at least some of those orders were plain card payments — Shopify only shows post-purchase pages for cards.",
+      if (stats7d === null) {
+        return warn(
+          "The ShouldRender inquiry log (OfferInquiry table) is not readable — the deployment has not run `npx prisma db push` since v1.9.",
+          "Run `npx prisma db push` on the deployment (Render Pre-Deploy command), then re-run checks. Until then this check falls back to impressions only.",
           detail,
         );
       }
-      return ok(
-        ppImpressions7d > 0
-          ? `Extension live — ${ppImpressions7d} post-purchase impressions this week.`
-          : `${orders7d} order(s) this week — too few to judge extension traffic yet.`,
-        detail,
+      const inq7d = stats7d.total;
+      const issued7d = stats7d.withOffers;
+      const checkouts7d = stats7d.checkouts;
+      const denominator = eligible7d >= 0 ? eligible7d : orders7d;
+      // Stage 1 — nobody calls us (judged against orders that COULD have).
+      if (denominator >= 5 && inq7d === 0) {
+        return fail(
+          `${denominator} shop-currency web orders this week (of ${orders7d} total) but ZERO ShouldRender inquiries reached this backend — Shopify is not running the post-purchase extension on this store.`,
+          "Check in order: (1) the 'Shopify checkout: post-purchase extension available' row must be green (Partner Dashboard 'Access post-purchase extensions' approval + a released version containing the extension + Settings → Checkout → Post-purchase page selection); (2) the deployed extension bundle must point at THIS backend (Debug → Post-purchase inquiries shows the app URL the last deploy baked in once a call arrives; the App URL check compares the source); (3) if the flag only just turned true, place a card order in the shop currency and re-run.",
+          detail,
+        );
+      }
+      // Stage 2 — we are called but always decline (distinct checkouts, not calls).
+      if (checkouts7d >= 5 && issued7d === 0) {
+        return fail(
+          `${checkouts7d} checkouts (${inq7d} ShouldRender calls) this week and this backend answered ALL of them with no offer — reasons: ${stats7d.topEmptyReasons.map((r) => `${r.reason} (×${r.count})`).join("; ") || "not recorded"}.`,
+          "Each reason names the engine step (Settings → General kill-switch / frequency cap, Markets, Upsell products allowlist, catalog Sync, offer rules). Fix the top reason and re-run; Debug → Post-purchase inquiries lists every call.",
+          detail,
+        );
+      }
+      // Stage 3 — pages issued for checkouts that CONVERTED, yet none rendered.
+      if (issuedForConverted7d >= 5 && ppImpressions7d === 0) {
+        return warn(
+          `${issuedForConverted7d} converted checkouts this week had a post-purchase page issued but ZERO pages were rendered — Shopify accepted our answer and then skipped the page after payment every time.`,
+          "This is decided by Shopify after payment: the page is skipped for wallets / PayPal / Klarna / gift cards / bank methods, for orders with duties or local delivery, when the order-creation step is delayed, and when the card could not be vaulted (receipt postPurchaseVaultedPaymentMethodStatus ≠ READY; possibly some 3-D Secure flows — unconfirmed). Compare with the payment-method split in the 'Orders eligible…' check; test with a plain Shopify Payments card in the shop currency and no wallet button.",
+          detail,
+        );
+      }
+      const slowNote = stats24h && stats24h.slowCount > 0 ? ` ${stats24h.slowCount} of the last 24h calls took over 2 s (avg ${stats24h.avgTookMs} ms) — Shopify only opens the page when ShouldRender finished before the buyer paid.` : "";
+      if (issued7d > 0 && ppImpressions7d > 0) {
+        return ok(
+          `Live: ${checkouts7d} checkouts / ${inq7d} ShouldRender calls → ${stats7d.checkoutsWithOffers} checkouts with a page issued → ${ppImpressions7d} rendered this week (${stats24h?.total ?? 0} calls in the last 24 h).${slowNote}`,
+          detail,
+        );
+      }
+      if (inq7d > 0) {
+        return ok(
+          `${checkouts7d} checkouts / ${inq7d} ShouldRender calls this week (${stats7d.checkoutsWithOffers} checkouts with a page issued, ${ppImpressions7d} pages rendered) — traffic is arriving; too few conversions to judge the render rate yet.${slowNote}`,
+          detail,
+        );
+      }
+      return ok(`${orders7d} order(s) this week (${eligible7d >= 0 ? eligible7d : "?"} shop-currency web orders) and no ShouldRender inquiries yet — too few eligible orders to judge extension traffic.`, detail);
+    },
+  },
+  {
+    id: "flow.currency-eligibility",
+    group: "Order & event flow",
+    name: "Orders eligible for the post-purchase page (currency + payment method)",
+    run: async (ctx) => {
+      // Shopify platform rules, both verified on the live store on 2026-08-18:
+      // (a) the checkout's own PostPurchaseData query answers
+      //     `PostPurchaseDataFailed { code: MULTI_CURRENCY }` for every checkout
+      //     whose presentment currency differs from the shop currency — no
+      //     ShouldRender runs for those buyers at all; (b) docs: the page is
+      //     never surfaced for wallets / installments / PayPal / gift cards
+      //     ("any payment method other than a credit card"). On a Markets store
+      //     selling in many local currencies with PayPal + Klarna enabled that
+      //     silently removes a large share of orders from the one-click surface
+      //     — those buyers can only be reached by the thank-you block. Measure
+      //     it on the last 50 real orders.
+      if (!ctx.graphql) return skip("Admin API unavailable — see the offline-session check.");
+      const shopCurrency = ctx.shopInfo?.currencyCode || "";
+      let orders: Array<{ presentment: string; shopCcy: string; test: boolean; gateways: string[]; source: string; nonCard: string | null }> = [];
+      try {
+        // transactions.paymentDetails tells wallets/BNPL paid THROUGH Shopify
+        // Payments apart from real cards (gateway name alone cannot). Queried
+        // first; if the API version rejects it, fall back to gateway names.
+        let nodes: any[] = [];
+        try {
+          const { data } = await gql(
+            ctx.graphql,
+            `#graphql
+            query cellexiaHealthOrderCurrencies {
+              orders(first: 50, sortKey: CREATED_AT, reverse: true) {
+                nodes {
+                  test currencyCode presentmentCurrencyCode paymentGatewayNames sourceName
+                  transactions(first: 5) { gateway kind status paymentDetails { __typename ... on CardPaymentDetails { wallet } } }
+                }
+              }
+            }`,
+          );
+          nodes = data?.orders?.nodes ?? [];
+        } catch {
+          const { data } = await gql(
+            ctx.graphql,
+            `#graphql
+            query cellexiaHealthOrderCurrenciesLite {
+              orders(first: 50, sortKey: CREATED_AT, reverse: true) {
+                nodes { test currencyCode presentmentCurrencyCode paymentGatewayNames sourceName }
+              }
+            }`,
+          );
+          nodes = data?.orders?.nodes ?? [];
+        }
+        orders = nodes.map((o: any) => {
+          const gateways: string[] = Array.isArray(o?.paymentGatewayNames) ? o.paymentGatewayNames.map((g: unknown) => String(g)) : [];
+          const fromTx = nonCardFromTransactions(Array.isArray(o?.transactions) ? o.transactions : null);
+          const fromName = gateways.find((g) => isNonCardGateway(g)) ?? null;
+          return {
+            presentment: String(o?.presentmentCurrencyCode ?? ""),
+            shopCcy: String(o?.currencyCode ?? ""),
+            test: Boolean(o?.test),
+            gateways,
+            source: String(o?.sourceName ?? ""),
+            nonCard: fromTx ?? fromName,
+          };
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (/ACCESS_DENIED|access denied|protected/i.test(msg)) {
+          return skip("Shopify denied the orders query (protected customer data not approved) — cannot measure currency eligibility.");
+        }
+        return warn("Could not read recent orders to measure currency eligibility.", "Re-run later; if it persists check the Admin API check.", { error: msg });
+      }
+      const real = orders.filter((o) => !o.test);
+      if (real.length === 0) return skip("No real orders yet to measure.");
+      const base = shopCurrency || real[0].shopCcy;
+      const foreign = real.filter((o) => o.presentment && o.presentment !== base);
+      const byCurrency: Record<string, number> = {};
+      for (const o of foreign) byCurrency[o.presentment] = (byCurrency[o.presentment] ?? 0) + 1;
+      // Card-only rule: wallets / BNPL / PayPal / local methods are ineligible
+      // (from transaction paymentDetails when available, else gateway names).
+      const nonCard = real.filter((o) => o.nonCard !== null);
+      const byGateway: Record<string, number> = {};
+      for (const o of real) {
+        const label = o.nonCard ?? o.gateways.join("+") ?? "?";
+        byGateway[label] = (byGateway[label] ?? 0) + 1;
+      }
+      const notOnlineStore = real.filter((o) => o.source && o.source !== "web");
+      const eligible = real.filter(
+        (o) => !(o.presentment && o.presentment !== base) && o.nonCard === null && (!o.source || o.source === "web"),
       );
+      const share = foreign.length / real.length;
+      const eligibleShare = eligible.length / real.length;
+      const detail = {
+        sampled: real.length,
+        shopCurrency: base,
+        nonShopCurrencyOrders: foreign.length,
+        byCurrency,
+        nonCardOrders: nonCard.length,
+        byGateway,
+        nonOnlineStoreOrders: notOnlineStore.length,
+        eligibleOrders: eligible.length,
+        eligibleShare: Math.round(eligibleShare * 100),
+      };
+      const nonCardCounts: Record<string, number> = {};
+      for (const o of nonCard) nonCardCounts[o.nonCard ?? "?"] = (nonCardCounts[o.nonCard ?? "?"] ?? 0) + 1;
+      const gatewayNote = nonCard.length > 0 ? ` and ${nonCard.length} used a non-card method (${Object.entries(nonCardCounts).map(([g, n]) => `${g}×${n}`).join(", ")})` : "";
+      const channelNote = notOnlineStore.length > 0 ? ` and ${notOnlineStore.length} came through another sales channel` : "";
+      if (eligibleShare < 0.5) {
+        return warn(
+          `Only ${eligible.length} of the last ${real.length} orders (${Math.round(eligibleShare * 100)}%) had no known Shopify gate against the post-purchase page: ${foreign.length} were paid in a currency other than ${base} (${Object.entries(byCurrency).map(([c, n]) => `${c}×${n}`).join(", ")} — Shopify answers MULTI_CURRENCY and never runs the extension)${gatewayNote}${channelNote}.`,
+          "Nothing in this app can change that. Keep the thank-you block installed and enabled (it works for every currency and payment method). When testing the post-purchase page: check out in a " + base + " market, pay with a plain card in the card form (Shopify Payments), not PayPal / Klarna / Apple Pay / Google Pay.",
+          detail,
+        );
+      }
+      if (share > 0 || nonCard.length > 0 || notOnlineStore.length > 0) {
+        return ok(
+          `${eligible.length} of the last ${real.length} orders (${Math.round(eligibleShare * 100)}%) had no known Shopify gate against the post-purchase page — ${foreign.length} in a non-${base} currency (MULTI_CURRENCY)${gatewayNote}${channelNote} can only see the thank-you offer.`,
+          detail,
+        );
+      }
+      return ok(`None of the last ${real.length} orders hit a known Shopify gate: all card payments in ${base} through the Online Store (a wallet hidden behind a card gateway can only be told apart when Shopify exposes the transaction's payment details, which this check reads when available).`, detail);
     },
   },
   {
@@ -1802,6 +2500,50 @@ const runsInFlight = new Map<string, Promise<HealthRun>>();
  * mutating externals (translation probe, discount code round-trip).
  * Concurrent calls for the same shop share one run.
  */
+/**
+ * Run ONE check by id against a hand-built context — for smoke tests and
+ * one-off diagnostics (e.g. probing a specific store's checkout flag from a
+ * script). Returns null for an unknown id. Never throws.
+ */
+export async function runSingleHealthCheck(
+  id: string,
+  ctx: {
+    shop: string;
+    settings?: AppSettings;
+    graphql?: AdminGraphql | null;
+    shopInfo?: Ctx["shopInfo"];
+    deep?: boolean;
+  },
+): Promise<HealthCheckResult | null> {
+  const def = CHECKS.find((c) => c.id === id);
+  if (!def) return null;
+  const full: Ctx = {
+    shop: ctx.shop,
+    settings: ctx.settings ?? (await getSettings(ctx.shop)),
+    deep: ctx.deep ?? false,
+    trigger: "manual",
+    graphql: ctx.graphql ?? null,
+    graphqlError: null,
+    shopInfo: ctx.shopInfo ?? null,
+    graphqlLatencyMs: null,
+    deprecationReason: null,
+    shopifyDateMs: null,
+  };
+  const started = Date.now();
+  try {
+    const outcome = await withTimeout(def.run(full), CHECK_TIMEOUT_MS);
+    return { id: def.id, group: def.group, name: def.name, tookMs: Date.now() - started, ...outcome };
+  } catch (error) {
+    return {
+      id: def.id,
+      group: def.group,
+      name: def.name,
+      tookMs: Date.now() - started,
+      ...fail("Check crashed.", "See the attached error.", { error: error instanceof Error ? error.message : String(error) }),
+    };
+  }
+}
+
 export function runHealthChecks(
   shop: string,
   opts: { trigger: "manual" | "auto" | "external"; deep?: boolean },
@@ -1864,6 +2606,10 @@ async function executeHealthRun(
   const skipCount = results.filter((r) => r.status === "skip").length;
   const status: HealthRun["status"] = failCount > 0 ? "fail" : warnCount > 0 ? "warn" : "ok";
   const tookMs = Date.now() - startedAt;
+
+  // Every full run also leaves a timestamped gate sample (see GateSample).
+  const availability = results.find((r) => r.id === "shopify.post-purchase-availability");
+  if (availability) void recordGateSample(shop, availability, "health").catch(() => {});
 
   try {
     const row = await prisma.healthCheckRun.create({
@@ -1954,6 +2700,95 @@ export function maybeAutoRunHealthChecks(shop: string): void {
       autoRunsInFlight.delete(shop);
     }
   })();
+}
+
+// ── Post-purchase gate monitor ───────────────────────────────────────────────
+//
+// Shopify's gate for the post-purchase page — the checkout's
+// `postPurchaseExtensionAvailable` flag plus `app { isPostPurchaseAppInUse }` —
+// is LIVE STATE: on cellexialabs.com it read off → on → off within one hour on
+// 2026-08-18 without any deploy (a re-saved checkout selection, an uninstall/
+// reinstall, a released version without the extension, or a lapsed approval
+// all move it). A single reading therefore proves nothing about the moment a
+// test order was placed; a timeline does. Samples come from every full health
+// run, from admin loaders (throttled), and from the external monitor
+// (`/api/health?…&gate=1`).
+
+const GATE_SAMPLE_MIN_INTERVAL_MS = 10 * 60 * 1000;
+const GATE_SAMPLE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+const gateSamplesInFlight = new Set<string>();
+const lastGateSampleAt = new Map<string, number>();
+
+export interface GateSampleRow {
+  at: string;
+  storefrontFlag: boolean | null;
+  inUse: boolean | null;
+  source: string;
+  note: string | null;
+}
+
+async function recordGateSample(shop: string, result: HealthCheckResult, source: string): Promise<GateSampleRow> {
+  const detail = (result.detail ?? {}) as { storefrontFlag?: string | null; isPostPurchaseAppInUse?: boolean | null };
+  const flag = detail.storefrontFlag === "true" ? true : detail.storefrontFlag === "false" ? false : null;
+  const inUse = typeof detail.isPostPurchaseAppInUse === "boolean" ? detail.isPostPurchaseAppInUse : null;
+  const note = `${result.status}: ${result.summary}`.slice(0, 300);
+  const row = await prisma.gateSample.create({ data: { shop, storefrontFlag: flag, inUse, source, note } });
+  await prisma.gateSample
+    .deleteMany({ where: { shop, at: { lt: new Date(Date.now() - GATE_SAMPLE_RETENTION_MS) } } })
+    .catch(() => {});
+  return { at: row.at.toISOString(), storefrontFlag: flag, inUse, source, note };
+}
+
+/**
+ * Take one gate sample now (one Admin GraphQL query + one storefront checkout
+ * fetch). Used by the throttled admin sampler and the external monitor; the
+ * full battery records its own sample.
+ */
+export async function samplePostPurchaseGate(shop: string, source: string): Promise<GateSampleRow | null> {
+  const ctx = await buildContext(shop, false, "auto");
+  const def = CHECKS.find((c) => c.id === "shopify.post-purchase-availability");
+  if (!def) return null;
+  const started = Date.now();
+  let outcome: Omit<HealthCheckResult, "id" | "group" | "name" | "tookMs">;
+  try {
+    outcome = await withTimeout(def.run(ctx), CHECK_TIMEOUT_MS);
+  } catch (error) {
+    outcome = { status: "fail", summary: `Check crashed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const result: HealthCheckResult = { id: def.id, group: def.group, name: def.name, tookMs: Date.now() - started, ...outcome };
+  return recordGateSample(shop, result, source);
+}
+
+/** Fire-and-forget, throttled sampler for admin loaders (dashboard, Debug). */
+export function maybeSamplePostPurchaseGate(shop: string): void {
+  const last = lastGateSampleAt.get(shop) ?? 0;
+  if (Date.now() - last < GATE_SAMPLE_MIN_INTERVAL_MS || gateSamplesInFlight.has(shop)) return;
+  gateSamplesInFlight.add(shop);
+  (async () => {
+    try {
+      const latest = await prisma.gateSample.findFirst({ where: { shop }, orderBy: { at: "desc" }, select: { at: true } });
+      if (latest && Date.now() - latest.at.getTime() < GATE_SAMPLE_MIN_INTERVAL_MS) {
+        lastGateSampleAt.set(shop, latest.at.getTime());
+        return;
+      }
+      lastGateSampleAt.set(shop, Date.now());
+      await samplePostPurchaseGate(shop, "auto");
+    } catch (error) {
+      console.error(`[health] gate sample failed for ${shop}`, error);
+    } finally {
+      gateSamplesInFlight.delete(shop);
+    }
+  })();
+}
+
+/** Latest gate samples (newest first) for the Debug tab timeline; [] when the table is missing. */
+export async function listGateSamples(shop: string, take = 100): Promise<GateSampleRow[]> {
+  try {
+    const rows = await prisma.gateSample.findMany({ where: { shop }, orderBy: { at: "desc" }, take });
+    return rows.map((r) => ({ at: r.at.toISOString(), storefrontFlag: r.storefrontFlag, inUse: r.inUse, source: r.source, note: r.note }));
+  } catch {
+    return [];
+  }
 }
 
 /**

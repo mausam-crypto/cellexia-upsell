@@ -15,7 +15,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
-import { authenticate, unauthenticated } from "../shopify.server";
+import { unauthenticated } from "../shopify.server";
+import { authenticateCheckoutPublic } from "../lib/public-auth.server";
 import prisma from "../db.server";
 import { gidToNumber, toGid } from "../lib/json";
 import { getSettings } from "../services/settings.server";
@@ -24,12 +25,12 @@ import type { AdminGraphql, PurchaseContext, PurchaseLineItem } from "../types";
 
 /** Answers CORS preflight / GET probes. */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { cors } = await authenticate.public.checkout(request);
+  const { cors } = await authenticateCheckoutPublic(request, "api.typ-offer");
   return cors(json({ ok: true }));
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { cors, sessionToken } = await authenticate.public.checkout(request);
+  const { cors, sessionToken } = await authenticateCheckoutPublic(request, "api.typ-offer");
   try {
     const token = sessionToken as any;
     const shop: string =

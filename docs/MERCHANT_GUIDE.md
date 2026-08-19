@@ -13,10 +13,21 @@ that complements what they just bought. One click adds it to the same order —
 same card, no extra shipping, no re-entering anything. The app decides **what**
 to offer (rules you define, or an automatic "auto-pilot" ranking), **what to
 say** (AI-written copy in the buyer's language), and **what discount to give**
-(10–15% by default). Customers who paid with Apple Pay, Google Pay, PayPal or
-Klarna can't see that page (a Shopify restriction), so they get a smaller
-fallback offer with a personal 48-hour discount code on the thank-you page
-instead.
+(10–15% by default). Two Shopify restrictions decide who can see that page at
+all — no app can change them: it appears **only for card payments** (never
+Apple Pay, Google Pay, PayPal or Klarna) **and only when the checkout was in
+the store's own currency** (EUR — a customer who paid in NOK, USD, GBP, SEK…
+never sees it, whatever card they used). Everyone else gets a smaller fallback
+offer with a personal 48-hour discount code on the thank-you page instead.
+
+Before any of that, Shopify itself must have the post-purchase page switched
+on for the store: your developer requests **"Access post-purchase
+extensions"** in the Partner Dashboard (Shopify approves it for live stores —
+it works on test stores without approval, which is why a demo can look fine
+while the live store shows nothing), publishes the app version, and you select
+the app under **Settings → Checkout → Post-purchase page**. The Debug tab's
+health check *"Shopify checkout: post-purchase extension available"* tells you
+in one click whether Shopify currently exposes the page on your store.
 
 Out of the box, with zero configuration:
 
@@ -42,10 +53,13 @@ What you see:
 - **Trend chart** of impressions and accepts over time.
 - **Top 5 offers** by performance.
 - **Setup checklist** — warns if the product catalog hasn't synced, if the AI
-  key is missing, and reminds you that (a) the post-purchase page must be
-  selected in *Settings → Checkout* in the store admin, and (b) the
-  post-purchase page only appears for credit-card payments — other payment
-  methods are covered by the thank-you fallback.
+  key is missing, and reminds you that (a) Shopify must expose the
+  post-purchase page for the store (Partner Dashboard access approval +
+  published extension + the app selected in *Settings → Checkout →
+  Post-purchase page*; the health check *"Shopify checkout: post-purchase
+  extension available"* verifies it), and (b) the post-purchase page only
+  appears for card payments in the store's own currency — other payment
+  methods and other currencies are covered by the thank-you fallback.
 - **Sync** action — refreshes the product catalog (including full product
   descriptions and every language's Translate & Adapt product names), markets
   and languages from Shopify. Individual products update automatically via
@@ -474,9 +488,70 @@ languages — these strings sit right next to the buy button.
 
 ## Debug
 
-The Debug tab has two views: **Health checks** (is everything working on the
-live store right now?) and **Offer traces** (what exactly happened inside one
-offer generation?).
+The Debug tab has three views: **Health checks** (is everything working on
+the live store right now?), **Offer traces** (what exactly happened inside one
+offer generation?) and **Post-purchase inquiries** (did Shopify call the app
+for a given checkout, and what did the app answer?). The page subtitle shows
+the deployed backend version.
+
+### Post-purchase inquiries — read this first after a test order
+
+Shopify decides three times before a buyer can see the post-purchase page,
+and only the last decision is the app's:
+
+1. **Shopify's rules for the order.** The page never appears when the buyer
+   pays with PayPal, Klarna, Apple Pay, Google Pay, a gift card or any
+   non-card method, when the checkout is in a currency other than the store
+   currency (Shopify's own answer is `MULTI_CURRENCY`, before the app is even
+   loaded), or when the order did not come through the Online Store.
+2. **Shopify's gate for the store.** The store-level post-purchase flag must
+   be on (Health checks → *"Shopify checkout: post-purchase extension
+   available"*). While it is off, no test order can show a page — the app is
+   never called. The flag is live state: on 18 August 2026 this store read
+   off, then on for about a quarter of an hour, then off again, with no
+   deploy in between — always together with Shopify's record of which app is
+   selected as the post-purchase app. A re-saved selection, a re-deploy
+   without the extension, an uninstall or a lapsed approval all move it; the
+   gate timeline on this tab shows every flip.
+3. **The app's answer.** Every time Shopify calls the app (as soon as the
+   checkout page loads, and again whenever the total, currency or country
+   changes) the app answers "offer" or "no offer, because …" — the frequency
+   cap (14 days, thank-you offers count), just-bought products (60 days), a
+   disabled market, an empty product pool.
+
+The tab opens with the **gate timeline** (step 2 over time): every sample of
+Shopify's flag and of the app selection, with the moments it switched. Click
+**Sample now** right before a test order; if the timeline says CLOSED, fix
+Settings → Checkout → Post-purchase page first (select the app, Save, sample
+again). If it switches to CLOSED by itself later, note the time — that is a
+Shopify-side event to raise with Shopify support, not an app setting. A
+private **gate monitor URL** is shown under the timeline; paste it into an
+uptime monitor (10-minute interval) to be alerted the moment the gate closes.
+
+Below the timeline the tab lists every call in step 3, and for the latest
+orders it joins the order (payment method, currency, channel from Shopify)
+to its calls and to a rendered page, and prints a **verdict** naming which of
+the three said no.
+Green "rendered" = the buyer saw the page. "Never eligible" = rule 1.
+"Shopify never called this backend" = rule 2 was closed at that time.
+"Called, app answered NO offer — …" = rule 3, with the reason. "Called, page
+issued, not rendered" = the app said yes but Shopify skipped the page after
+payment (card could not be vaulted, a wallet button, an order-creation delay,
+possibly some 3-D Secure flows) — nothing the app can change.
+
+**How to run a clean test:** first add your own customer id under Settings →
+Frequency & hygiene → **Test customer IDs** (Shopify admin → Customers → open
+yourself → the number at the end of the URL) so your account is never blocked
+by your own earlier test orders (products bought in the last 60 days are
+normally not offered again, and a seen offer normally caps the account for
+14 days). Then open the store in a EUR market (e.g. Ireland, France, Germany,
+Spain), add a product, check out (your account or a guest with a fresh
+e-mail), ship to that EUR country, wait a few seconds on the payment step,
+pay with a real card in the card form (not the PayPal/Klarna/wallet buttons).
+Within seconds of the checkout page loading, a row must appear in this tab —
+long before you pay. If no row appears, the store gate is closed (rule 2). If
+a row appears with "no offer", the reason is written next to it. If a row
+says "offer" and the page still did not show, look at the order's verdict.
 
 ### Health checks
 
@@ -612,11 +687,23 @@ analysis.
    find where.
 8. **Keep costs filled in Shopify** (product cost per item) — gross-profit
    ranking and reporting are only as good as your cost data.
-9. **Remember the payment-method split.** Only card payments see the
-   post-purchase page (Shopify platform rule). Wallet/PayPal buyers get the
-   thank-you fallback with a 48-hour single-use code — expect lower volume
-   from that surface; it's a bonus channel, not the main act.
-10. **Mind the copy guardrails.** The AI is instructed to never suggest the
+9. **Remember the payment-method AND currency split.** Only card payments
+   checked out in the store currency see the post-purchase page (Shopify
+   platform rules). Wallet/PayPal buyers and every buyer in a local-currency
+   market get the thank-you fallback with a 48-hour single-use code — expect
+   lower volume from that surface; it's a bonus channel, not the main act.
+   The health check *"Orders eligible for the post-purchase page"* shows what
+   share of your recent orders could see the one-click page at all. If a big
+   market pays in a local currency, switching that market to EUR pricing in
+   Shopify Markets is the only way to bring it onto the one-click page — a
+   commercial trade-off, not an app setting.
+10. **Test like a stranger.** When you place test orders, use guest checkout
+    or a fresh e-mail: a customer who has just seen an offer (including the
+    thank-you-page one) is not shown another for 14 days, and products you
+    just bought are not offered again to you for 60 days — both are the app
+    working as designed, but they make "I ordered three times and saw nothing"
+    look like a bug. Ship the test order to a store-currency country.
+11. **Mind the copy guardrails.** The AI is instructed to never suggest the
     customer bought the wrong thing, to make no medical claims, to keep
     research statements ingredient-level with no invented citations, and to
     never use urgency or hype (the countdown is the only time pressure on the

@@ -35,6 +35,8 @@ read [MERCHANT_GUIDE.md](MERCHANT_GUIDE.md).
 23. [Multi-currency display & the Markets health checks](#23-multi-currency-display--the-markets-health-checks)
 24. [Manual product names, the em-dash policy & self-healing UI strings](#24-manual-product-names-the-em-dash-policy--self-healing-ui-strings)
 25. [Live health checks & external monitoring](#25-live-health-checks--external-monitoring)
+26. [Upgrade notes — v1.8](#26-upgrade-notes--v18-why-is-the-post-purchase-page-not-showing)
+27. [Upgrade notes — v1.9](#27-upgrade-notes--v19-what-the-live-store-actually-does-and-how-to-read-it)
 
 ---
 
@@ -190,6 +192,41 @@ sync (bootstrap or dashboard **Sync**).
 
 ## 7. Enable the post-purchase page
 
+Three things must ALL be true before Shopify's checkout will run this app's
+`Checkout::PostPurchase::ShouldRender` on a **live** store. Miss any one of
+them and every buyer goes straight to the thank-you page — silently, for
+every currency, language, market and payment method, with nothing in the app's
+logs (the backend is never called).
+
+### 7.1 Partner Dashboard: "Access post-purchase extensions" (live stores — mandatory)
+
+Post-purchase checkout extensions are still a gated Shopify beta:
+
+> "Post-purchase checkout extensions are in beta and can be used without
+> restrictions in a development store. **To use post-purchase extensions on a
+> live store, you need to request access.**"
+> — <https://shopify.dev/docs/apps/build/checkout/product-offers>
+
+1. Partner Dashboard → **Apps** → this app → **API access**.
+2. On the **Access post-purchase extensions** card click **Request access**,
+   describe the use case (one-click complementary product offers after
+   checkout for cellexialabs.com) and submit.
+3. Wait for approval — Shopify says the review "can take up to seven days".
+
+This is a **separate** gate from app review, from Protected Customer Data (§14)
+and from checkout-UI network access (§15); custom/single-merchant distribution
+does NOT skip it. Development stores are exempt, which is exactly why a setup
+that worked perfectly on the dev store can show nothing on the live store.
+
+### 7.2 A released app version that contains the post-purchase extension
+
+`shopify app deploy` (§11) must have released a version that includes the
+`checkout_post_purchase` extension from `extensions/post-purchase-upsell/`
+(with `APP_URL` set, §8). Check Partner Dashboard → your app → **Versions**:
+the active version must list "Cellexia Post-Purchase Upsell" under extensions.
+
+### 7.3 Select the app in the store's checkout settings
+
 Shopify only renders ONE app on the post-purchase page, and the merchant must
 select it explicitly:
 
@@ -198,11 +235,89 @@ select it explicitly:
 3. Select **Cellexia Post-Purchase Upsell** (the app must be installed and the
    post-purchase extension must be available — during `shopify app dev` it is
    served automatically; in production it must have been deployed, see §11).
-4. Save.
+4. **Save**.
 
-If this step is skipped, `Checkout::PostPurchase::ShouldRender` never runs and
-no offer can ever appear — it is the single most common "offer not showing"
-cause.
+### 7.4 Verify — the one check that settles it
+
+Shopify's checkout decides per store whether ANY post-purchase extension is
+available and embeds the answer in every checkout page. Verify it directly:
+
+- App admin → **Debug → Health checks → Run checks** → the row **"Shopify
+  checkout: post-purchase extension available"** must be green. It opens a
+  real checkout on the storefront (a cart permalink) and reads Shopify's flag.
+- Or by hand: open any product page → Add to cart → Checkout, then *View page
+  source* and search for `postPurchaseExtensionAvailable`. It must read
+  `true`. If it reads `false`, one of 7.1–7.3 is not satisfied — nothing else
+  in this guide can make an offer appear until it does.
+
+Only once that flag is `true` do payment method (§16), currency (§16), APP_URL
+(§8) and the app's own settings come into play.
+
+The flag is **live state, not a one-time setting**: on cellexialabs.com it read
+`false` on 2026-08-16 and again at 14:22 UTC on 2026-08-18, `true` for every
+market between ~14:49 and ~15:03 UTC, and `false` again from ~15:03 UTC —
+without any code change, and always in lockstep with the Admin API's
+`app { isPostPurchaseAppInUse }` (true in the same window, false outside it).
+Whatever flips it (a re-saved checkout selection, an uninstall/reinstall, a
+released version without the extension, an approval change, or a Shopify-side
+reset of the selection) takes effect within minutes. Treat the health row
+as a monitor, not a certificate — it re-runs every 6 h while the admin is
+open and via the external monitor URL (§25).
+
+### 7.5 What a working store looks like (verified live, 2026-08-18)
+
+With the flag `true`, this is the exact chain Shopify's checkout runs — it
+was observed end to end in a real browser on cellexialabs.com, so use it as
+the reference when something looks off:
+
+1. The checkout page mounts Shopify's `PostPurchaseShouldRender` component
+   as soon as it loads (one-page checkout), before any address is entered.
+2. It asks Shopify's own server for the post-purchase data
+   (`POST /checkouts/internal/graphql/persisted?operationName=PostPurchaseData`).
+   - EUR (shop-currency) checkout → `PostPurchaseDataSuccess { appId:
+     "406851944449", scriptUrl: https://cdn.shopify.com/partners-extensions-scripts-bucket/checkout_post_purchase/handle/cellexia-post-purchase-upsell/version/cellexia-post-purchase-upsell-11/…js, inputData: {token, shop, initialPurchase…} }`.
+     `appId` 406851944449 = this app (Admin API `app { id }`, client id
+     `501bb278…`), version 11 = the release of 2026-08-05 whose bundle bakes
+     `APP_URL = https://cellexia-upsell.onrender.com`.
+   - NOK checkout (Norway market) → `PostPurchaseDataFailed { code:
+     "MULTI_CURRENCY" }`. **This is Shopify's own refusal, issued before the
+     extension is loaded — no ShouldRender runs, the backend is never called,
+     nothing in this app can change it.** Observed on the NOK market; per
+     Shopify's multiple-currencies limitation the same is expected for every
+     presentment currency other than EUR (§16, §23). With the gate closed the
+     same query answers `code: "EXTENSION_NOT_FOUND"` for every currency.
+3. Shopify loads the extension bundle in a sandbox worker (~60 ms) and runs
+   `Checkout::PostPurchase::ShouldRender`, which POSTs `/api/offer` with the
+   token. Observed: `render: true` in 74–171 ms on repeat calls (per-checkout
+   session cache); the FIRST call for a new checkout took ~3.1 s on the v1.7
+   backend then live (no `POST_PURCHASE_ASSEMBLY_BUDGET_MS`) — v1.8+ answers
+   within 1.8 s.
+4. The inquiry is re-run — and reset to "timeout" while pending — every time
+   the running total, the currency or the shipping country changes (shipping
+   method chosen, discount applied, address country switched). Only when the
+   LAST run finished with `render: true` before the buyer clicks Pay does the
+   submit carry `postPurchaseInquiryResult: SUCCESS`.
+5. After payment Shopify's receipt must additionally report
+   `postPurchasePageRequested: true`, `postPurchaseVaultedPaymentMethodStatus:
+   READY` (the card was vaulted — wallets, PayPal, Klarna, gift cards and bank
+   methods are `DISABLED_FEATURE` / `NOT_READY`; whether some 3-D Secure flows
+   also end `NOT_READY` is unconfirmed) and the order created; then, and only
+   then, the checkout navigates to
+   `/checkouts/cn/<id>/post-purchase` where the extension's Render step draws
+   the page. Anything else → thank-you page.
+
+Where each step leaves evidence in THIS app (v1.9): step 3 → Debug →
+**Post-purchase inquiries** (one row per ShouldRender call: time, country,
+currency, customer/guest, lines, total, offers, engine reason, ms) and the
+Render log line `[api.offer] …`; step 5 → the same tab's **Recent orders**
+list joins each order (webhook: payment gateway, presentment currency, sales
+channel, checkout token) to its inquiries and to a rendered impression, and
+prints a verdict naming which party said no — Shopify's rules, Shopify's
+gate, or this app. (The join assumes `referenceId` = `checkout_token`, an
+inference from format and Shopify's checkout-token conventions; the tab says
+so when no recent order matches any inquiry.) The checkout-web field names
+above were observed in Shopify's client bundle on 2026-08-18; they are not a
+public contract.
 
 ## 8. Set APP_URL in the post-purchase extension
 
@@ -284,11 +399,29 @@ a test card — not a manual/COD order:
 
 Notes:
 
-- Orders under $0.50, gift-card-only payments and local delivery never get a
-  post-purchase page (platform rule).
+- **Test in the store's own currency.** Shopify never shows the post-purchase
+  page when the checkout currency differs from the shop currency (§16). On a
+  EUR store, test with a shipping address in a EUR market (Ireland, Spain,
+  France, Germany…) — a Norway/USA/UK/Australia address can never show it,
+  whatever the app does.
+- Orders under $0.50, gift-card-only payments, local delivery, orders with
+  duties and orders from channels other than the Online Store never get a
+  post-purchase page (platform rules).
 - The frequency cap applies to test customers too: by default a customer who
-  saw an offer is not shown another for 14 days (`frequencyCapDays`). Test as
-  guest, use different customer emails, or lower the cap in Settings.
+  saw an offer is not shown another for 14 days (`frequencyCapDays`) — and an
+  offer seen on the **thank-you page counts as well**. So if the thank-you
+  block is installed, a merchant who tests while logged into their own
+  account will see the thank-you offer on order 1 and then NO post-purchase
+  page for 14 days. Test as guest, use different customer emails, or set the
+  cap to 0 in Settings while testing (and set it back).
+- Products the test customer bought within `suppressionDays` (60) are never
+  offered again to that customer — a burst of test orders from one account
+  shrinks the offerable pool order by order. Again: guest / fresh accounts.
+- Every ShouldRender call is logged server-side as one line
+  `[api.offer] shop=… offers=N tookMs=… reason="…"` — when `offers=0` the
+  reason names the engine step (kill switch, frequency cap, market disabled,
+  empty pool …). Look there first; it's the fastest way to know why a card
+  order in the shop currency showed nothing.
 
 You don't need a test order just to look at offers and copy: the admin's
 **Preview** page (`/app/preview`, route `app/routes/app.preview.tsx`)
@@ -311,6 +444,20 @@ This creates a new app version containing both extensions **and** the config
 in `shopify.app.toml` (scopes + webhook subscriptions, because
 `include_config_on_deploy = true`), and releases it. Re-run after every
 extension change; the hosted Remix app deploys separately (§12).
+
+Run it from a checkout of this repo whose `shopify.app.toml` carries the REAL
+`client_id` (after `shopify app config link`, §3) — deploying from a copy with
+the placeholder id, or from an app other than the one installed on the store,
+puts the extension on the wrong app. After deploying, confirm in the Partner
+Dashboard → **Versions** that the active version lists BOTH extensions; a
+version released without the post-purchase extension removes the app from
+Settings → Checkout → Post-purchase page (or silently drops the selection).
+
+The extension and the backend are versioned independently: **whenever this
+repo's `extensions/post-purchase-upsell/src/index.jsx` changes** (e.g. the
+`corePending` copy swap added in v1.8), redeploy the extension too — a stale
+extension keeps working with a newer backend (it just ignores new fields),
+but only the redeployed one gets the new behaviour.
 
 ### Extension bundle size limits
 
@@ -450,9 +597,13 @@ query throws and the app appears broken):
 
 Use a **Postgres database** (Render's SQLite disk is ephemeral — data is lost
 on every deploy/restart unless you attach a persistent disk; Postgres is the
-right choice, see §13). On the free/starter tier the instance sleeps and
-cold-starts (~30-60s of "Bad Gateway" after idle) — use a paid instance for a
-production checkout surface.
+right choice, see §13). On the **Free** tier the instance spins down after
+~15 minutes without traffic and takes 30–60 s to come back — a ShouldRender
+call that lands on a sleeping instance resolves long after the buyer has
+paid, so the page is silently skipped (and the developer's own probe wakes
+the instance, hiding the problem). Use a **paid, always-on instance (Starter
+or above)** for a production checkout surface, in the same region as the
+Postgres database (Frankfurt for an EU store).
 
 **If the service shows "Bad Gateway":** open Render → your service → Logs.
 Look for the crash reason (commonly: `Environment variable not found`,
@@ -499,7 +650,10 @@ how you distribute the app:
   this, also change `distribution: AppDistribution.AppStore` to
   `AppDistribution.SingleMerchant` in `app/shopify.server.ts`, and select
   custom distribution in the Partner Dashboard (Apps → your app →
-  Distribution). Note: distribution choice is permanent per app.
+  Distribution). Note: distribution choice is permanent per app. Custom
+  distribution does **not** waive the post-purchase access request (§7.1) —
+  that gate applies to every app on a live store (Plus merchants only can
+  install custom apps that use post-purchase extensions; Cellexia is Plus).
 - **Public (App Store) distribution:** you must request access in the Partner
   Dashboard → your app → **API access** → **Protected customer data access**:
   request the "Protected customer data" (orders) level, plus the specific
@@ -531,26 +685,40 @@ component renders nothing (it fails silent by design).
 The **post-purchase** extension does **not** need this toggle — post-purchase
 extensions may call external APIs natively.
 
-## 16. Payment method support
+## 16. When Shopify shows the post-purchase page — payment methods AND currency
 
 Shopify renders the post-purchase page **only for plain credit-card payments**
-(Shopify Payments and a small set of card gateways). This is a platform
-limitation — documented at
-<https://shopify.dev/docs/apps/build/checkout/product-offers/post-purchase> —
-and no app can bypass it. That is exactly what the thank-you fallback is for:
+(Shopify Payments and a small set of card gateways) **and only when the
+checkout currency is the shop's own currency**. Both are platform limitations
+— documented at <https://shopify.dev/docs/apps/build/checkout/product-offers>
+("Limitations": *"Post-purchase upsell offers won't be surfaced on orders with
+duties and multiple currencies"*) — and no app can bypass them. That is
+exactly what the thank-you fallback is for:
 
-| Payment method | Post-purchase upsell (one-click, same card) | Thank-you fallback (discount code) |
+| Situation | Post-purchase upsell (one-click, same card) | Thank-you fallback (discount code) |
 |---|---|---|
-| Credit / debit card via Shopify Payments | ✓ | ✓ (post-purchase takes precedence in practice) |
-| Credit card via supported third-party gateways | ✓ | ✓ |
+| Credit / debit card via Shopify Payments, checkout in the **shop currency** (EUR for Cellexia) | ✓ | ✓ (post-purchase takes precedence in practice) |
+| Credit card via supported third-party gateways, shop currency | ✓ | ✓ |
+| Shop Pay (card vaulted in Shop Pay), shop currency | ✓ (with the Shop Pay storage caveat, see ARCHITECTURE.md) | ✓ |
+| **Checkout in any other currency** (a Markets local currency: NOK, SEK, DKK, PLN, RON, CHF, GBP, USD, CAD, AUD…) | ✗ — never, whatever the payment method | ✓ |
+| Orders with duties collected at checkout | ✗ | ✓ |
 | Apple Pay | ✗ | ✓ |
 | Google Pay | ✗ | ✓ |
 | Shop Pay Installments / Klarna / other installments | ✗ | ✓ |
 | PayPal | ✗ | ✓ |
-| Gift-card-only orders, orders < $0.50, local delivery | ✗ | ✓ |
+| Gift-card-only orders, orders < $0.50, local delivery, no shipping address, non-Online-Store channels | ✗ | ✓ |
 
-Set expectations with the merchant accordingly: the share of orders that can
-see the one-click page equals the share paid by plain card.
+For cellexialabs.com this matters more than the payment split: the store is
+EUR but many of its markets sell in a local currency, so **every order from
+those markets is structurally excluded from the one-click page** — only the
+EUR markets (Ireland, France, Germany, Spain, Italy, Netherlands, Belgium,
+Portugal, Finland, Austria, Luxembourg, the EU market's other countries…) can
+ever see it. Set expectations with the merchant accordingly, keep the
+thank-you block installed for everything else, and read the health check
+**"Orders eligible for the post-purchase page (shop currency)"** (Debug tab)
+for the live share. If the one-click page is worth more than local-currency
+pricing in a given market, the merchant can switch that market to EUR
+pricing in Shopify Markets — a business decision, not an app setting.
 
 ## 17. Testing checklist
 
@@ -614,39 +782,76 @@ Work through this on a dev store before go-live:
 
 ### The post-purchase offer doesn't show
 
-Check in this order — the first four cover ~90% of cases:
+Work top-down — each step is a hard gate for everything below it. Steps 1–2
+are decided by Shopify and explain "nothing shows, for any currency, language
+or market" on their own; the app's backend is not even called until they pass.
 
-1. **Payment method.** Only plain credit-card payments qualify. Wallets
-   (Apple Pay / Google Pay), PayPal, Klarna/installments, gift-card-only,
-   orders under $0.50, and local delivery orders never see the page
-   (see §16). Pay with the test card per §10.
-2. **Post-purchase app not selected.** Settings → Checkout → Post-purchase
-   page must have this app selected (§7). Only one app can occupy that slot.
+0. **Run the health checks** (Debug tab). Two rows answer steps 1–2 directly:
+   *"Shopify checkout: post-purchase extension available"* and *"Orders
+   eligible for the post-purchase page (shop currency)"*.
+1. **Shopify does not consider any post-purchase extension available for the
+   store** — the `postPurchaseExtensionAvailable` flag in every checkout page
+   is `false` (§7.4). Causes, in order of likelihood on a LIVE store:
+   (a) the Partner Dashboard **"Access post-purchase extensions"** request was
+   never made or not yet approved (§7.1 — dev stores are exempt, live stores
+   are not); (b) the released app version doesn't contain the post-purchase
+   extension (§7.2); (c) the app isn't selected/saved under Settings →
+   Checkout → Post-purchase page (§7.3). Nothing below matters until the flag
+   reads `true`.
+2. **Checkout currency ≠ shop currency, or duties.** Shopify never shows the
+   page for local-currency checkouts (§16). Test with an address in a
+   shop-currency market. Wallets (Apple Pay / Google Pay), PayPal,
+   Klarna/installments, gift-card-only, orders under $0.50, local delivery and
+   non-Online-Store channels never see the page either. Pay with a real card
+   / the test card per §10.
 3. **`APP_URL` wrong or stale.** The constant in
    `extensions/post-purchase-upsell/src/index.jsx` must be the URL currently
    serving the app. During dev the tunnel URL changes between CLI restarts —
    update the constant and let the CLI hot-reload the extension. On any fetch
-   failure `ShouldRender` returns `{ render: false }` silently.
-4. **App disabled.** Settings → General → "enabled" toggle
-   (`settings.enabled`) turns everything off.
-5. **Frequency cap.** If the buyer has a customer account and saw any offer
-   in the last `frequencyCapDays` (default 14), they get nothing. Check
-   `CustomerState` or test as a fresh customer.
-6. **Market disabled.** Settings → Markets: if the destination country's
-   market row is disabled, no offers there.
-7. **No eligible products.** Everything was suppressed: products already in
+   failure `ShouldRender` returns `{ render: false }` silently. The health
+   check *"Post-purchase extension traffic"* fails when orders arrive but the
+   extension never calls the backend.
+4. **Backend rejects the token (401).** `SHOPIFY_API_SECRET` on the server
+   must be the client secret of the SAME Partner app that serves the
+   extension. Since v1.8 the server logs
+   `[api.offer] rejected: extension token failed verification (401)` with the
+   shop domain from the token — grep for it.
+5. **Backend too slow / asleep.** Shopify only takes the post-purchase detour
+   when ShouldRender has resolved BEFORE the order is processed (and it
+   re-runs the inquiry whenever the total, currency or country changes). Since
+   v1.8 `/api/offer` answers within ~2 s by design (`POST_PURCHASE_ASSEMBLY_BUDGET_MS`;
+   AI copy that isn't ready ships as fallback and is swapped in at Render
+   time). What can still break it: a Render **Free** instance that spun down
+   (30–60 s cold start — use a paid instance, §12) or a database on another
+   continent. Every call logs `[api.offer] … tookMs=…`.
+6. **App disabled.** Settings → General → "enabled" toggle
+   (`settings.enabled`) turns everything off. Log reason: `step1: app
+   kill-switch is off`.
+7. **Frequency cap.** If the buyer has a customer account and saw any offer
+   (post-purchase OR thank-you page) in the last `frequencyCapDays`
+   (default 14), they get nothing. Log reason: `step2: frequency cap`. Test as
+   guest / fresh customer or set the cap to 0 while testing.
+8. **Market disabled.** Settings → Markets: if the destination country's
+   market row is disabled, no offers there. A country listed in two markets
+   (e.g. DE in "germany" and "eu") resolves to the most specific one (fewest
+   countries) — same rule as Shopify. Log reason: `step3: market … disabled`.
+9. **No eligible products.** Everything was suppressed: products already in
    the order, products the customer bought within `suppressionDays`
-   (default 60), non-ACTIVE products, variants with tracked inventory below
-   `minInventory`, or price ≤ 0. A tiny dev catalog often trips this — add
-   more active, in-stock products.
-8. **Catalog not synced.** Dashboard checklist warns; press Sync. Products
-   are served from the local `ProductCache`, not live from Shopify.
-9. **Extension not deployed/released** (production): `npm run deploy` and
-   confirm the new version is released in the Partner Dashboard.
-10. **Server errors.** The public endpoints never 500 by design — they
+   (default 60), products excluded in the Upsell products tab, non-ACTIVE
+   products, variants with tracked inventory below `minInventory`, or price ≤
+   0. A matched offer rule whose candidates are all suppressed yields an EMPTY
+   page (no auto-pilot fallback for matched rules). Log reason: `step6b:
+   auto-pilot pool is empty` / `step6: rule … every slot candidate is
+   suppressed`.
+10. **Catalog not synced / empty.** Dashboard checklist warns; press Sync.
+    Products are served from the local `ProductCache`, not live from Shopify —
+    an empty cache (fresh database, failed bootstrap) means an empty pool.
+11. **Server errors.** The public endpoints never 500 by design — they
     degrade to `{ offers: [] }`. So a "healthy but empty" response means an
-    internal error was swallowed: check server logs for `[offer]`/`[engine]`
-    prefixed errors.
+    internal error was swallowed: check server logs for `[api.offer]` (one
+    line per call with `offers=N tookMs=… reason="…"`), `[orchestrator]` and
+    `[engine]` prefixed errors, or turn on Debug → "record live buyer
+    requests" for full traces.
 
 ### Accept button fails ("Something went wrong")
 
@@ -837,6 +1042,41 @@ every repeat of the same basket/offer/language combination is served complete
 and instantly — no second stage, no polling. First-ever baskets are the only
 ones that see the staged fill-in.
 
+### The ShouldRender time budget (v1.8): `corePending`
+
+Shopify's checkout runs `ShouldRender` when the payment page loads, **re-runs
+it every time the total, currency or shipping country changes** (its inquiry
+status resets to "timeout" each time), and only takes the post-purchase
+detour if the inquiry has resolved "success" by the moment the order is
+processed. Shopify's UX guidance is "network calls must complete in two
+seconds or less". So `/api/offer` is now time-boxed:
+
+- `POST_PURCHASE_ASSEMBLY_BUDGET_MS` (1800 ms, `offer-orchestrator.server.ts`)
+  is measured from the moment the request is authenticated. Offer pages are
+  built **concurrently** (one copy round-trip for three pages, not three in a
+  row); the core copy call gets `min(aiTimeoutMs, remaining budget)`; the
+  contextual-pricing wait is cut at the deadline (FX / shop-currency prices
+  are used instead).
+- If the core call runs out of budget the page ships immediately with the
+  deterministic fallback copy and `corePending: true`, while the **full**
+  background generation (core + extended, language-enforced) continues. When
+  it lands, `patchFullCopy` replaces the stored page's copy wholesale and
+  flags `coreReady` on the `IssuedOffer` meta.
+- The extension polls `POST /api/offer-extended` **immediately** on Render
+  for `corePending` pages (Render runs after payment — many seconds after
+  ShouldRender — so the copy is almost always ready), holds the first paint
+  for at most 900 ms, and swaps in the real headline/lead/bullets (and the
+  below-CTA sections). `/api/offer-extended` returns `coreReady: true` plus
+  `headline/body/bullets` in that case; for `extendedPending`-only pages its
+  response is unchanged.
+- Cache hits (`CopyCache`) are unaffected: they return in a few ms with
+  complete copy and no pending flags.
+
+Every call logs one line: `[api.offer] shop=… ref=… offers=N [corePending]
+tookMs=… [reason="…"]`. A store whose baskets repeat sees `corePending` only
+on first-ever combinations; a store that never sees `corePending` but has
+`tookMs` consistently > 2000 has a slow database or hosting, not a slow AI.
+
 ### Thinking-disabled + stop_reason (the silent-fallback root cause)
 
 Two Anthropic API behaviors used to cause silent fallback copy and are now
@@ -1006,7 +1246,13 @@ verifies every production dependency against the live store. Operationally:
 
 **Before go-live.** Run **deep checks** once and get everything green (or a
 consciously accepted yellow). The battery catches exactly the class of
-problems local testing can't: wrong `APP_URL` baked into the deployed
+problems local testing can't: Shopify not yet exposing ANY post-purchase
+extension on the live store (the *"Shopify checkout: post-purchase extension
+available"* row opens a real storefront checkout and reads Shopify's
+`postPurchaseExtensionAvailable` flag — red means §7.1–7.3 are not done and
+no offer can appear anywhere), the share of recent orders that Shopify
+excludes for being in a non-shop currency (*"Orders eligible for the
+post-purchase page (shop currency)"*), wrong `APP_URL` baked into the deployed
 extension, missing `write_discounts` after a scope change, webhooks pointing
 at an old host, SQLite still configured in production, an invalid model id,
 clock skew, untranslated languages.
@@ -1044,3 +1290,213 @@ cadence costs cents per month. Deep runs add one translation call and one
 discount-code create+delete on the live store (deleted immediately,
 usage-limited, 10-minute expiry — harmless if a delete ever failed, and the
 check tells you which code to remove if so).
+
+### 25.1 Gate-only monitor (v1.9)
+
+`GET /api/health?shop=<domain>&token=<t>&gate=1` samples only Shopify's
+post-purchase gate (storefront flag + `isPostPurchaseAppInUse`), at most every
+10 minutes, and answers **200** while the gate is open and **503** while it is
+closed or unreadable (`{ gate, storefrontFlag, isPostPurchaseAppInUse,
+sampledAt, source, note }`). Same token as the full monitor URL; the Debug
+tab shows the ready-made URL. Use it in an uptime monitor with a 10-minute
+interval: you get an alert the moment the checkout selection drops, and the
+Debug tab timeline keeps 14 days of samples.
+
+## 26. Upgrade notes — v1.8 ("why is the post-purchase page not showing")
+
+v1.8 is the result of a root-cause investigation on the live store. Nothing
+in it changes the security model or the data model. What it does:
+
+- **Diagnoses Shopify's own gate.** New health check *"Shopify checkout:
+  post-purchase extension available"* opens a real storefront checkout and
+  reads Shopify's `postPurchaseExtensionAvailable` flag; red = Shopify will
+  not run ANY post-purchase extension on this store (§7). New check *"Orders
+  eligible for the post-purchase page (shop currency)"* measures how many
+  recent orders Shopify excludes for being in a local currency (§16). The
+  Dashboard checklist reflects both; the Markets page explains the currency
+  rule per market.
+- **Answers ShouldRender fast and deterministically.** `/api/offer` is
+  time-boxed (`POST_PURCHASE_ASSEMBLY_BUDGET_MS`, 1.8 s); pages build
+  concurrently; AI copy that isn't ready ships as fallback with
+  `corePending: true`, is generated in the background, patched into the
+  stored page, and swapped in by the extension at Render time (§22).
+- **Says why when it says no.** One log line per ShouldRender call
+  (`[api.offer] … offers=N tookMs=… reason="…"`) naming the engine step that
+  emptied the response; 401/410 rejections are logged with the token's shop
+  and answered WITH CORS headers so the browser shows the real status.
+- **Deterministic market routing.** A country listed in several markets
+  resolves to the most specific one (fewest countries), everywhere.
+- **Webhook inventory fix.** `products/update` payloads on API 2024-07+ carry
+  no `inventory_management`; untracked variants keep their untracked
+  (always-offerable) state instead of being flipped to "0 in stock".
+- **Extension hygiene.** No post-ES2015 built-ins; polls `/api/offer-extended`
+  immediately for `corePending` pages (first paint held ≤ 0.9 s).
+
+Deploy order:
+
+1. Backend: deploy as usual (`npm ci && npm run build`, Pre-Deploy
+   `npx prisma db push`, `npm run start`). No new tables in v1.8 (v1.7's
+   `HealthCheckRun` is created by the same `db push` if you skipped v1.7).
+2. Extension: set `APP_URL` in `extensions/post-purchase-upsell/src/index.jsx`
+   (§8) and run `npm run deploy` from the linked checkout (§11) — the
+   `corePending` swap only exists in the redeployed extension. Confirm the
+   released version lists both extensions.
+3. In the app admin: Debug → **Run checks**. Work the red rows top-down —
+   the availability row first (§7.1–7.4). Then place ONE test order: guest
+   checkout, real card, shipping address in a shop-currency country (§10).
+4. Read the server log line for that order (`[api.offer] … offers=…`) — if
+   Shopify called the backend at all, that line exists and explains the rest.
+
+## 27. Upgrade notes — v1.9 ("what the live store actually does, and how to read it")
+
+v1.9 comes out of a second live investigation (2026-08-18) after the merchant
+reported: approval granted, app selected, real card, EUR country — and still no
+page. What was found, in order of certainty:
+
+1. **The Shopify-side gate was closed when the test was made, and it is not
+   stable.** The checkout HTML on cellexialabs.com serialized
+   `postPurchaseExtensionAvailable: false` for every market on 2026-08-16 and
+   at 14:22 UTC on 2026-08-18; it read `true` for every market between ~14:49
+   and ~15:03 UTC that day and `false` again from ~15:03 UTC — each time in
+   lockstep with `app { isPostPurchaseAppInUse }` for this app (App
+   406851944449 / client id `501bb278…`), i.e. Shopify's record of "this app
+   is the selected post-purchase app" switched on and off within an hour with
+   no deploy. While it is `false` Shopify never mounts the ShouldRender
+   component (§7.4/§7.5) and its own `PostPurchaseData` query answers
+   `EXTENSION_NOT_FOUND`, so no test order placed outside such a window could
+   show a page, whatever the app did. Who or what toggles the selection is the
+   open question the new gate timeline is built to answer (§25.1).
+2. **The production backend was still v1.7**, fingerprinted from outside
+   (a bad-token `POST /api/offer` answers `401` WITHOUT CORS headers; v1.8's
+   `public-auth.server.ts` adds them; the offer response carries
+   `extendedPending` and no `corePending`). v1.7 has no availability health
+   row — so a "green availability row" cannot have come from the live
+   backend; it was another row (most likely "App URL & deployed extension
+   URL", which only compares source strings) or a non-production instance.
+   v1.9 removes this class of confusion: the Debug tab header and
+   `GET /api/health?probe=version` state the deployed version.
+3. **With the flag `true` the chain works for EUR checkouts** — Shopify serves
+   this app (appId 406851944449, extension version 11, `APP_URL =
+   https://cellexia-upsell.onrender.com`) and ShouldRender returned
+   `render: true`. So once the gate is open, a real-card EUR test order that
+   still shows nothing is decided by (a) the app answering "no offer" for
+   THAT buyer — most often the 14-day frequency cap on the merchant's own
+   customer account (thank-you-page impressions count) or 60-day suppression
+   of just-bought products — or (b) Shopify's receipt-side rules (card
+   vaulting / 3-D Secure, wallet buttons, order-creation delay). Before v1.9
+   neither left a durable trace a merchant could read.
+4. **Every non-EUR checkout is refused by Shopify itself** with
+   `PostPurchaseDataFailed { code: MULTI_CURRENCY }` before the extension is
+   loaded (verified on the Norway market). On this store that is the majority
+   of orders (see the "Orders eligible…" health row) — they can only see the
+   thank-you offer.
+
+What v1.9 changes (backend only — the deployed extension bundle is byte-identical
+to the repo's and needs no redeploy):
+
+- **ShouldRender inquiry log** (`OfferInquiry` table, `app/services/inquiry-log.server.ts`):
+  one row per `/api/offer` call — country, shop/presentment currency,
+  customer or guest, lines, total (and whether it came from the reported total
+  or was summed from lines), offers issued, `corePending`, the engine's empty
+  reason, duration, backend version. Written fire-and-forget after the
+  response; 30-day retention.
+- **Debug → Post-purchase inquiries** (new tab): 24 h / 7 d funnel, top
+  "no offer" reasons, the raw inquiry list, and **Recent orders** with a
+  per-order verdict. Orders now store `checkoutToken`, `gateway`,
+  `presentment` and `sourceName` from the orders webhook so an order can be
+  joined to its inquiries (`referenceId` = checkout token) and judged against
+  Shopify's payment-method / currency / channel rules.
+- **Health checks**: *Post-purchase extension traffic* is now the three-stage
+  funnel (inquiries → issued → rendered) with precise verdicts; *Orders
+  eligible for the post-purchase page* counts payment method and sales
+  channel as well as currency and names Shopify's `MULTI_CURRENCY` code;
+  *Shopify checkout: post-purchase extension available* prints this app's
+  id / handle / client id next to `isPostPurchaseAppInUse` (match them
+  against the Partner Dashboard app), shares one deadline across candidate
+  variants and reports a stale catalog instead of a bogus "password-protected"
+  warning; *Last real orders* replays the engine AND shows what actually
+  happened per order.
+- **Zero-total inquiries**: Shopify's earliest ShouldRender runs carry
+  `initialPurchase.totalPriceSet = 0.0` while line items already carry their
+  totals; `/api/offer` now sums the lines when the reported total is not
+  positive, so rules with a minimum order value and discount tiers see the
+  basket value instead of 0.
+- **Version identity**: `app/lib/version.ts`, `GET /api/health?probe=version`,
+  Debug tab subtitle.
+- **Stored-page reuse is destination-aware**: the pages issued for a
+  referenceId are reused verbatim only while the buyer's destination country
+  is the one they were issued for; the country-less first inquiry's pages are
+  retired the moment the address is known and selection runs again for the
+  real market (market gating, per-market discount/language, per-country
+  prices). Rows already matching the live country are kept, so a late
+  country-less response can never delete the pages the extension's storage
+  refers to.
+- **Auto-pilot affinity memo**: the order history behind co-purchase affinity
+  (up to 5,000 orders + lines) is memoized per shop for 5 minutes instead of
+  being re-read on every ShouldRender call.
+- **Test customers bypass the cap and suppression** (Settings → Frequency &
+  hygiene → "Test customer IDs"): the merchant's own account, used for repeated
+  real-card tests, is otherwise blocked by its own history — every earlier
+  test order suppresses its products for 60 days and any seen offer caps the
+  account for 14 days — and the buyer-facing result is identical to "the page
+  never shows". Real buyers are unaffected.
+- **Stale market rows are removed on re-sync**: a `MarketSetting` row for a
+  market that no longer exists in Shopify (or was reorganised) could keep a
+  country under a disabled row; on the v1.7 backend market resolution was
+  first-match over an unordered list, so such a row silently gated every
+  buyer of that country. v1.8 made resolution deterministic (most specific
+  market wins); v1.9 also deletes rows whose handle Shopify no longer returns.
+- **Resilience on a not-yet-migrated database**: the orders webhook stores
+  orders without the new columns (one warning), redaction hooks tolerate the
+  missing tables, and the Debug tab says "run db push" instead of "no
+  orders". Verified against a v1.8-shaped database.
+- **Gate monitor** (`GateSample` table): the availability check's two facts
+  (storefront flag + `isPostPurchaseAppInUse`) are stored with a timestamp on
+  every health run, every 10 minutes while the admin is open, on the Debug
+  tab's **Sample now** button, and via `GET /api/health?shop=…&token=…&gate=1`
+  (200 while open / 503 while closed — point an uptime monitor at it; it is
+  far lighter than `&run=1`). Debug → Post-purchase inquiries renders the
+  transitions (OFF → ON → OFF with times). Reason: on 2026-08-18 the gate on
+  cellexialabs.com read off at 14:22 UTC, on at 14:47–14:56 UTC and off again
+  by 15:03 UTC (`isPostPurchaseAppInUse` false, storefront flag false at
+  15:24 UTC) — someone or something is switching the checkout selection; only
+  a timeline can correlate that with test orders and with actions in the
+  Shopify admin / Partner Dashboard.
+
+Deploy order:
+
+1. Backend: `npm ci && npm run build`, Pre-Deploy **`npx prisma db push`**
+   (adds `OfferInquiry`, `GateSample` and four nullable `OrderRecord`
+   columns — no data loss), `npm run start`. Verify with
+   `curl https://<host>/api/health?probe=version` → `{"version":"1.9.0"}`.
+2. Extension: no change since v1.8's source; redeploy only if the released
+   version does not list it (Partner Dashboard → Versions).
+0. **Before deploying anything, read the Render logs for the last test.**
+   The v1.7 backend already logs one `POST /api/offer 200 - - <ms> ms` line
+   per ShouldRender call and `[engine] step…` lines per selection. Open Render
+   → the service → Logs, filter by the minutes of the test order:
+   - no `POST /api/offer` line at all → Shopify did not run the extension for
+     that checkout (gate/currency/channel side);
+   - lines present, then `[engine] step2: frequency cap hit …`, `step3: market
+     "<handle>" disabled …`, `step5: suppression set size = N` followed by
+     `step6b: auto-pilot pool size = 0`, or `step6: … no eligible candidates`
+     → the app answered "no offer" and that line is the reason;
+   - lines present with a large `<ms>` (3,000+) on the LAST call before the
+     order → the answer arrived after the buyer paid.
+   That single log excerpt decides which of the fixes below matters.
+3. In the app admin: Debug → **Run checks**. The availability row must be
+   green AND the gate timeline (Debug → Post-purchase inquiries) must read
+   OPEN at the moment you test — click **Sample now** right before the test.
+   Add your own customer id under Settings → Frequency & hygiene → Test
+   customer IDs (or test as a guest with a fresh e-mail).
+   Then place ONE card order in a EUR market as a **guest with a fresh
+   e-mail** (or set Settings → General frequency cap to 0 while testing) and
+   open Debug → **Post-purchase inquiries**: the checkout must appear there
+   within seconds of the checkout page loading. Its verdict after the order
+   tells you which party said no.
+4. If the timeline shows the gate closing on its own (OPEN → CLOSED with no
+   one touching Settings → Checkout), that is the Shopify-side finding to
+   take to Shopify Partner support with the exact timestamps, the app client
+   id (`501bb278…`) and the fact that `isPostPurchaseAppInUse` reverted to
+   false: on this store the selection did not persist on 2026-08-18.
+

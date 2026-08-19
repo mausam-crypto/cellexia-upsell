@@ -7,19 +7,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
-import { authenticate } from "../shopify.server";
+import { authenticateCheckoutPublic } from "../lib/public-auth.server";
 import { gidToNumber, toGid } from "../lib/json";
-import { assembleOfferResponse } from "../services/offer-orchestrator.server";
+import { recordOfferInquiry } from "../services/inquiry-log.server";
+import {
+  assembleOfferResponse,
+  POST_PURCHASE_ASSEMBLY_BUDGET_MS,
+  type AssembleOfferOptions,
+} from "../services/offer-orchestrator.server";
 import type { PurchaseContext, PurchaseLineItem } from "../types";
 
 /** Answers CORS preflight / GET probes. */
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { cors } = await authenticate.public.checkout(request);
+  const { cors } = await authenticateCheckoutPublic(request, "api.offer");
   return cors(json({ ok: true }));
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { cors, sessionToken } = await authenticate.public.checkout(request);
+  const startedAt = Date.now();
+  const { cors, sessionToken } = await authenticateCheckoutPublic(request, "api.offer");
+  let shopForLog = "?";
+  let refForLog = "?";
   try {
     const token = sessionToken as any;
     const inputData: any = token?.input_data ?? {};
@@ -29,12 +37,65 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       typeof inputData?.shop?.domain === "string" && inputData.shop.domain
         ? inputData.shop.domain
         : new URL(typeof token?.dest === "string" ? token.dest : "https://x").hostname;
+    shopForLog = shop;
 
-    const ctx = buildPurchaseContext(shop, inputData, purchase);
-    const response = await assembleOfferResponse(ctx);
+    const built = buildPurchaseContext(shop, inputData, purchase);
+    const ctx = built.ctx;
+    refForLog = ctx.referenceId;
+    // ShouldRender budget: Shopify only takes the post-purchase detour when
+    // this call has resolved BEFORE the order is processed (and it re-runs
+    // the inquiry on every total/currency/country change), so the assembly
+    // is time-boxed — see POST_PURCHASE_ASSEMBLY_BUDGET_MS.
+    const options: AssembleOfferOptions = {
+      deadlineAt: startedAt + POST_PURCHASE_ASSEMBLY_BUDGET_MS,
+    };
+    const response = await assembleOfferResponse(ctx, options);
+    // One line per ShouldRender call — the only production trace of WHY a
+    // buyer did or did not get a page (Debug-tab traces are opt-in).
+    const tookMs = Date.now() - startedAt;
+    const corePending = response.offers.some((o) => o.corePending);
+    console.log(
+      `[api.offer] shop=${shop} ref=${ctx.referenceId} country=${ctx.countryCode ?? "-"} locale=${ctx.locale || "-"} currency=${ctx.currency}${ctx.presentmentCurrency ? `/${ctx.presentmentCurrency}` : ""} lines=${ctx.lineItems.length} total=${ctx.totalAmount}${built.totalSource !== "total" ? `(${built.totalSource})` : ""} customer=${ctx.customerId ? "yes" : "guest"} offers=${response.offers.length}${corePending ? " corePending" : ""} tookMs=${tookMs}${response.offers.length === 0 && options.emptyReason ? ` reason="${options.emptyReason}"` : ""}`,
+    );
+    // Durable twin of the log line (Debug tab → ShouldRender inquiries; the
+    // extension-traffic health check). Fire-and-forget, after the response
+    // is fully computed — adds nothing to the ShouldRender latency.
+    recordOfferInquiry({
+      shop,
+      referenceId: ctx.referenceId,
+      countryCode: ctx.countryCode,
+      currency: ctx.currency,
+      presentment: ctx.presentmentCurrency ?? null,
+      customerId: ctx.customerId,
+      lines: ctx.lineItems.length,
+      totalAmount: ctx.totalAmount,
+      totalSource: built.totalSource,
+      offers: response.offers.length,
+      corePending,
+      emptyReason: response.offers.length === 0 ? (options.emptyReason ?? "no reason recorded") : null,
+      tookMs,
+    });
     return cors(json(response));
   } catch (error) {
-    console.error("[api.offer] failed", error);
+    const tookMs = Date.now() - startedAt;
+    console.error(`[api.offer] failed shop=${shopForLog} ref=${refForLog} tookMs=${tookMs}`, error);
+    if (shopForLog !== "?" && refForLog !== "?") {
+      recordOfferInquiry({
+        shop: shopForLog,
+        referenceId: refForLog,
+        countryCode: null,
+        currency: null,
+        presentment: null,
+        customerId: null,
+        lines: 0,
+        totalAmount: 0,
+        totalSource: "none",
+        offers: 0,
+        corePending: false,
+        emptyReason: `route crashed: ${error instanceof Error ? error.message : String(error)}`,
+        tookMs,
+      });
+    }
     return cors(json({ offers: [] }));
   }
 };
@@ -45,7 +106,7 @@ function buildPurchaseContext(
   shop: string,
   inputData: any,
   purchase: any,
-): PurchaseContext {
+): { ctx: PurchaseContext; totalSource: "total" | "lines" | "none" } {
   // Everything comes exclusively from the verified token's input_data — the
   // request body is untrusted and never read. Shop money preferred (rule
   // min/max totals, discount tiers and catalog prices are shop-currency, so
@@ -53,7 +114,7 @@ function buildPurchaseContext(
   // when shopMoney is absent.
   const money =
     purchase?.totalPriceSet?.shopMoney ?? purchase?.totalPriceSet?.presentmentMoney ?? null;
-  const totalAmount = toAmount(money?.amount) ?? 0;
+  const reportedTotal = toAmount(money?.amount) ?? 0;
   const currency =
     typeof money?.currencyCode === "string" && money.currencyCode
       ? money.currencyCode
@@ -92,7 +153,28 @@ function buildPurchaseContext(
       ? String(purchase.referenceId)
       : crypto.randomUUID();
 
-  return {
+  // Observed on the live store (2026-08-18): Shopify runs ShouldRender as soon
+  // as the checkout mounts and again on every total/currency/country change,
+  // and the EARLY inquiries carry initialPurchase.totalPriceSet = 0.0 while
+  // the line items already carry their real totals. A zero total would make
+  // every rule with a minimum order value miss and pick the lowest discount
+  // tier for that inquiry — so when the reported total is not positive, fall
+  // back to the sum of the line totals (basket value; shipping/tax excluded,
+  // which is what rule thresholds mean anyway). Which one was used is logged.
+  const linesTotal = lineItems.reduce((sum, li) => sum + (li.priceAmount ?? 0), 0);
+  let totalAmount = reportedTotal;
+  let totalSource: "total" | "lines" | "none" = "total";
+  if (!(reportedTotal > 0)) {
+    if (linesTotal > 0) {
+      totalAmount = Math.round(linesTotal * 100) / 100;
+      totalSource = "lines";
+    } else {
+      totalAmount = 0;
+      totalSource = "none";
+    }
+  }
+
+  const ctx: PurchaseContext = {
     shop,
     referenceId,
     // customerId comes ONLY from the verified token (null for guest checkout)
@@ -113,6 +195,7 @@ function buildPurchaseContext(
     presentmentCurrency: presentment.currency,
     presentmentRate: presentment.rate,
   };
+  return { ctx, totalSource };
 }
 
 /**

@@ -31,6 +31,8 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+  refreshToken  String?
+  refreshTokenExpires DateTime?
 }
 
 // One row per installed shop. settingsJson holds AppSettings (see app/types.ts).
@@ -204,6 +206,54 @@ model OfferEvent {
   @@index([shop, customerId])
 }
 
+// One row per ShouldRender call that reached /api/offer (post_purchase) — the
+// authoritative "is Shopify calling us, and what did we answer" record. Written
+// fire-and-forget AFTER the response is computed (never on the critical path),
+// pruned to 30 days. `offers` = pages issued (0 = we told Shopify not to show
+// the page; `emptyReason` says why in the engine's own words). Powers the
+// Debug tab "ShouldRender inquiries" list and the extension-traffic health check.
+model OfferInquiry {
+  id            String   @id @default(cuid())
+  shop          String
+  referenceId   String
+  surface       String   @default("post_purchase")
+  countryCode   String?
+  currency      String? // shop-money currency the engine used
+  presentment   String? // buyer's presentment currency when it differs
+  customerId    String?
+  lines         Int      @default(0)
+  totalAmount   Float    @default(0)
+  totalSource   String   @default("total") // "total" | "lines" | "none"
+  offers        Int      @default(0)
+  corePending   Boolean  @default(false)
+  emptyReason   String?
+  tookMs        Int      @default(0)
+  appVersion    String?
+  createdAt     DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([shop, referenceId])
+}
+
+// Timestamped samples of Shopify's post-purchase gate for this store (v1.9):
+// storefrontFlag = the checkout's `postPurchaseExtensionAvailable`, inUse =
+// Admin API `app { isPostPurchaseAppInUse }`. Observed live on 2026-08-18: the
+// gate switched off → on → off within one hour with no deploy, so a single
+// health-check reading is a snapshot, not a state. Sampled by every health run,
+// by admin loaders (throttled) and by the external monitor (?gate=1); 14-day
+// retention. The Debug tab renders the transitions.
+model GateSample {
+  id            String   @id @default(cuid())
+  shop          String
+  at            DateTime @default(now())
+  storefrontFlag Boolean?
+  inUse         Boolean?
+  source        String   @default("auto") // "auto" | "manual" | "external" | "health"
+  note          String?
+
+  @@index([shop, at])
+}
+
 // Race-proof replay guard for extension events: one row per (page, event type),
 // claimed atomically via the unique constraint BEFORE any OfferEvent rows or
 // counters are written. Concurrent duplicates lose the insert and are dropped.
@@ -230,6 +280,17 @@ model OrderRecord {
   country        String?
   hadUpsellOffer Boolean     @default(false)
   acceptedUpsell Boolean     @default(false)
+  // Post-purchase eligibility annotations from the orders/create payload
+  // (v1.9): Shopify only surfaces the post-purchase page for plain card
+  // payments in the shop currency through the Online Store — these three
+  // fields let the Debug tab say WHY a given order could never have seen it.
+  // checkoutToken = payload.checkout_token, the same 32-hex value the
+  // post-purchase ShouldRender receives as initialPurchase.referenceId, so an
+  // order can be joined to its OfferInquiry rows.
+  checkoutToken  String?
+  gateway        String? // payment_gateway_names joined with ", "
+  presentment    String? // presentment_currency
+  sourceName     String? // source_name ("web" = Online Store)
   createdAt      DateTime    @default(now())
   lines          OrderLine[]
 

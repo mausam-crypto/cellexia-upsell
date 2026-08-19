@@ -68,7 +68,10 @@ npm run dev
 
 Then, on the dev store: install the app, go to **Settings → Checkout →
 Post-purchase page** and select **Cellexia Post-Purchase Upsell**, place a test
-order with a test credit card, and the offer appears after payment.
+order with a test credit card (shipping to a shop-currency country), and the
+offer appears after payment. On a **live** store one more step is mandatory
+first: request **"Access post-purchase extensions"** for the app in the
+Partner Dashboard (see the guide, §7.1).
 
 Before `shopify app deploy`, set the `APP_URL` constant at the top of
 `extensions/post-purchase-upsell/src/index.jsx` to your production app URL, and
@@ -95,6 +98,7 @@ app/
   db.server.ts                    Prisma client singleton
   types.ts                        Shared domain types + DEFAULT_SETTINGS + UI string catalog
   lib/json.ts                     JSON-column helpers, gid <-> numeric id conversion
+  lib/version.ts                  APP_VERSION — shown in the Debug tab and by GET /api/health?probe=version
   services/
     settings.server.ts            Per-shop settings (deep-merged over defaults)
     catalog.server.ts             Product catalog cache, markets & locales sync
@@ -104,7 +108,8 @@ app/
     analytics.server.ts           Event recording, dashboards, experiments, CLV cohorts
     market-pricing.server.ts      Real per-country prices (Shopify contextualPricing, cached)
     debug.server.ts               Diagnostic traces (Debug tab): prompts, provenance, name scan
-    health.server.ts              Live health-check battery (Debug tab): ~33 checks against the real store
+    health.server.ts              Live health-check battery (Debug tab): ~35 checks against the real store
+    inquiry-log.server.ts         ShouldRender inquiry log (one row per /api/offer call) + funnel stats
     language-guard.server.ts      Wrong-language detection + enforcement for buyer copy
     offer-orchestrator.server.ts  Assembles the full offer response for the extensions
   routes/
@@ -118,7 +123,7 @@ app/
     app.prompts.tsx               Admin: AI prompt templates + preview
     app.settings.tsx              Admin: settings (discount, markets, languages, AI, ...)
     app.translations.tsx          Admin: buyer-facing UI strings per language
-    app.debug.tsx                 Admin: live health checks + full generation traces
+    app.debug.tsx                 Admin: live health checks + post-purchase inquiries + generation traces
     api.offer.tsx                 Public: post-purchase offer endpoint (JWT-verified)
     api.offer-extended.tsx        Public: below-CTA copy sections, polled while extendedPending
     api.sign-changeset.tsx        Public: signs changesets from server-side IssuedOffer rows
@@ -148,14 +153,33 @@ and Postgres in production; `ANTHROPIC_API_KEY` powers AI copy (without it the
 app degrades to deterministic fallback copy); `DEEPL_API_KEY` is optional for
 DeepL-based UI-string translation.
 
-## Payment method support (platform limitation)
+## When Shopify shows the post-purchase page (platform limitations)
 
-| Payment method | Post-purchase page | Thank-you fallback |
+| Situation | Post-purchase page | Thank-you fallback |
 |---|---|---|
-| Credit / debit card (Shopify Payments and supported gateways) | ✓ | ✓ |
+| Credit / debit card (Shopify Payments and supported gateways), checkout in the **shop currency** | ✓ | ✓ |
+| Checkout in any **other currency** (Markets local currencies), or orders with duties | ✗ | ✓ |
 | Apple Pay / Google Pay | ✗ | ✓ |
 | PayPal | ✗ | ✓ |
 | Klarna / installments | ✗ | ✓ |
+| Gift-card-only, < $0.50, local delivery, non-Online-Store channel | ✗ | ✓ |
 
-This is a Shopify platform restriction, not an app limitation — see
-[Shopify's post-purchase documentation](https://shopify.dev/docs/apps/build/checkout/product-offers/post-purchase).
+These are Shopify platform restrictions, not app limitations — see
+[Shopify's product-offers documentation](https://shopify.dev/docs/apps/build/checkout/product-offers)
+("Limitations"). In addition, on a **live** store Shopify only exposes the
+post-purchase page after the app has been granted **"Access post-purchase
+extensions"** in the Partner Dashboard (development stores are exempt) — see
+[IMPLEMENTATION_GUIDE.md §7](docs/IMPLEMENTATION_GUIDE.md#7-enable-the-post-purchase-page).
+The Debug tab's health check *"Shopify checkout: post-purchase extension
+available"* verifies the live flag in one click, and Debug → **Post-purchase
+inquiries** shows every ShouldRender call Shopify actually sent, the app's
+answer, and a per-order verdict (Shopify's rules / Shopify's gate / the app).
+Verified live on 2026-08-18: a non-shop-currency checkout (observed on the
+NOK market) is refused by Shopify's own `PostPurchaseData` query with
+`code: MULTI_CURRENCY` before the extension is even loaded; the same query for
+a EUR checkout, while the gate was open, served this app's extension and its
+ShouldRender returned `render: true`. Also verified: the gate itself is live
+state — it read off, on and off again within one hour, together with
+`isPostPurchaseAppInUse` — so the Debug tab keeps a timestamped **gate
+timeline** and exposes a gate-only monitor URL (`/api/health?…&gate=1`,
+200 open / 503 closed).
